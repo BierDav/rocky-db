@@ -43,6 +43,24 @@ const TITLES: &str = "SELECT key,title FROM items ORDER BY key";
 
 mod admission;
 
+/// Inserts items `000000` up to `rows`, a transaction per 200.
+async fn numbered_items(replica: &Replica, rows: i64) {
+    let sql = session(replica).await;
+    for chunk in (0..rows).collect::<Vec<_>>().chunks(200) {
+        sql.run("BEGIN", vec![]).await.unwrap();
+        for i in chunk {
+            let id = sql.next_id("items").await.unwrap().integer();
+            sql.run(
+                "INSERT INTO items(key,title,id) VALUES(printf('%06d',?1),printf('item number %06d',?1),?2)",
+                vec![SqlValue::Integer(*i), SqlValue::Integer(id)],
+            )
+            .await
+            .unwrap();
+        }
+        sql.run("COMMIT", vec![]).await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn kept_seals_show_their_rows_while_the_live_tables_move_on() {
     let lineage = Lineage::new();
@@ -236,16 +254,7 @@ async fn five_kept_seals_of_one_percent_changes_add_about_five_percent() {
         })
         .await
         .unwrap();
-    let sql = session(&replica).await;
-    sql.run("BEGIN", vec![]).await.unwrap();
-    let first = sql.next_id("items").await.unwrap().integer();
-    sql.run(
-        "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO items(key,title,id) SELECT printf('%06d',i),printf('item number %06d',i),?+i FROM n",
-        vec![SqlValue::Integer(ROWS - 1), SqlValue::Integer(first)],
-    )
-    .await
-    .unwrap();
-    sql.run("COMMIT", vec![]).await.unwrap();
+    numbered_items(&replica, ROWS).await;
     let mut kept = Vec::new();
     for round in 0..6i64 {
         kept.push(seal(&lineage, &replica).await.id().unwrap());
@@ -545,15 +554,13 @@ async fn a_node_holds_a_seal_it_compacted_past_once_it_pulls_it_from_a_node_that
     assert_eq!(status.rebootstrap, None);
 }
 
-/// What a switch must reproduce: stored rows, scope digests and the table.
+/// What a switch must reproduce: scope digests and the table.
 async fn workspace_state(replica: &Replica) -> Vec<Vec<Vec<SqlValue>>> {
     let inner = replica.inner.lock(crate::replica::Class::Background).await;
     let mut state = Vec::new();
     for sql in [
-        "SELECT scope,row,fields FROM secure_row_records ORDER BY scope,row",
         "SELECT scope,rows,tombstones,digest FROM secure_scope_state ORDER BY scope",
         "SELECT key,title FROM items ORDER BY key",
-        "SELECT scope,id,created,deleted FROM secure_existence ORDER BY scope,id",
     ] {
         state.push(crate::storage::rows(&inner.conn, sql).await.unwrap());
     }
@@ -605,16 +612,7 @@ async fn switching_to_a_branch_two_seals_back_and_back_costs_the_rows_changed_si
         })
         .await
         .unwrap();
-    let sql = session(&replica).await;
-    sql.run("BEGIN", vec![]).await.unwrap();
-    let first_id = sql.next_id("items").await.unwrap().integer();
-    sql.run(
-        "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO items(key,title,id) SELECT printf('%06d',i),printf('item number %06d',i),?+i FROM n",
-        vec![SqlValue::Integer(ROWS - 1), SqlValue::Integer(first_id)],
-    )
-    .await
-    .unwrap();
-    sql.run("COMMIT", vec![]).await.unwrap();
+    numbered_items(&replica, ROWS).await;
     let first = seal(&lineage, &replica).await.id().unwrap();
     replica.finalize_path(lineage.domain).await.unwrap();
     update(&replica, "000001", "changed after the first seal").await;
@@ -666,7 +664,7 @@ async fn switching_to_a_branch_two_seals_back_and_back_costs_the_rows_changed_si
     let to_main = follow_changing(&lineage, &replica, "main").await;
     assert_eq!(replica.followed_tip().await, main_tip);
     let back = workspace_state(&replica).await;
-    assert_eq!(back[2], on_main[2]);
+    assert_eq!(back[1], on_main[1]);
 
     // A rebuild from the replay base reaches the same states, writing
     // every row.
@@ -693,13 +691,6 @@ async fn switching_to_a_branch_two_seals_back_and_back_costs_the_rows_changed_si
 #[tokio::test]
 async fn a_branch_on_a_kept_seal_keeps_its_own_writes_across_switches() {
     branch_writes_across_switches(Lineage::new()).await;
-}
-
-#[tokio::test]
-async fn a_branch_on_a_kept_seal_keeps_its_existence_log_across_switches() {
-    let mut lineage = Lineage::new();
-    lineage.existence = true;
-    branch_writes_across_switches(lineage).await;
 }
 
 async fn branch_writes_across_switches(lineage: Lineage) {
@@ -794,9 +785,6 @@ async fn branch_writes_across_switches(lineage: Lineage) {
             .unwrap();
         assert_eq!(&titles(&replica).await, expected, "{bookmark}");
         fast.push(workspace_state(&replica).await);
-    }
-    if lineage.existence {
-        assert!(scalar(&replica, "SELECT count(*) FROM secure_existence_log").await >= 6);
     }
     replica
         .inner

@@ -1,12 +1,11 @@
 //! Schema fixtures and local projection plans. Replicated changes use seals.
 use super::*;
-use crate::replica::migrate::PlanStage;
 use crate::sql::SqlOptions;
-use crate::storage::{collect_rows, rows};
+use crate::storage::rows;
 use rocky_core::{
     Affinity, Collation, ColumnClass, DomainId, Generation, IndexColumn, LOGICAL_SCHEMA_FORMAT,
     LogicalColumn, LogicalIndex, LogicalSchema, LogicalTable, RowApplication, SchemaSource, Scope,
-    SqlValue, TableClass, TypedRows, UpdatePolicy,
+    SqlValue, TableClass, TypedRows,
 };
 use std::collections::BTreeMap;
 
@@ -19,14 +18,11 @@ fn column(name: &str, affinity: Affinity, not_null: bool) -> LogicalColumn {
         not_null,
         default: None,
         collation: Collation::Binary,
-        class: ColumnClass::Mergeable,
+        class: ColumnClass::Replicated,
     }
 }
 fn table(name: &str, mut columns: Vec<LogicalColumn>) -> LogicalTable {
     columns.push(column("id", Affinity::Integer, true));
-    let mut kind = column("row_kind", Affinity::Integer, true);
-    kind.default = Some("0".into());
-    columns.push(kind);
     let sql: Vec<String> = columns
         .iter()
         .map(|column| {
@@ -55,8 +51,7 @@ fn table(name: &str, mut columns: Vec<LogicalColumn>) -> LogicalTable {
     LogicalTable {
         sql_name: name.into(),
         granted_like: None,
-        class: TableClass::Mergeable,
-        coordinated: false,
+        class: TableClass::Replayed,
         create_sql: format!("CREATE TABLE {name}({})", sql.join(",")),
         auto_generate: false,
         columns,
@@ -71,13 +66,10 @@ fn table(name: &str, mut columns: Vec<LogicalColumn>) -> LogicalTable {
                 descending: false,
             }],
             create_sql: format!("CREATE UNIQUE INDEX {name}_identity ON {name}(id)"),
-            on_conflict: None,
             expressions: Vec::new(),
             predicate: None,
         }],
         foreign_keys: Vec::new(),
-
-        existence_log: false,
     }
 }
 pub(super) fn text(value: &str) -> SqlValue {
@@ -90,11 +82,7 @@ pub(super) fn text(value: &str) -> SqlValue {
 pub(super) struct Lineage {
     publisher: PrivateKey,
     pub(super) domain: Scope,
-    /// Every table keeps an existence log.
-    pub(super) existence: bool,
-    /// Every table is replayed.
-    pub(super) replayed: bool,
-    /// `tags` is partitioned by `label`; it requires `replayed`.
+    /// `tags` is partitioned by `label`.
     pub(super) partitioned: bool,
 }
 impl Lineage {
@@ -237,8 +225,6 @@ impl Lineage {
         Self {
             publisher,
             domain,
-            existence: false,
-            replayed: false,
             partitioned: false,
         }
     }
@@ -263,9 +249,6 @@ impl Lineage {
                 ],
             ));
         }
-        for table in tables.iter_mut().filter(|_| self.replayed) {
-            table.class = TableClass::Replayed;
-        }
         for tags in tables
             .iter_mut()
             .filter(|table| self.partitioned && table.sql_name == "tags")
@@ -286,15 +269,6 @@ impl Lineage {
             tags.indexes[0].create_sql =
                 "CREATE UNIQUE INDEX tags_identity ON tags(label,id)".into();
         }
-        // An existence log names rows by `id`.
-        for table in tables.iter_mut().filter(|_| self.existence) {
-            table.existence_log = true;
-            table.primary_key = vec!["id".into()];
-            table.create_sql = table
-                .create_sql
-                .replace(" PRIMARY KEY", "")
-                .replace("id INTEGER NOT NULL", "id INTEGER NOT NULL PRIMARY KEY");
-        }
         LogicalSchema {
             format: LOGICAL_SCHEMA_FORMAT,
             publisher: *self.publisher.public_key().as_bytes(),
@@ -304,42 +278,41 @@ impl Lineage {
                 version: generation,
                 identity: "lineage".into(),
             },
-            update_policy: UpdatePolicy::Changed,
             tables,
             views: Vec::new(),
             assertions: Vec::new(),
         }
     }
-    /// Generation 1 with an index on `title`: a local change.
+    /// Generation 1 with a local `drafts` table indexed on `body`: a local
+    /// change.
     fn indexed(&self) -> LogicalSchema {
         let mut schema = self.schema(1);
-        schema.tables[0].indexes.push(LogicalIndex {
-            name: "items_title".into(),
+        let mut drafts = table(
+            "drafts",
+            vec![
+                column("key", Affinity::Text, true),
+                column("body", Affinity::Text, false),
+            ],
+        );
+        drafts.class = TableClass::LocalOnly;
+        drafts.indexes.push(LogicalIndex {
+            name: "drafts_body".into(),
             unique: false,
             columns: vec![IndexColumn {
-                name: "title".into(),
+                name: "body".into(),
                 descending: false,
             }],
-            create_sql: "CREATE INDEX items_title ON items(title)".into(),
-            on_conflict: None,
+            create_sql: "CREATE INDEX drafts_body ON drafts(body)".into(),
             expressions: Vec::new(),
             predicate: None,
         });
+        schema.tables.insert(0, drafts);
         schema
     }
     pub(super) fn app(&self, generation: u32) -> TypedRows {
-        let schema = self.schema(generation);
-        let items = schema.table("items").unwrap();
-        let added = items
-            .columns
-            .iter()
-            // A replayed table has no register records to fill.
-            .filter(|column| !self.replayed && ["note", "rank"].contains(&column.sql_name.as_str()))
-            .map(|column| schema.field_id(items, column))
-            .collect();
-        TypedRows::new(schema.clone(), vec![DOMAIN])
+        TypedRows::new(self.schema(generation), vec![DOMAIN])
             .unwrap()
-            .at_generation(generation, added)
+            .at_generation(generation)
             .unwrap()
     }
     pub(super) fn definition(&self, generation: u32) -> rocky_core::ApplicationManifest {
@@ -559,12 +532,6 @@ impl Lineage {
             self.readers(generation),
         )
     }
-    /// The id of `items.note`.
-    fn note(&self) -> Commitment {
-        let schema = self.schema(3);
-        let items = schema.table("items").unwrap();
-        schema.field_id(items, items.column("note").unwrap())
-    }
     pub(super) async fn open(
         &self,
         path: &std::path::Path,
@@ -691,7 +658,7 @@ pub(super) async fn identity_insert(
                 .unwrap()
                 .columns
                 .iter()
-                .filter(|column| !["id", "row_kind"].contains(&column.name.as_str()))
+                .filter(|column| column.name != "id")
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>()
                 .join(","),
@@ -782,91 +749,80 @@ async fn frames_as(
 }
 
 #[tokio::test]
-async fn a_local_plan_survives_an_interruption_at_every_step() {
+async fn an_interrupted_local_plan_finishes_when_the_replica_opens() {
     let lineage = Lineage::new();
     let dir = TempDir::new().unwrap();
     let node = PrivateKey::new();
-    for (round, stage) in [PlanStage::Create, PlanStage::Fill, PlanStage::Switch]
-        .into_iter()
-        .enumerate()
-    {
-        let path = dir.path().join(format!("{round}.db"));
-        let replica = lineage.open(&path, &node, 1, None).await.unwrap();
-        insert(&replica, 0..150).await;
-        insert(&replica, 150..300).await;
-        // A second fill step is interrupted: the first one committed.
-        replica
-            .inject_plan_fault(stage, usize::from(stage == PlanStage::Fill))
-            .await;
-        let failed = replica
-            .install_tables(lineage.indexed(), lineage.domain, lineage.readers(1))
-            .await;
-        assert!(matches!(failed, Err(Error::InjectedFailure)), "{failed:?}");
-        let pending = replica.projection_plan().await.unwrap().unwrap();
-        assert_eq!(pending.tables, 1);
-        assert_eq!(pending.filled, usize::from(stage == PlanStage::Switch));
-        // Nothing half-built is visible; the installed table still answers.
-        assert_eq!(
-            select(&replica, "SELECT count(*) FROM items").await,
-            vec![vec![SqlValue::Integer(300)]]
-        );
-        // Another plan waits for this one.
-        let mut other = lineage.indexed();
-        other.tables[0].indexes[1].name = "items_by_title".into();
-        other.tables[0].indexes[1].create_sql =
-            "CREATE INDEX items_by_title ON items(title)".into();
-        let other = replica
-            .install_tables(other, lineage.domain, lineage.readers(1))
-            .await;
-        assert!(matches!(other, Err(Error::Incompatible(_))), "{other:?}");
-        // Writes between steps reach the shadow as well.
-        let writer = session(&replica).await;
-        writer
-            .run("UPDATE items SET title='changed' WHERE key='0001'", vec![])
-            .await
-            .unwrap();
-        writer
-            .run("DELETE FROM items WHERE key='0299'", vec![])
-            .await
-            .unwrap();
-        identity_insert(&writer, "INSERT INTO items VALUES('9999','late')", vec![])
-            .await
-            .unwrap();
-        drop(writer);
-        drop(replica);
-        // Reopening finishes the same plan before anything else runs.
-        let replica = EncryptedReplica::open(&path, lineage.app(1), lineage.config(1, &node))
-            .await
-            .unwrap();
-        assert_eq!(replica.projection_plan().await.unwrap(), None);
-        replica
-            .install_tables(lineage.indexed(), lineage.domain, lineage.readers(1))
-            .await
-            .unwrap();
-        assert_eq!(
-            select(&replica, "SELECT count(*), max(key) FROM items").await,
-            vec![vec![SqlValue::Integer(300), text("9999")]]
-        );
-        assert_eq!(
-            select(&replica, "SELECT title FROM items WHERE key='0001'").await,
-            vec![vec![text("changed")]]
-        );
-        let indexes = {
-            let inner = replica.inner.lock(crate::replica::Class::Background).await;
-            rows(
-                &inner.conn,
-                "SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name='items' AND name NOT LIKE 'sqlite_%'",
-            )
-            .await
-            .unwrap()
-        };
-        assert_eq!(
-            indexes,
-            vec![vec![text("items_identity")], vec![text("items_title")]]
-        );
-        let status = replica.generations().await.unwrap();
-        assert_eq!(status.current, Generation { schema: 1 });
-    }
+    let path = dir.path().join("a.db");
+    let replica = lineage.open(&path, &node, 1, None).await.unwrap();
+    insert(&replica, 0..150).await;
+    insert(&replica, 150..300).await;
+    replica.fail_next_plan_switch().await;
+    let failed = replica
+        .install_tables(lineage.indexed(), lineage.domain, lineage.readers(1))
+        .await;
+    assert!(matches!(failed, Err(Error::InjectedFailure)), "{failed:?}");
+    assert_eq!(replica.projection_plan().await.unwrap().unwrap().tables, 1);
+    // The installed tables still answer.
+    assert_eq!(
+        select(&replica, "SELECT count(*) FROM items").await,
+        vec![vec![SqlValue::Integer(300)]]
+    );
+    // Another plan waits for this one.
+    let mut other = lineage.indexed();
+    other.tables[0].indexes[1].name = "drafts_by_body".into();
+    other.tables[0].indexes[1].create_sql = "CREATE INDEX drafts_by_body ON drafts(body)".into();
+    let other = replica
+        .install_tables(other, lineage.domain, lineage.readers(1))
+        .await;
+    assert!(matches!(other, Err(Error::Incompatible(_))), "{other:?}");
+    // Writes before the switch keep their rows.
+    let writer = session(&replica).await;
+    writer
+        .run("UPDATE items SET title='changed' WHERE key='0001'", vec![])
+        .await
+        .unwrap();
+    writer
+        .run("DELETE FROM items WHERE key='0299'", vec![])
+        .await
+        .unwrap();
+    identity_insert(&writer, "INSERT INTO items VALUES('9999','late')", vec![])
+        .await
+        .unwrap();
+    drop(writer);
+    drop(replica);
+    // Reopening finishes the same plan before anything else runs.
+    let replica = EncryptedReplica::open(&path, lineage.app(1), lineage.config(1, &node))
+        .await
+        .unwrap();
+    assert_eq!(replica.projection_plan().await.unwrap(), None);
+    replica
+        .install_tables(lineage.indexed(), lineage.domain, lineage.readers(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        select(&replica, "SELECT count(*), max(key) FROM items").await,
+        vec![vec![SqlValue::Integer(300), text("9999")]]
+    );
+    assert_eq!(
+        select(&replica, "SELECT title FROM items WHERE key='0001'").await,
+        vec![vec![text("changed")]]
+    );
+    let indexes = {
+        let inner = replica.inner.lock(crate::replica::Class::Background).await;
+        rows(
+            &inner.conn,
+            "SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name='drafts' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        indexes,
+        vec![vec![text("drafts_body")], vec![text("drafts_identity")]]
+    );
+    let status = replica.generations().await.unwrap();
+    assert_eq!(status.current, Generation { schema: 1 });
 }
 
 #[tokio::test]
@@ -893,12 +849,12 @@ async fn an_uninterrupted_local_plan_switches_while_reads_continue() {
         let inner = replica.inner.lock(crate::replica::Class::Background).await;
         rows(
             &inner.conn,
-            "EXPLAIN QUERY PLAN SELECT key FROM items WHERE title='title 3'",
+            "EXPLAIN QUERY PLAN SELECT key FROM drafts WHERE body='body 3'",
         )
         .await
         .unwrap()
     };
-    assert!(format!("{plan:?}").contains("items_title"), "{plan:?}");
+    assert!(format!("{plan:?}").contains("drafts_body"), "{plan:?}");
     // A renamed field is another field: refused before a plan.
     let mut renamed = lineage.schema(1);
     renamed.tables[0].columns[1].sql_name = "name".into();
@@ -973,7 +929,49 @@ async fn a_backup_copy_opens_only_under_a_fresh_identity_and_keeps_its_history()
     );
 }
 
-mod held;
+/// Catches `target` up on `scope` from `source` by range pages, voids
+/// first, as a session does.
+async fn sync(
+    source: &EncryptedReplica<TypedRows>,
+    target: &EncryptedReplica<TypedRows>,
+    target_key: &PrivateKey,
+    lineage: &Lineage,
+    generation: u32,
+    scope: ResourceScope,
+) {
+    let credentials = lineage.credentials(generation, target_key);
+    // As the target's session hello declares its followed tip.
+    let tip = target.followed_tip().await;
+    source
+        .admit_peer(target_key.public_key(), &credentials, tip)
+        .await
+        .unwrap();
+    let mut after = None;
+    loop {
+        let frontier = target.frontier(scope).await.unwrap();
+        let page = source
+            .range_page(
+                target_key.public_key(),
+                &credentials,
+                &frontier,
+                after,
+                MAX_SECURE_FRAME,
+            )
+            .await
+            .unwrap();
+        for status in target.receive_voids(&page.voids).await {
+            status.unwrap();
+        }
+        for status in target.receive_all(page.frames).await {
+            status.unwrap();
+        }
+        after = page.next;
+        if after.is_none() {
+            return;
+        }
+    }
+}
+
 mod replayed;
 mod sideways;
 mod switches;

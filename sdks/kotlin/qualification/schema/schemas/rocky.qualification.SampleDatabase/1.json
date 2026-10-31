@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "b99abff2396aa14ff30fb583ae307b7c",
+    "identityHash": "148cd39324d5836505f40b1b2a9ad47a",
     "entities": [
       {
         "tableName": "samples",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sensor` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `reading` REAL, `raw` BLOB, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`sensor`, `sequence`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sensor` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `reading` REAL, `raw` BLOB, `id` INTEGER NOT NULL, PRIMARY KEY(`sensor`, `sequence`))",
         "fields": [
           {
             "fieldPath": "sensor",
@@ -33,12 +33,6 @@
           {
             "fieldPath": "id",
             "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
             "affinity": "INTEGER",
             "notNull": true
           }
@@ -76,7 +70,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'b99abff2396aa14ff30fb583ae307b7c')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '148cd39324d5836505f40b1b2a9ad47a')"
     ]
   }
 }

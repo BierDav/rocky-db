@@ -159,7 +159,7 @@ mod tests {
             "rocky_logical_schema",
             "d0000000000000000000000000000000000000000000000000000000000000000_rocky_logical_schema",
         ] {
-            for version in [0, 1, 2, 3, 4, 6] {
+            for version in [0, 1, 2, 3, 4, 5, 7] {
                 let directory = tempfile::tempdir().unwrap();
                 let path = directory.path().join("file.sqlite");
                 let conn = sqlite::Connection::open(&path).unwrap();

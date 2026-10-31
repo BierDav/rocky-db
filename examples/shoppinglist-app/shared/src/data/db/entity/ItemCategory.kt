@@ -2,7 +2,7 @@ package org.example.examples.shopping.data.db.entity
 
 import androidx.room.*
 
-/** Item [item] of [list] is in [category]; deleting either hides the link. */
+/** Item [item] of [list] is in [category]; deleting either deletes the link. */
 @Entity(
     tableName = "item_categories",
     primaryKeys = ["list", "item", "category"],
@@ -20,5 +20,4 @@ data class ItemCategory(
     val item: Long,
     val category: Long,
     val id: Long,
-    @ColumnInfo(name = "row_kind") val rowKind: Long = 0,
 )

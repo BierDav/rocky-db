@@ -109,11 +109,6 @@ impl<A: RowApplication> Inner<A> {
         &mut self,
         scope: ResourceScope,
     ) -> Result<PruneStep, Error> {
-        // A checkpoint holds row records, which replayed partitions keep
-        // none of: no checkpoint covers their operations, so they stay.
-        if self.replayed_scope(scope) {
-            return Ok(PruneStep::blocked(PruneBlock::NoCheckpoint));
-        }
         let Some(id) = self.find_scope_id(scope).await? else {
             return Ok(PruneStep::blocked(PruneBlock::NoCheckpoint));
         };

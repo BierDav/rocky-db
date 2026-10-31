@@ -135,7 +135,6 @@ private fun importEntity(name: String, entity: JsonObject): Table {
             require(identityIndex == null) { "duplicate identity index" }
             identityIndex = names
         }
-        // A unique index needs Rocky's conflict policy, added with `onConflict` on top of the import.
         val orders = index["orders"]?.jsonArray.orEmpty().map { it.jsonPrimitive.content.uppercase() }
         require(orders.isEmpty() || orders.size == names.size) { "$indexName: index order count" }
         require(orders.all { it == "ASC" || it == "DESC" }) { "$indexName: unsupported index order" }
@@ -170,13 +169,11 @@ private fun importEntity(name: String, entity: JsonObject): Table {
         }
     }
     val builder = TableBuilder(name)
-    columns.filterNot { it.name in setOf("id", "row_kind") }.forEach(builder::column)
-    // Every entity carries Rocky's identity as fields: `id` names the incarnation, `row_kind` is 0 for application rows.
-    for (field in listOf("id", "row_kind")) {
-        val column = columns.firstOrNull { it.name == field } ?: error("declare Rocky's id and row_kind fields; $field is missing")
-        require(column.kind == "integer" && !column.nullable && column.collation == Collation.Binary) { "$field must be a non-null integer identity field" }
-        require(column.default == null || (field == "row_kind" && column.default == JsonPrimitive(0L))) { "$field: unsupported default" }
-    }
+    columns.filterNot { it.name == "id" }.forEach(builder::column)
+    // Every entity carries Rocky's identity as its `id` field.
+    val id = columns.firstOrNull { it.name == "id" } ?: error("declare Rocky's id field")
+    require(id.kind == "integer" && !id.nullable && id.collation == Collation.Binary) { "id must be a non-null integer identity field" }
+    require(id.default == null) { "id: unsupported default" }
     require("id" in key || identityIndex != null) {
         "declare the identity index @Index(value = [\"id\"], unique = true, name = \"${name}_identity\")"
     }

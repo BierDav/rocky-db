@@ -3,7 +3,6 @@ mod incoming;
 mod pruning;
 mod rebootstrap;
 pub(crate) mod retention;
-mod sql;
 use crate::read::{Changed, ReadPlan, ReadPool, Reads};
 use crate::scoped_connection::ScopedConnection;
 use crate::{
@@ -15,7 +14,6 @@ use rocky_core::{
     AdmissionBoundary, AuthorSequence, Envelope, LamportTime, LocalRevision, NodeId, OperationId,
     ProjectionStatement, SqlValue, StoredApplication, required_dependencies,
 };
-pub(crate) use sql::Sealed;
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use tokio::sync::watch;
 
@@ -129,8 +127,6 @@ pub(crate) struct Worker<A: StoredApplication> {
     /// Observers of this domain's committed tables.
     events: Arc<crate::observe::TableEvents>,
     retention: retention::Retention,
-    /// Session classification of the tables, built by the first SQL session.
-    sql: Option<Arc<crate::capture::Plan>>,
     /// Retained operation records and their accounted bytes.
     retained: usize,
     retained_bytes: usize,
@@ -347,7 +343,6 @@ where
             targets: Default::default(),
             events,
             retention,
-            sql: None,
             retained: 0,
             retained_bytes: 0,
             frontier: BTreeMap::new(),
@@ -378,11 +373,6 @@ where
             }
             if fresh {
                 worker.conn().execute(storage::UNAPPLIED_INDEX, ()).await?;
-            }
-            if worker.app.sql_writes().is_some() {
-                for sql in crate::sql::SCHEMA {
-                    worker.conn().execute(*sql, ()).await?;
-                }
             }
             if fresh {
                 for sql in retention::SCHEMA {
@@ -552,10 +542,6 @@ where
             }
             Command::Retention(request, reply) => {
                 let _ = reply.send(self.retention(*request).await);
-            }
-            Command::Sql(crate::sql::Request::Outcome(token), reply) => {
-                let outcome = self.sql_outcome(token).await;
-                let _ = reply.send(outcome.map(crate::sql::Response::Outcome));
             }
             other => other.refuse(Error::Closed),
         }

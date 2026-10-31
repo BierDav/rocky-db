@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.Flow
 import org.example.examples.shopping.data.db.entity.DecisionRow
 import org.example.examples.shopping.data.db.entity.RequestRow
 
-/** Reads ordinary request rows and committed coordinated decisions. */
+/** Reads request and decision rows. */
 @Dao
 interface ApprovalDao {
     @Query("SELECT * FROM requests ORDER BY id")

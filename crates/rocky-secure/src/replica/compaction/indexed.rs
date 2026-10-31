@@ -1,65 +1,6 @@
 //! Indexed seal cuts and projection differences.
 use super::*;
 
-impl<A: RowApplication> Inner<A> {
-    /// Maintains the seal candidates of a natural-key slot after projection.
-    pub(in crate::replica) async fn index_seal_slot(
-        &self,
-        typed: &typed::Typed,
-        scope: ResourceScope,
-        key: Commitment,
-        image: Option<&[SqlValue]>,
-    ) -> Result<(), Error> {
-        if typed.shadowed {
-            return Ok(());
-        }
-        let Some(table) = typed.by_scope(scope) else {
-            return Ok(());
-        };
-        let id = self.scope_id(scope).await?;
-        let fields = image
-            .map(|image| typed.rows.fields(&table.table, image))
-            .transpose()
-            .map_err(Error::Corrupt)?;
-        let records = collect_rows(self.conn.query(
-            "SELECT r.row,r.fields FROM secure_row_keys k JOIN secure_rows r ON r.scope=k.scope AND r.row=k.row WHERE k.scope=? AND k.key=?",
-            bindings(vec![SqlValue::Integer(id), SqlValue::Blob(identity::key_digest(&key))]),
-        ).await?).await?;
-        for record in records {
-            let [SqlValue::Blob(row), SqlValue::Blob(bytes)] = record.as_slice() else {
-                return Err(Error::Corrupt("seal candidate".into()));
-            };
-            let record = self.decode_record(bytes).await?;
-            if record
-                .key
-                .as_ref()
-                .map_or(row.as_slice(), |key| key.as_slice())
-                != key.as_slice()
-            {
-                continue;
-            }
-            let differs = record.deleted
-                || fields.as_ref().is_none_or(|fields| {
-                    fields
-                        .iter()
-                        .any(|(field, value)| record.fields.get(field) != Some(value))
-                });
-            let sql = if differs {
-                "INSERT OR IGNORE INTO secure_seal_candidates VALUES(?,?)"
-            } else {
-                "DELETE FROM secure_seal_candidates WHERE scope=? AND row=?"
-            };
-            self.conn
-                .execute(
-                    sql,
-                    bindings(vec![SqlValue::Integer(id), SqlValue::Blob(row.clone())]),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
 pub(in crate::replica) async fn check_schema(conn: &ScopedConnection) -> Result<(), Error> {
     for sql in crate::store::SCHEMA
         .iter()
@@ -77,7 +18,6 @@ pub(in crate::replica) async fn check_schema(conn: &ScopedConnection) -> Result<
                 || sql.contains("secure_rows_dead ")
                 || sql.contains("secure_row_positions")
                 || sql.contains("secure_row_position_operations")
-                || sql.contains("secure_seal_candidates")
                 || sql.contains("secure_finalization_rows")
                 || sql.contains("secure_seal_operation_positions")
         })
@@ -199,31 +139,17 @@ impl<A: RowApplication> Inner<A> {
 }
 
 impl<A: RowApplication> Inner<A> {
-    pub(super) async fn has_indexed_seal_drops(
-        &self,
-        scope: ResourceScope,
-        tip: TipId,
-        id: i64,
-    ) -> Result<bool, Error> {
-        let typed = self
-            .workspace
-            .typed
-            .as_ref()
-            .and_then(|typed| typed.by_scope(scope))
-            .is_some();
-        let (missing, fields) = self.seal_shape_predicate(scope, tip, 2)?;
-        let sql = if typed {
-            format!(
-                "SELECT 1 FROM secure_rows WHERE scope=?1 AND live=0 UNION ALL SELECT 1 FROM secure_seal_candidates WHERE scope=?1 UNION ALL SELECT 1 FROM secure_scope_shapes s WHERE s.scope=?1 AND ({missing}) LIMIT 1"
-            )
-        } else {
-            "SELECT 1 FROM secure_rows WHERE scope=?1 AND live=0 LIMIT 1".into()
-        };
-        let params = std::iter::once(SqlValue::Integer(id))
-            .chain(fields)
-            .collect();
-        Ok(!collect_rows(self.conn.query(sql, bindings(params)).await?)
-            .await?
-            .is_empty())
+    /// Whether the scope stored as `id` holds a tombstone to drop.
+    pub(super) async fn has_indexed_seal_drops(&self, id: i64) -> Result<bool, Error> {
+        Ok(!collect_rows(
+            self.conn
+                .query(
+                    "SELECT 1 FROM secure_rows WHERE scope=? AND live=0 LIMIT 1",
+                    [id],
+                )
+                .await?,
+        )
+        .await?
+        .is_empty())
     }
 }

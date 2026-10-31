@@ -144,8 +144,7 @@ internal fun Run.seals() {
 }
 
 /**
- * Slice 2: the trusted desktop opens `dev` on main's latest seal, the member follows it, both write, and a
- * coordinated write runs through dev's own log. The phone on `main` receives nothing of dev; the member returns and
+ * Slice 2: the trusted desktop opens `dev` on main's latest seal, the member follows it, and both write. The phone on `main` receives nothing of dev; the member returns and
  * drops it.
  */
 internal fun Run.branch() {
@@ -156,10 +155,10 @@ internal fun Run.branch() {
     shareAll(trusted, weekly, member, phone)
     // Sealed first, so dev opens on main's latest seal while main's tip and its log stay open.
     trusted.call("seal")
-    // A coordinated write on main, so main's log has a position to keep.
+    // A decision on main, which dev never shows to main's devices.
     val onMain = member.call("ask", "title" to "Paint").text
     retrying("a decision on main", trusted, member) { trusted.call("decide", "key" to onMain) }
-    val mainPosition = trusted.call("coordinated").jsonPrimitive.long
+    val mainLog = trusted.call("coordinated").text
     eventually("both members to hold Weekly and main's decision", member, phone, trusted) {
         listOf(member, phone).all { it.items(weekly) == listOf("Milk") && it.call("decisions").jsonArray.map { key -> key.text } == listOf(onMain) }
     }
@@ -182,8 +181,8 @@ internal fun Run.branch() {
     }
     val onDev = member.call("ask", "title" to "Ladder").text
     retrying("a decision on dev", trusted, member) { trusted.call("decide", "key" to onDev) }
-    val devPosition = trusted.call("coordinated").jsonPrimitive.long
-    notes += "coordinated: main's log at $mainPosition; dev's log at $devPosition after its decision"
+    val devLog = trusted.call("coordinated").text
+    expect(devLog != mainLog) { "dev follows main's log $mainLog" }
 
     phone.call("add", "list" to weekly, "title" to "Phone on main")
     phone.settle(3)
@@ -196,14 +195,14 @@ internal fun Run.branch() {
     member.settle()
     member.call("leave", "name" to "dev")
     trusted.call("leave", "name" to "dev", "delete" to true)
-    expect(trusted.call("coordinated").jsonPrimitive.long == mainPosition) { "main's log moved to ${trusted.call("coordinated")} from $mainPosition" }
+    expect(trusted.call("coordinated").text == mainLog) { "the trusted node follows ${trusted.call("coordinated")}, not main's log $mainLog" }
     for (device in listOf(trusted, member, phone)) {
         eventually("${device.name} to read main", device, trusted, phone) { device.items(weekly) == listOf("Milk", "Phone on main") }
         expect(device.call("decisions").jsonArray.map { it.text } == listOf(onMain)) { "${device.name} on main read decisions ${device.call("decisions")}" }
     }
     expect(dev !in member.storage().getValue("tips").jsonArray.map { it.text }) { "the member kept dev's frames after dropping it" }
     eventually("dev's deletion to reach the member", member, trusted) { !member.tips().getValue("bookmarks").jsonObject.containsKey("dev") }
-    notes += "main's log stayed at $mainPosition; the member dropped dev and every device reads main"
+    notes += "the trusted node follows main's log again; the member dropped dev and every device reads main"
 }
 
 /** Reopens under app version [app]; a new endpoint, so [peers] learn its contact again. */

@@ -54,38 +54,23 @@ async fn rewind_mark(replica: &Replica, scope: ResourceScope, sequence: u32) {
         )
         .await
         .unwrap();
-    inner.conn.execute(
-        "DELETE FROM secure_admission_claims WHERE allocation=(SELECT allocation FROM secure_identity_partitions WHERE scope=?) AND (identity & 4294967295)>?",
-        crate::storage::bindings(vec![SqlValue::Blob(encode(&scope).unwrap()), SqlValue::Integer(i64::from(sequence))]),
-    ).await.unwrap();
+    inner
+        .conn
+        .execute(
+            "DELETE FROM secure_identity_ledger WHERE scope=?",
+            [encode(&scope).unwrap()],
+        )
+        .await
+        .unwrap();
 }
-async fn status(replica: &Replica, hash: Hash) -> Option<String> {
+/// Why `replica` dropped the transaction of `hash`, if it did.
+async fn dropped(replica: &Replica, hash: Hash) -> Option<String> {
     let inner = replica.inner.lock(crate::replica::Class::Background).await;
-    let records = crate::storage::collect_rows(
+    match crate::storage::collect_rows(
         inner
             .conn
             .query(
-                "SELECT status FROM secure_operations WHERE hash=?",
-                [hash.as_bytes().to_vec()],
-            )
-            .await
-            .unwrap(),
-    )
-    .await
-    .unwrap();
-    match records.first().map(Vec::as_slice) {
-        Some([SqlValue::Text(status)]) => Some(status.clone()),
-        None => None,
-        other => panic!("{other:?}"),
-    }
-}
-async fn consumed(replica: &Replica, hash: Hash) -> bool {
-    let inner = replica.inner.lock(crate::replica::Class::Background).await;
-    !crate::storage::collect_rows(
-        inner
-            .conn
-            .query(
-                "SELECT reason FROM secure_consumed WHERE hash=?",
+                "SELECT dropped FROM secure_replayed WHERE hash=?",
                 [hash.as_bytes().to_vec()],
             )
             .await
@@ -93,7 +78,12 @@ async fn consumed(replica: &Replica, hash: Hash) -> bool {
     )
     .await
     .unwrap()
-    .is_empty()
+    .first()
+    .map(Vec::as_slice)
+    {
+        Some([SqlValue::Text(reason)]) => Some(reason.clone()),
+        _ => None,
+    }
 }
 /// `server` holds `writer`'s frames, finalizes and compacts the seal the
 /// writer signs; the writer itself never finalizes.
@@ -188,20 +178,14 @@ async fn a_reused_identity_beyond_the_seal_applies_once() {
     assert_eq!(own_mark(&a, scope).await, (author, covered + 1));
 
     // J holds every frame, then imports the first seal's base: y beyond it
-    // reapplies and z never materializes.
+    // reapplies and z's transaction drops.
     let j = open(&lineage, &dir, "j", &keys[2]).await;
     crate::tests::exchange_graphs(&a, &j, lineage.domain).await;
     sync(&lineage, &a, &j, &keys[2]).await;
     let (offered, report) = import_all(&lineage, &s, &j, &keys[2]).await;
     assert_eq!(marks(&offered), vec![(author, covered)]);
     assert!(report.reapplied.contains(&y), "{report:?}");
-    assert!(!report.reapplied.contains(&z), "{report:?}");
-    assert_ne!(status(&j, z).await.as_deref(), Some("pending"));
-    assert!(
-        status(&j, z).await.as_deref() == Some("rejected") || consumed(&j, z).await,
-        "{:?}",
-        status(&j, z).await
-    );
+    assert_eq!(dropped(&j, z).await.as_deref(), Some("admission"));
     assert_eq!(titles(&j).await, vec![vec![text("x"), text("covered")]]);
     assert_eq!(own_mark(&j, scope).await, (author, covered + 1));
 }
@@ -236,59 +220,9 @@ async fn a_retired_covered_birth_cannot_be_reused_after_an_import() {
     sync(&lineage, &a, &j, &keys[2]).await;
     // The importer's covered mark refuses the reused identity, exactly as a
     // device that applied the retired birth itself would.
-    assert_eq!(status(&j, reused).await.as_deref(), Some("rejected"));
+    assert_eq!(dropped(&j, reused).await.as_deref(), Some("admission"));
     assert_eq!(own_mark(&j, scope).await, (author, retired));
     assert_eq!(titles(&j).await, vec![vec![text("x"), text("kept")]]);
-}
-
-#[tokio::test]
-async fn a_consumed_birth_is_covered_by_the_next_seal() {
-    let lineage = Lineage::new();
-    let dir = TempDir::new().unwrap();
-    let keys = [PrivateKey::new(), PrivateKey::new(), PrivateKey::new()];
-    let scope = lineage.scope("items");
-    let a = open(&lineage, &dir, "a", &keys[0]).await;
-    let s = open(&lineage, &dir, "s", &keys[1]).await;
-    follow_main(&lineage, &a).await;
-    insert(&a, "x", "covered").await;
-    compacted_seal(&lineage, &a, &s, &keys[1]).await;
-    let (author, covered) = own_mark(&a, scope).await;
-    insert(&a, "y", "first").await;
-    delete(&a, "y").await;
-    sync(&lineage, &a, &s, &keys[1]).await;
-    // On the finalized server a second birth of y's identity is consumed:
-    // its row's tombstone is still there.
-    compact_own(&lineage, &a).await;
-    rewind_mark(&a, scope, covered).await;
-    insert(&a, "z", "reused").await;
-    let z = last_operation(&a, scope).await;
-    sync(&lineage, &a, &s, &keys[1]).await;
-    assert_eq!(status(&s, z).await.as_deref(), Some("applied"));
-    assert!(consumed(&s, z).await);
-    assert_eq!(titles(&s).await, vec![vec![text("x"), text("covered")]]);
-    // A rebuild replays past the seal drop of y's tombstone and still
-    // never materializes z; so do the open and full audits.
-    s.rebuild_projection(scope).await.unwrap();
-    assert_eq!(titles(&s).await, vec![vec![text("x"), text("covered")]]);
-    s.audit(scope).await.unwrap();
-    drop(s);
-    let s = open(&lineage, &dir, "s", &keys[1]).await;
-    s.audit(scope).await.unwrap();
-    assert_eq!(titles(&s).await, vec![vec![text("x"), text("covered")]]);
-    // A seal past z covers its consumed birth; signing self-checks it.
-    let next = seal(&lineage, &a).await.id().unwrap();
-    crate::tests::exchange_graphs(&a, &s, lineage.domain).await;
-    assert_eq!(
-        s.compact(lineage.domain, 0).await.unwrap().compacted,
-        Some(next)
-    );
-    assert_eq!(titles(&s).await, vec![vec![text("x"), text("covered")]]);
-    let j = open(&lineage, &dir, "j", &keys[2]).await;
-    let (offered, _) = import_all(&lineage, &s, &j, &keys[2]).await;
-    assert_eq!(offered.statement.seal, Some(next));
-    assert_eq!(marks(&offered), vec![(author, covered + 1)]);
-    assert_eq!(titles(&j).await, vec![vec![text("x"), text("covered")]]);
-    j.audit(scope).await.unwrap();
 }
 
 /// `target` imports `source`'s kept checkpoint of `scope` at `sealed`.
@@ -401,66 +335,6 @@ async fn transaction(replica: &Replica, statements: &[(&str, Option<i64>)]) -> R
 }
 
 #[tokio::test]
-async fn a_consumed_reuse_in_a_mixed_frame_drops_only_that_birth() {
-    let lineage = Lineage::new();
-    let dir = TempDir::new().unwrap();
-    let keys = [PrivateKey::new(), PrivateKey::new(), PrivateKey::new()];
-    let scope = lineage.scope("items");
-    let a = open(&lineage, &dir, "a", &keys[0]).await;
-    let s = open(&lineage, &dir, "s", &keys[1]).await;
-    follow_main(&lineage, &a).await;
-    insert(&a, "x", "covered").await;
-    compacted_seal(&lineage, &a, &s, &keys[1]).await;
-    let (author, covered) = own_mark(&a, scope).await;
-    insert(&a, "y", "first").await;
-    delete(&a, "y").await;
-    sync(&lineage, &a, &s, &keys[1]).await;
-    compact_own(&lineage, &a).await;
-    rewind_mark(&a, scope, covered).await;
-    // One frame: a reused birth of y's identity, an update and a fresh birth.
-    transaction(
-        &a,
-        &[
-            (
-                "INSERT INTO items(key,title,id) VALUES('z','reused',?id)",
-                None,
-            ),
-            ("UPDATE items SET title='edited' WHERE key='x'", None),
-            (
-                "INSERT INTO items(key,title,id) VALUES('w','fresh',?id)",
-                None,
-            ),
-        ],
-    )
-    .await
-    .unwrap();
-    let mixed = last_operation(&a, scope).await;
-    sync(&lineage, &a, &s, &keys[1]).await;
-    assert_eq!(status(&s, mixed).await.as_deref(), Some("applied"));
-    assert!(consumed(&s, mixed).await);
-    let expected = vec![
-        vec![text("w"), text("fresh")],
-        vec![text("x"), text("edited")],
-    ];
-    assert_eq!(titles(&s).await, expected);
-    assert_eq!(own_mark(&s, scope).await, (author, covered + 2));
-    s.rebuild_projection(scope).await.unwrap();
-    assert_eq!(titles(&s).await, expected);
-    s.audit(scope).await.unwrap();
-    let next = seal(&lineage, &a).await.id().unwrap();
-    crate::tests::exchange_graphs(&a, &s, lineage.domain).await;
-    assert_eq!(
-        s.compact(lineage.domain, 0).await.unwrap().compacted,
-        Some(next)
-    );
-    assert_eq!(titles(&s).await, expected);
-    let j = open(&lineage, &dir, "j", &keys[2]).await;
-    let (offered, _) = import_all(&lineage, &s, &j, &keys[2]).await;
-    assert_eq!(marks(&offered), vec![(author, covered + 2)]);
-    assert_eq!(titles(&j).await, expected);
-}
-
-#[tokio::test]
 async fn births_of_one_frame_compare_with_the_marks_it_entered_with() {
     let lineage = Lineage::new();
     let dir = TempDir::new().unwrap();
@@ -531,93 +405,6 @@ async fn births_of_one_frame_compare_with_the_marks_it_entered_with() {
 }
 
 #[tokio::test]
-async fn a_reuse_pages_after_its_retirement_across_a_seal_drop_never_materializes() {
-    let lineage = Lineage::new();
-    let dir = TempDir::new().unwrap();
-    let keys = [PrivateKey::new(), PrivateKey::new(), PrivateKey::new()];
-    let scope = lineage.scope("items");
-    let a = open(&lineage, &dir, "a", &keys[0]).await;
-    let s = open(&lineage, &dir, "s", &keys[1]).await;
-    follow_main(&lineage, &a).await;
-    insert(&a, "x", "covered").await;
-    compacted_seal(&lineage, &a, &s, &keys[1]).await;
-    let (_, covered) = own_mark(&a, scope).await;
-    insert(&a, "y", "first").await;
-    delete(&a, "y").await;
-    // More than a replay page of other operations between them.
-    for round in 0..12 {
-        super::super::generations::write(
-            &a,
-            &format!("UPDATE items SET title='edit {round}' WHERE key='x'"),
-        )
-        .await;
-    }
-    sync(&lineage, &a, &s, &keys[1]).await;
-    compact_own(&lineage, &a).await;
-    rewind_mark(&a, scope, covered).await;
-    insert(&a, "z", "reused").await;
-    sync(&lineage, &a, &s, &keys[1]).await;
-    let expected = vec![vec![text("x"), text("edit 11")]];
-    assert_eq!(titles(&s).await, expected);
-    // Rebuild, audit and compaction replay y and z on different pages,
-    // with the seal drop of y's tombstone between them.
-    s.rebuild_projection(scope).await.unwrap();
-    assert_eq!(titles(&s).await, expected);
-    s.audit(scope).await.unwrap();
-    seal(&lineage, &a).await;
-    crate::tests::exchange_graphs(&a, &s, lineage.domain).await;
-    assert!(
-        s.compact(lineage.domain, 0)
-            .await
-            .unwrap()
-            .compacted
-            .is_some()
-    );
-    assert_eq!(titles(&s).await, expected);
-    s.audit(scope).await.unwrap();
-    let j = open(&lineage, &dir, "j", &keys[2]).await;
-    import_all(&lineage, &s, &j, &keys[2]).await;
-    assert_eq!(titles(&j).await, expected);
-}
-
-#[tokio::test]
-async fn a_replay_from_no_base_seeds_nothing_and_still_retires_identities() {
-    let lineage = Lineage::new();
-    let dir = TempDir::new().unwrap();
-    let keys = [PrivateKey::new(), PrivateKey::new()];
-    let scope = lineage.scope("items");
-    let a = open(&lineage, &dir, "a", &keys[0]).await;
-    let s = open(&lineage, &dir, "s", &keys[1]).await;
-    follow_main(&lineage, &a).await;
-    insert(&a, "x", "kept").await;
-    let (_, kept) = own_mark(&a, scope).await;
-    // S finalizes a first seal without compacting: it keeps no base.
-    sync(&lineage, &a, &s, &keys[1]).await;
-    s.follow_bookmark(lineage.domain, "main").await.unwrap();
-    seal(&lineage, &a).await;
-    crate::tests::exchange_graphs(&a, &s, lineage.domain).await;
-    s.finalize_path(lineage.domain).await.unwrap();
-    let compaction = s.compaction_status(lineage.domain).await.unwrap();
-    assert!(compaction.finalized.is_some() && compaction.compacted.is_none());
-    insert(&a, "y", "first").await;
-    delete(&a, "y").await;
-    sync(&lineage, &a, &s, &keys[1]).await;
-    compact_own(&lineage, &a).await;
-    rewind_mark(&a, scope, kept).await;
-    insert(&a, "z", "reused").await;
-    let z = last_operation(&a, scope).await;
-    sync(&lineage, &a, &s, &keys[1]).await;
-    assert_eq!(status(&s, z).await.as_deref(), Some("applied"));
-    assert!(consumed(&s, z).await);
-    let expected = vec![vec![text("x"), text("kept")]];
-    assert_eq!(titles(&s).await, expected);
-    // Replay from nothing applies the drop at the bound, then meets z.
-    s.rebuild_projection(scope).await.unwrap();
-    assert_eq!(titles(&s).await, expected);
-    s.audit(scope).await.unwrap();
-}
-
-#[tokio::test]
 async fn a_signed_empty_base_carries_its_retired_marks() {
     let lineage = Lineage::new();
     let dir = TempDir::new().unwrap();
@@ -639,7 +426,7 @@ async fn a_signed_empty_base_carries_its_retired_marks() {
     insert(&a, "r2", "reused").await;
     let reused = last_operation(&a, scope).await;
     sync(&lineage, &a, &j, &keys[2]).await;
-    assert_eq!(status(&j, reused).await.as_deref(), Some("rejected"));
+    assert_eq!(dropped(&j, reused).await.as_deref(), Some("admission"));
     j.rebuild_projection(scope).await.unwrap();
     assert!(titles(&j).await.is_empty());
     j.audit(scope).await.unwrap();

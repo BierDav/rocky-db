@@ -26,16 +26,6 @@ fun main(args: Array<String>) {
             }
         }.isFailure,
     )
-    check(
-        runCatching {
-            schema("reserved") {
-                table("t") {
-                    integer("row_kind")
-                    primaryKey("id")
-                }
-            }
-        }.isFailure,
-    )
     val table = data.getValue("tables").jsonArray.single().jsonObject
     check(table.getValue("primary_key").jsonArray.map { it.jsonPrimitive.content } == listOf("sensor", "sequence"))
     check(table.getValue("columns").jsonArray.map { it.jsonObject.getValue("type").jsonPrimitive.content } == listOf("text", "integer", "real", "blob"))
@@ -84,20 +74,20 @@ fun main(args: Array<String>) {
     // Room never assigns row ids: autoGenerate is refused, with or without its AUTOINCREMENT SQL.
     rejected(changed { entity -> JsonObject(entity + ("primaryKey" to JsonObject(entity.getValue("primaryKey").jsonObject + ("autoGenerate" to JsonPrimitive(true))))) }, "autoGenerate = true is refused")
     rejected(changed { entity -> entity.sql { it.replace("`id` INTEGER NOT NULL", "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL").replace(", PRIMARY KEY(`id`)", "") } }, "unsupported SQL")
-    // Every entity carries both identity fields, as non-null integers.
-    rejected(changed { entity -> entity.withoutField("row_kind").sql { it.replace(", `row_kind` INTEGER NOT NULL", "") } }, "declare Rocky's id and row_kind fields; row_kind is missing")
+    // Every entity carries Rocky's id field, as a non-null integer.
+    rejected(changed { entity -> entity.withoutField("id").sql { it.replace("`id` INTEGER NOT NULL, ", "") } }, "declare Rocky's id field")
     rejected(
         changed { entity ->
             val fields = entity.getValue("fields").jsonArray.map { field ->
-                if (field.jsonObject.getValue("columnName").jsonPrimitive.content != "row_kind") {
+                if (field.jsonObject.getValue("columnName").jsonPrimitive.content != "id") {
                     field
                 } else {
                     JsonObject(field.jsonObject - "notNull")
                 }
             }
-            JsonObject(entity + ("fields" to JsonArray(fields))).sql { it.replace("`row_kind` INTEGER NOT NULL", "`row_kind` INTEGER") }
+            JsonObject(entity + ("fields" to JsonArray(fields))).sql { it.replace("`id` INTEGER NOT NULL", "`id` INTEGER") }
         },
-        "row_kind must be a non-null integer identity field",
+        "id must be a non-null integer identity field",
     )
     rejected(changed { JsonObject(it + ("ftsVersion" to JsonPrimitive("FTS4"))) }, "unsupported entity")
     rejected(changed { entity -> entity.sql { it.replace("`title` TEXT NOT NULL", "`title` TEXT NOT NULL CHECK(length(title)>0)") } }, "unsupported SQL")
@@ -258,7 +248,7 @@ fun main(args: Array<String>) {
             primaryKey("sensor", "sequence")
             partitionBy("sensor")
         }
-        view("partial_partition_samples", "SELECT * FROM partition_samples WHERE row_kind = 0")
+        view("partial_partition_samples", "SELECT * FROM partition_samples")
     }
     check(partitions.definitionJson("09".repeat(32)) == importedPartitions.definitionJson("09".repeat(32)))
     for ((name, declaration) in listOf("partitions-hand" to partitions, "partitions-import" to importedPartitions)) {
@@ -347,12 +337,7 @@ fun main(args: Array<String>) {
         File(args[0], "$name-wire.json").writeText(declaration.json())
     }
     val constraintExport = File(root, "sdks/kotlin/qualification/schema/schemas/rocky.qualification.ConstraintDatabase/1.json").readText()
-    val constrainedImport = schemaFromRoom("constraints", constraintExport) {
-        table("children") {
-            onConflict("index_children_code", Conflict.LatestWins)
-            onConflict("index_children_label", Conflict.SetNull)
-        }
-    }
+    val constrainedImport = schemaFromRoom("constraints", constraintExport)
     val constrainedHand = schema("constraints") {
         val parent = table("parents") {
             text("title")
@@ -364,8 +349,8 @@ fun main(args: Array<String>) {
             integer("parent")
             integer("optional", nullable = true)
             primaryKey("id")
-            unique("code", onConflict = Conflict.LatestWins)
-            unique("label", onConflict = Conflict.SetNull)
+            unique("code")
+            unique("label")
             index("index_children_parent", "parent")
             index("index_children_optional", "optional")
             reference("parent", parent, onDelete = Delete.Cascade)
@@ -374,59 +359,10 @@ fun main(args: Array<String>) {
     }
     check(constrainedHand.definitionJson("09".repeat(32)) == constrainedImport.definitionJson("09".repeat(32)))
     check(constrainedHand.json() == constrainedImport.json())
-    rejected(constraintExport, "needs onConflict", "children")
     rejected(constraintExport.replace("CASCADE", "RESTRICT"), "onDelete RESTRICT", "children")
     rejected(constraintExport.replace("SET NULL", "SET DEFAULT"), "onDelete SET DEFAULT", "children")
     rejected(constraintExport.replace("\"referencedColumns\": [\n              \"id\"", "\"referencedColumns\": [\n            \"title\""), "must reference its id", "children")
     for ((name, declaration) in listOf("constraints-hand" to constrainedHand, "constraints-import" to constrainedImport)) {
-        File(args[0], "$name.json").writeText(declaration.definitionJson("09".repeat(32)))
-        File(args[0], "$name-wire.json").writeText(declaration.json())
-    }
-    // A cross-scope reference: the parent's existence log is the author's visible choice.
-    val existenceImport = schemaFromRoom("constraints", constraintExport) {
-        table("parents") { existenceLog = true }
-        table("children") {
-            onConflict("index_children_code", Conflict.LatestWins)
-            onConflict("index_children_label", Conflict.SetNull)
-        }
-    }
-    val existenceHand = schema("constraints") {
-        val parent = table("parents") {
-            text("title")
-            primaryKey("id")
-            existenceLog = true
-        }
-        table("children") {
-            text("code")
-            text("label", nullable = true)
-            integer("parent")
-            integer("optional", nullable = true)
-            primaryKey("id")
-            unique("code", onConflict = Conflict.LatestWins)
-            unique("label", onConflict = Conflict.SetNull)
-            index("index_children_parent", "parent")
-            index("index_children_optional", "optional")
-            reference("parent", parent, onDelete = Delete.Cascade)
-            reference("optional", parent, onDelete = Delete.SetNull)
-        }
-    }
-    check(existenceHand.definitionJson("09".repeat(32)) == existenceImport.definitionJson("09".repeat(32)))
-    check(existenceHand.json() == existenceImport.json())
-    check("\"existence_log\":true" in existenceHand.definitionJson("09".repeat(32)))
-    check("existence_log" !in constrainedHand.definitionJson("09".repeat(32)))
-    check(
-        runCatching {
-            schema("logs") {
-                table("lists") {
-                    text("title")
-                    primaryKey("title")
-                    existenceLog = true
-                }
-            }
-        }
-            .exceptionOrNull()?.message?.contains("keyed by id") == true,
-    )
-    for ((name, declaration) in listOf("existence-hand" to existenceHand, "existence-import" to existenceImport)) {
         File(args[0], "$name.json").writeText(declaration.definitionJson("09".repeat(32)))
         File(args[0], "$name-wire.json").writeText(declaration.json())
     }
@@ -453,7 +389,7 @@ fun main(args: Array<String>) {
             integer("category", nullable = true)
             primaryKey("list", "key")
             partitionBy("list", group = "list")
-            unique("list", "title", onConflict = Conflict.LatestWins)
+            unique("list", "title")
             index("index_items_list_category", "list", "category")
             reference("list", "lists", onDelete = Delete.Cascade)
             reference(listOf("list", "category"), "categories", onDelete = Delete.SetNull)
@@ -476,10 +412,7 @@ fun main(args: Array<String>) {
     val listsOverlay: SchemaBuilder.() -> Unit = {
         table("lists") { partitionBy("id", group = "list") }
         table("categories") { partitionBy("list", group = "list") }
-        table("items") {
-            partitionBy("list", group = "list")
-            onConflict("index_items_list_title", Conflict.LatestWins)
-        }
+        table("items") { partitionBy("list", group = "list") }
     }
     val listsImport = schemaFromRoom("shopping", listsExport, listsOverlay)
     check(shoppingLists.definitionJson("09".repeat(32)) == listsImport.definitionJson("09".repeat(32)))
@@ -515,12 +448,12 @@ fun main(args: Array<String>) {
     }
     check(reversed.definitionJson("09".repeat(32)) == market.definitionJson("09".repeat(32)))
     check(reversed.json() == market.json())
-    // Only format-3 tables exist: a register table without a key is refused before the engine sees it.
+    // A table without a primary key is refused before the engine sees it.
     check(
         runCatching { Schema("legacy", tables = listOf(Table("t", listOf(Column.text("x"))))) }.exceptionOrNull()?.message ==
             "every table declares a primary key; use the schema builder",
     )
-    println("schema builder, groups, existence log, partitioned constraints and shopping/market/scalar Room import qualification passed")
+    println("schema builder, groups, partitioned constraints and shopping/market/scalar Room import qualification passed")
 }
 
 /** Each partitioned shape that stays refused fails before installation with its own message. */
@@ -543,22 +476,7 @@ private fun refusePartitionedShapes(listsExport: String, listsOverlay: SchemaBui
         primaryKey("list", "id")
         partitionBy("list", group = group)
     }
-    // Uniqueness across partitions requires a coordinated write.
-    refused("must include every partition column") {
-        lists()
-        table("items") {
-            item()
-            unique("title", onConflict = Conflict.LatestWins)
-        }
-    }
-    refused("takes Conflict.LatestWins; Conflict.SetNull is refused") {
-        lists()
-        table("items") {
-            item()
-            unique("note", onConflict = Conflict.SetNull)
-        }
-    }
-    // References between partitioned tables of different groups wait for partitioned existence logs.
+    // References between partitioned tables of different groups are refused.
     refused("needs the same explicit partition group") {
         lists()
         table("items") {
@@ -575,7 +493,7 @@ private fun refusePartitionedShapes(listsExport: String, listsOverlay: SchemaBui
             reference("list", "lists", onDelete = Delete.Cascade)
         }
     }
-    refused("only if it is unpartitioned with an existence log") {
+    refused("a partitioned table cannot reference unpartitioned products") {
         table("products") {
             text("name")
             primaryKey("id")
@@ -613,14 +531,6 @@ private fun refusePartitionedShapes(listsExport: String, listsOverlay: SchemaBui
             reference("list", "lists", onDelete = Delete.SetNull)
         }
     }
-    refused("an existence log needs an unpartitioned") {
-        table("lists") {
-            text("title")
-            primaryKey("id")
-            partitionBy("id")
-            existenceLog = true
-        }
-    }
     refused("names the unknown table") {
         lists()
         table("items") {
@@ -638,6 +548,6 @@ private fun refusePartitionedShapes(listsExport: String, listsOverlay: SchemaBui
     check(restrict != listsExport)
     check(runCatching { schemaFromRoom("shopping", restrict, listsOverlay) }.exceptionOrNull()?.message?.contains("onDelete RESTRICT") == true)
     // The overlay must partition what the Room keys declare: categories are keyed by (list, id).
-    val unpartitioned = runCatching { schemaFromRoom("shopping", listsExport) { table("items") { onConflict("index_items_list_title", Conflict.LatestWins) } } }
+    val unpartitioned = runCatching { schemaFromRoom("shopping", listsExport) }
     check(unpartitioned.exceptionOrNull()?.message?.contains("categories: Room identity index must contain partition columns followed by id") == true) { unpartitioned.toString() }
 }

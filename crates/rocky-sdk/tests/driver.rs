@@ -17,10 +17,10 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
 const SHOPPING: &str = r#"{"format":6,"application":"shopping","version":3,"tables":[
- {"name":"lists","class":"mergeable","columns":[
+ {"name":"lists","class":"replayed","columns":[
    {"name":"key","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],
   "primary_key":["key"]},
- {"name":"items","class":"mergeable","columns":[
+ {"name":"items","class":"replayed","columns":[
    {"name":"key","type":"text","not_null":true},{"name":"list","type":"text","not_null":true},
    {"name":"title","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},
    {"name":"note","type":"blob"}],
@@ -266,11 +266,13 @@ async fn a_writer_transaction_is_one_bundle_and_savepoints_nest() -> Result<(), 
             SqlValue::Blob(vec![1, 2])
         ]
     );
-    // Parent and children: one bundle, one frame for each table's scope.
+    // Parent and children: one bundle, one frame for each table's scope,
+    // and the outcome record each member's log carries.
     let after = published(root.path())?;
-    assert_eq!((after.0 - before.0, after.1 - before.1), (1, 2));
+    assert_eq!((after.0 - before.0, after.1 - before.1), (1, 4));
 
-    // Inserted and deleted in one transaction: nothing is published.
+    // Inserted and deleted in one transaction: its statements still
+    // replicate, since another replica's replay may differ.
     run(&writer, "BEGIN IMMEDIATE TRANSACTION").await?;
     all(
         &writer,
@@ -280,7 +282,8 @@ async fn a_writer_transaction_is_one_bundle_and_savepoints_nest() -> Result<(), 
     .await?;
     run(&writer, "DELETE FROM lists WHERE key = 'gone'").await?;
     run(&writer, "END TRANSACTION").await?;
-    assert_eq!(published(root.path())?, after);
+    let after = published(root.path())?;
+    assert_eq!(after, (before.0 + 2, before.1 + 5));
     // A transaction that only began and ended never took the file.
     run(&writer, "BEGIN IMMEDIATE TRANSACTION").await?;
     run(&writer, "END TRANSACTION").await?;
@@ -425,12 +428,27 @@ async fn bundle_limits_and_the_lease_fail_the_transaction_without_splitting_it()
             .map(|failure| *failure)
     };
 
-    // 2,049 rows: the commit fails as a whole.
+    // Seeds of 32 and 64 rows; a statement crossing them replays 2,048.
+    run(&writer, "BEGIN IMMEDIATE TRANSACTION").await?;
+    for key in 0..65 {
+        all(
+            &writer,
+            "INSERT INTO lists(key,title) VALUES(?,?)",
+            vec![
+                text(&format!("s{key:02}")),
+                text(if key < 32 { "a" } else { "b" }),
+            ],
+        )
+        .await?;
+    }
+    run(&writer, "END TRANSACTION").await?;
+    let seeded = published(root.path())?;
+    // 2,049 replayed rows: the commit fails as a whole.
     run(&writer, "BEGIN IMMEDIATE TRANSACTION").await?;
     all(
         &writer,
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2049) \
-         INSERT INTO lists(key,title) SELECT printf('l%04d', i), 'list' FROM n",
+        "INSERT INTO lists(key,title) SELECT x.key || y.key, 'list' FROM lists x, lists y \
+         WHERE x.title = 'a' AND y.title IN ('a','b')",
         Vec::new(),
     )
     .await?;
@@ -442,19 +460,16 @@ async fn bundle_limits_and_the_lease_fail_the_transaction_without_splitting_it()
     )
     .map_err(|_| "code")?;
     assert_eq!(refused.code, 18, "{refused}");
-    assert!(refused.message.contains("2048"), "{refused}");
     assert!(!writer.in_transaction().await?);
-    assert_eq!(count(&writer, "lists").await?, 0);
-    // More than 4 MiB of values in few rows fails the same way.
+    assert_eq!(count(&writer, "lists").await?, 65);
+    // An intent frame over a range page's bytes fails the same way.
     run(&writer, "BEGIN IMMEDIATE TRANSACTION").await?;
-    for key in 0..5 {
-        all(
-            &writer,
-            "INSERT INTO lists(key,title) VALUES(?,?)",
-            vec![text(&format!("big{key}")), text(&"x".repeat(1024 * 1024))],
-        )
-        .await?;
-    }
+    all(
+        &writer,
+        "INSERT INTO lists(key,title) VALUES(?,?)",
+        vec![text("big"), text(&"x".repeat(256 * 1024))],
+    )
+    .await?;
     let refused = code(
         all(&writer, "END TRANSACTION", Vec::new())
             .await
@@ -462,22 +477,21 @@ async fn bundle_limits_and_the_lease_fail_the_transaction_without_splitting_it()
             .ok_or("bytes")?,
     )
     .map_err(|_| "code")?;
-    assert_eq!(refused.code, 18, "{refused}");
-    assert_eq!(count(&writer, "lists").await?, 0);
-    // Exactly the limit commits as one bundle.
+    assert!(refused.message.contains("quota"), "{refused}");
+    assert_eq!(count(&writer, "lists").await?, 65);
+    // Exactly the limit commits as one bundle of one intent frame.
     run(&writer, "BEGIN IMMEDIATE TRANSACTION").await?;
     all(
         &writer,
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2048) \
-         INSERT INTO lists(key,title) SELECT printf('l%04d', i), 'list' FROM n",
+        "INSERT INTO lists(key,title) SELECT x.key || y.key, 'list' FROM lists x, lists y \
+         WHERE x.title = 'a' AND y.title = 'b'",
         Vec::new(),
     )
     .await?;
     run(&writer, "END TRANSACTION").await?;
     let after = published(root.path())?;
-    // One bundle of 64 frames of 32 rows.
-    assert_eq!(after.0 - before.0, 1);
-    assert_eq!(after.1 - before.1, 64);
+    assert_eq!((after.0 - seeded.0, after.1 - seeded.1), (1, 1));
+    assert!(seeded.0 > before.0);
     writer.close().await;
     database.close().await?;
     Ok(())
@@ -526,15 +540,19 @@ async fn readers_page_snapshots_and_never_hold_the_writer() -> Result<(), Failur
     let database = create(open(root.path(), None), None).await?.database;
     let writer = database.connect(WRITER).await?;
     let reader = database.connect(READER).await?;
-    run(&writer, "BEGIN IMMEDIATE TRANSACTION").await?;
-    all(
-        &writer,
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600) \
-         INSERT INTO lists(key,title) SELECT printf('l%04d', i), 'list' FROM n",
-        Vec::new(),
-    )
-    .await?;
-    run(&writer, "END TRANSACTION").await?;
+    // 600 lists, in transactions under the intent statement quota.
+    for batch in 0..3 {
+        run(&writer, "BEGIN IMMEDIATE TRANSACTION").await?;
+        for i in 1..=200 {
+            all(
+                &writer,
+                "INSERT INTO lists(key,title) VALUES(?,'list')",
+                vec![text(&format!("l{:04}", batch * 200 + i))],
+            )
+            .await?;
+        }
+        run(&writer, "END TRANSACTION").await?;
+    }
 
     // An open cursor and an open read transaction do not stop a commit.
     let streaming = reader.statement();
@@ -856,21 +874,17 @@ async fn room_housekeeping_is_answered_from_the_catalog_and_the_file() -> Result
     // Room's own table statements for an installed table and index change nothing.
     run(
         &writer,
-        "CREATE TABLE IF NOT EXISTS `items` (`key` TEXT NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`key`))",
+        "CREATE TABLE IF NOT EXISTS `items` (`key` TEXT NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`key`))",
     )
     .await?;
-    // An entity must carry Rocky's identity fields and leave its ids to Rocky.
+    // An entity must carry Rocky's id field and leave its ids to Rocky.
     for (sql, reason) in [
         (
-            "CREATE TABLE IF NOT EXISTS `items` (`key` TEXT NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`key`))",
-            "lacks row_kind",
+            "CREATE TABLE IF NOT EXISTS `items` (`key` TEXT NOT NULL, `note` TEXT, PRIMARY KEY(`key`, `note`))",
+            "must declare Rocky's id",
         ),
         (
-            "CREATE TABLE IF NOT EXISTS `items` (`key` TEXT NOT NULL, `row_kind` INTEGER NOT NULL, `note` TEXT, PRIMARY KEY(`key`, `note`))",
-            "lacks id",
-        ),
-        (
-            "CREATE TABLE IF NOT EXISTS `items` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `row_kind` INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS `items` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL)",
             "autoGenerate = true is refused",
         ),
     ] {
@@ -914,7 +928,7 @@ async fn room_housekeeping_is_answered_from_the_catalog_and_the_file() -> Result
         assert_eq!(answered, engine_pragma(root.path(), engine)?, "{asked}");
     }
     let columns = all(&reader, "PRAGMA table_info(`items`)", vec![]).await?;
-    assert_eq!(columns.len(), 7);
+    assert_eq!(columns.len(), 6);
     assert_eq!(
         columns[0][1..],
         [
@@ -925,14 +939,12 @@ async fn room_housekeeping_is_answered_from_the_catalog_and_the_file() -> Result
             SqlValue::Integer(1)
         ]
     );
-    for name in ["id", "row_kind"] {
-        let column = columns
-            .iter()
-            .find(|row| row[1] == text(name))
-            .ok_or(name)?;
-        assert_eq!(column[2], text("INTEGER"));
-        assert_eq!(column[3], SqlValue::Integer(1));
-    }
+    let id = columns
+        .iter()
+        .find(|row| row[1] == text("id"))
+        .ok_or("id")?;
+    assert_eq!(id[2], text("INTEGER"));
+    assert_eq!(id[3], SqlValue::Integer(1));
     let indexes = all(&reader, "PRAGMA index_list(`items`)", vec![]).await?;
     assert!(
         indexes
@@ -988,11 +1000,11 @@ async fn room_housekeeping_is_answered_from_the_catalog_and_the_file() -> Result
 async fn room_reads_each_reference_action_when_references_share_a_partition_column()
 -> Result<(), Failure> {
     const GROUPED: &str = r#"{"format":6,"application":"grouped","version":1,"tables":[
- {"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],
+ {"name":"lists","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],
   "primary_key":["id"],"partition_by":["id"],"partition_group":"list"},
- {"name":"categories","class":"mergeable","columns":[{"name":"list","type":"integer","not_null":true}],
+ {"name":"categories","class":"replayed","columns":[{"name":"list","type":"integer","not_null":true}],
   "primary_key":["list","id"],"partition_by":["list"],"partition_group":"list"},
- {"name":"items","class":"mergeable","columns":[
+ {"name":"items","class":"replayed","columns":[
    {"name":"list","type":"integer","not_null":true},{"name":"category","type":"integer"}],
   "primary_key":["list","id"],"partition_by":["list"],"partition_group":"list",
   "foreign_keys":[{"columns":["list","category"],"table":"categories","on_delete":"set_null"},
@@ -1056,7 +1068,7 @@ async fn a_member_installs_only_its_readable_tables_even_after_reopen() -> Resul
         .as_array_mut()
         .ok_or("tables")?
         .push(json!({
-            "name":"devices", "class":"mergeable",
+            "name":"devices", "class":"replayed",
             "columns":[{"name":"key","type":"text","not_null":true},
                 {"name":"name","type":"text","not_null":true}], "primary_key":["key"], "indexes":[{"name":"devices_by_name", "columns":[{"name":"name","descending":false}]}]
         }));

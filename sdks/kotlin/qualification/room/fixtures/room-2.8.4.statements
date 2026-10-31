@@ -2,13 +2,13 @@ reader BEGIN DEFERRED TRANSACTION
 reader END TRANSACTION
 reader SELECT * FROM items WHERE list = ? ORDER BY title
 reader SELECT * FROM lists WHERE `key` = ?
-reader SELECT `key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id`,`row_kind` FROM `items` WHERE `list` IN (?)
+reader SELECT `key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id` FROM `items` WHERE `list` IN (?)
 reader SELECT list, count(*) AS items, sum(completed) AS done FROM items GROUP BY list ORDER BY list
 writer BEGIN EXCLUSIVE TRANSACTION
 writer BEGIN IMMEDIATE TRANSACTION
 writer CREATE INDEX IF NOT EXISTS `items_by_list` ON `items` (`list`, `title`)
-writer CREATE TABLE IF NOT EXISTS `items` (`key` TEXT NOT NULL, `list` TEXT NOT NULL, `title` TEXT NOT NULL, `completed` INTEGER NOT NULL, `quantity` INTEGER NOT NULL, `price` REAL, `photo` BLOB, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`key`))
-writer CREATE TABLE IF NOT EXISTS `lists` (`key` TEXT NOT NULL, `title` TEXT NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`key`))
+writer CREATE TABLE IF NOT EXISTS `items` (`key` TEXT NOT NULL, `list` TEXT NOT NULL, `title` TEXT NOT NULL, `completed` INTEGER NOT NULL, `quantity` INTEGER NOT NULL, `price` REAL, `photo` BLOB, `id` INTEGER NOT NULL, PRIMARY KEY(`key`))
+writer CREATE TABLE IF NOT EXISTS `lists` (`key` TEXT NOT NULL, `title` TEXT NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`key`))
 writer CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)
 writer CREATE TEMP TABLE IF NOT EXISTS room_table_modification_log (table_id INTEGER PRIMARY KEY, invalidated INTEGER NOT NULL DEFAULT 0)
 writer CREATE UNIQUE INDEX IF NOT EXISTS `items_identity` ON `items` (`id`)
@@ -17,12 +17,12 @@ writer DELETE FROM `items` WHERE `key` = ?
 writer DELETE FROM items WHERE completed = 1 AND list = ?
 writer DROP TABLE IF EXISTS room_table_modification_log
 writer END TRANSACTION
-writer INSERT INTO `items` (`key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id`,`row_kind`) VALUES (?,?,?,?,?,?,?,?,?)
-writer INSERT OR ABORT INTO `items` (`key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id`,`row_kind`) VALUES (?,?,?,?,?,?,?,?,?)
-writer INSERT OR ABORT INTO `lists` (`key`,`title`,`id`,`row_kind`) VALUES (?,?,?,?)
-writer INSERT OR IGNORE INTO `items` (`key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id`,`row_kind`) VALUES (?,?,?,?,?,?,?,?,?)
-writer INSERT OR REPLACE INTO `items` (`key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id`,`row_kind`) VALUES (?,?,?,?,?,?,?,?,?)
-writer INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '922031869095397e9c17acf1f4367be1')
+writer INSERT INTO `items` (`key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id`) VALUES (?,?,?,?,?,?,?,?)
+writer INSERT OR ABORT INTO `items` (`key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id`) VALUES (?,?,?,?,?,?,?,?)
+writer INSERT OR ABORT INTO `lists` (`key`,`title`,`id`) VALUES (?,?,?)
+writer INSERT OR IGNORE INTO `items` (`key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id`) VALUES (?,?,?,?,?,?,?,?)
+writer INSERT OR REPLACE INTO `items` (`key`,`list`,`title`,`completed`,`quantity`,`price`,`photo`,`id`) VALUES (?,?,?,?,?,?,?,?)
+writer INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '32ce9cb0a798989eaff43a457024d86a')
 writer PRAGMA busy_timeout
 writer PRAGMA busy_timeout = 3000
 writer PRAGMA journal_mode = WAL
@@ -44,6 +44,6 @@ writer SELECT changes()
 writer SELECT count(*) FROM sqlite_master WHERE name != 'android_metadata'
 writer SELECT identity_hash FROM room_master_table WHERE id = 42 LIMIT 1
 writer SELECT last_insert_rowid()
-writer UPDATE OR ABORT `items` SET `key` = ?,`list` = ?,`title` = ?,`completed` = ?,`quantity` = ?,`price` = ?,`photo` = ?,`id` = ?,`row_kind` = ? WHERE `key` = ?
-writer UPDATE `items` SET `key` = ?,`list` = ?,`title` = ?,`completed` = ?,`quantity` = ?,`price` = ?,`photo` = ?,`id` = ?,`row_kind` = ? WHERE `key` = ?
+writer UPDATE OR ABORT `items` SET `key` = ?,`list` = ?,`title` = ?,`completed` = ?,`quantity` = ?,`price` = ?,`photo` = ?,`id` = ? WHERE `key` = ?
+writer UPDATE `items` SET `key` = ?,`list` = ?,`title` = ?,`completed` = ?,`quantity` = ?,`price` = ?,`photo` = ?,`id` = ? WHERE `key` = ?
 writer UPDATE items SET completed = ? WHERE list = ?

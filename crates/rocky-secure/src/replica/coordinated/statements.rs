@@ -1,15 +1,10 @@
 //! Tip statements on a trusted node: a seal ends its tip's coordinated log
-//! with its digest before it enters the graph, so no entry commits on a tip
-//! the graph sealed; an opening's minimum configures its line's logs before
-//! their first join. Once a log committed an entry only its in-sync set ends
-//! it, so a node first catches up and joins; the owner's recovery is the one
-//! terminal entry committed without it. Seals waiting for their terminal
-//! entry are journaled. See `docs/runtime/coordinated-writes.md#seals-and-moves`
-//! and `docs/runtime/stuck-recovery.md`.
-use super::abandoned::refusal;
+//! with its digest before it enters the graph; the owner's recovery is a
+//! terminal entry that ends a log no ordinary seal can. Seals waiting for
+//! their terminal entry are journaled.
 use super::*;
 use crate::TipStatement;
-use rocky_core::{CoordinationError, LogTerminal};
+use rocky_core::{CoordinationError, LogHead, LogTerminal};
 use rocky_credentials::SignedSeal;
 
 pub(in crate::replica) const SCHEMA: &[&str] = &[
@@ -34,16 +29,6 @@ enum Ending {
     /// Not confirmed yet; the coordinator may have committed it after a lost reply.
     Unconfirmed { code: &'static str, reason: String },
 }
-/// Peers for a node that has none: catching up fails `Behind`.
-pub(in crate::replica) struct NoPeers;
-impl EntryPeers for NoPeers {
-    fn store<'a>(&'a self, _: PublicKey, _: &'a CoordinatedEntry) -> PeerFuture<'a, ()> {
-        Box::pin(async { Err(Error::Rejected("no peer is reachable".into())) })
-    }
-    fn committed(&self, _: TipLog, _: u64) -> PeerFuture<'_, Vec<CommittedEntry>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-}
 /// What coordinating a batch decided.
 pub(in crate::replica) struct Coordinated {
     /// May enter the graph now.
@@ -65,7 +50,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
     pub(in crate::replica) async fn coordinate_tip_statements(
         &self,
         statements: &[TipStatement],
-        peers: &dyn EntryPeers,
         strict: bool,
         own: bool,
     ) -> Result<Coordinated, Error> {
@@ -128,7 +112,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
                     continue;
                 }
                 let ending = match coordinator.as_deref() {
-                    Some(coordinator) => self.end_log(seal, coordinator, peers).await?,
+                    Some(coordinator) => self.end_log(seal, coordinator).await?,
                     None => Ending::Unconfirmed {
                         code: "recovery_pending",
                         reason: "recovery needs its line's trusted acknowledgments".into(),
@@ -155,7 +139,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
             let Some(coordinator) = coordinator.as_deref() else {
                 continue;
             };
-            match self.end_log(seal, coordinator, peers).await? {
+            match self.end_log(seal, coordinator).await? {
                 Ending::Ended => {}
                 Ending::Lost if strict => {
                     return Err(refusal(
@@ -214,15 +198,12 @@ impl<A: RowApplication> EncryptedReplica<A> {
         }
         Ok(coordinated)
     }
-    /// Ends `seal`'s tip log with it unless it ended already. An ordinary
-    /// seal of a log that committed an entry needs this node in the in-sync
-    /// set: a node following the tip catches up and joins first. A
-    /// recovery is confirmed only by the exact terminal entry it is.
+    /// Ends `seal`'s tip log with it unless it ended already. A recovery is
+    /// confirmed only by the exact terminal entry it is.
     async fn end_log(
         &self,
         seal: &SignedSeal,
         coordinator: &dyn DomainLog,
-        peers: &dyn EntryPeers,
     ) -> Result<Ending, Error> {
         let log = TipLog {
             scope: seal.statement.scope,
@@ -248,25 +229,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 let bytes = seal.to_bytes().map_err(credential)?;
                 coordinator.recover(log, bytes).await
             }
-            None => {
-                if head.commit > 0 && !head.member(&coordinator.node()) {
-                    match self.join_to_seal(log, coordinator, peers).await {
-                        Ok(()) | Err(CoordinatedError::Sealed) => {}
-                        Err(CoordinatedError::Unavailable) => {
-                            return Ok(unavailable(CoordinationError::Unavailable));
-                        }
-                        Err(error) => {
-                            return Ok(Ending::Unconfirmed {
-                                code: "behind",
-                                reason: format!(
-                                    "this node cannot join the tip's in-sync set: {error}"
-                                ),
-                            });
-                        }
-                    }
-                }
-                coordinator.seal(log, terminal).await
-            }
+            None => coordinator.seal(log, terminal).await,
         };
         match submitted {
             Ok(_) => Ok(Ending::Ended),
@@ -334,20 +297,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
             },
         )
     }
-    /// Catches this node up on `log`, which it must follow, and joins its
-    /// in-sync set so that it may end it. It switches no tip for this.
-    pub(super) async fn join_to_seal(
-        &self,
-        log: TipLog,
-        coordinator: &dyn DomainLog,
-        peers: &dyn EntryPeers,
-    ) -> Result<(), CoordinatedError> {
-        if log != self.followed_log(log.scope).await {
-            return Err(CoordinatedError::Unfollowed);
-        }
-        let _deciding = self.domain_log.deciding.lock().await;
-        self.join_log(log, coordinator, peers).await.map(|_| ())
-    }
     /// Journals a batch, flushed, before its seals reach the coordinator.
     /// Received batches beyond the bound are not kept; a peer resends them.
     pub(in crate::replica) async fn journal_tips(
@@ -399,9 +348,8 @@ impl<A: RowApplication> EncryptedReplica<A> {
     }
     /// Ends the logs of journaled seals and admits what they confirm: own
     /// batches after a restart or a lost reply, with the same bytes, and
-    /// received ones once this node caught up and joined through `peers`.
-    /// Returns the statements admitted.
-    pub async fn settle_tip_statements(&self, peers: &dyn EntryPeers) -> Result<usize, Error> {
+    /// received ones. Returns the statements admitted.
+    pub async fn settle_tip_statements(&self) -> Result<usize, Error> {
         let (pending, own) = {
             let inner = self.inner.lock(crate::replica::Class::Background).await;
             let own = inner
@@ -415,7 +363,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
         let mut admitted = 0;
         for (batch, statements) in pending {
             let coordinated = match self
-                .coordinate_tip_statements(&statements, peers, false, own.contains(&batch))
+                .coordinate_tip_statements(&statements, false, own.contains(&batch))
                 .await
             {
                 Ok(coordinated) => coordinated,
@@ -494,41 +442,11 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 &graphs[&statement.scope()],
                 Some((&inner.config.revocations, now()?)),
             )?;
-            if let TipStatement::Carry(carry) = statement {
-                inner.check_carry(carry).await?;
-            }
         }
         Ok(())
     }
 }
 impl<A: RowApplication> Inner<A> {
-    /// A trusted node holding the committed entry a carry record names
-    /// refuses a record of other frames: the coordinator committed those.
-    pub(in crate::replica) async fn check_carry(
-        &self,
-        carry: &rocky_credentials::SignedCarry,
-    ) -> Result<(), Error> {
-        let log = TipLog {
-            scope: carry.statement.scope,
-            tip: carry.statement.tip,
-        };
-        let position = carry.statement.position;
-        let ids: Vec<Hash> = carry
-            .statement
-            .ids
-            .iter()
-            .map(|id| Hash::from_bytes(*id))
-            .collect();
-        let hash = entry_hash(log, position, &ids)?;
-        for entry in self.entries(log, &["committed"]).await? {
-            if entry.position == position && entry.hash != hash {
-                return Err(denied(
-                    "the carry record names frames another entry committed",
-                ));
-            }
-        }
-        Ok(())
-    }
     /// Journaled batches, own ones or received ones when `own` names which.
     pub(crate) async fn pending_tips(
         &self,
@@ -551,7 +469,10 @@ impl<A: RowApplication> Inner<A> {
             };
             if own.is_none_or(|own| own == (*kind == 1)) {
                 pending.push((
-                    commitment_of(batch)?,
+                    batch
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::Corrupt("pending tip batch".into()))?,
                     decode_bounded(statements, MAX_SECURE_BYTES)?,
                 ));
             }
@@ -609,77 +530,6 @@ impl<A: RowApplication> Inner<A> {
             .await?;
         Ok(())
     }
-    /// The minimum in-sync size the opening of `log`'s line names; none on
-    /// the genesis line, which takes the domain's, or without a graph.
-    fn line_minimum(&self, log: TipLog) -> Result<Option<usize>, Error> {
-        let Some(graph) = self.graphs.get(&log.scope) else {
-            return Ok(None);
-        };
-        // A tip of an explicit schema switch is outside the graph.
-        if graph.schema_any(log.tip).is_err() {
-            return Ok(None);
-        }
-        let root = graph.line_root(log.tip).map_err(credential)?;
-        for opening in &graph.openings {
-            if opening.tip().map_err(credential)? == root {
-                return Ok(Some(opening.statement.minimum_in_sync as usize));
-            }
-        }
-        Ok(None)
-    }
-    /// Where a write the terminal entry of `log` aborted continues: the
-    /// continuation of the tip's winning seal in this replica's graph, else
-    /// the terminal entry's own.
-    pub(super) fn continuation(
-        &self,
-        log: TipLog,
-        terminal: LogTerminal,
-    ) -> Result<Option<TipId>, Error> {
-        match self.graphs.get(&log.scope) {
-            Some(graph) => match graph.seal(log.tip).map_err(credential)? {
-                Some(seal) => seal.successor().map_err(credential),
-                None => Ok(terminal.continuation),
-            },
-            None => Ok(terminal.continuation),
-        }
-    }
-    /// The winning continuation `log`'s tip resolves to when its seal lost.
-    pub(super) fn canonical(&self, log: TipLog) -> Result<TipId, Error> {
-        match self.graphs.get(&log.scope) {
-            Some(graph) if graph.schema_any(log.tip).is_ok() => {
-                graph.canonical_tip(log.tip).map_err(credential)
-            }
-            _ => Ok(log.tip),
-        }
-    }
-}
-impl<A: RowApplication> EncryptedReplica<A> {
-    /// Before this node joins `log`, relays the minimum of its line if no
-    /// node joined yet. A log that took a smaller one is not joined.
-    pub(super) async fn configure_line(
-        &self,
-        log: TipLog,
-        head: &LogHead,
-        coordinator: &dyn DomainLog,
-    ) -> Result<(), CoordinatedError> {
-        let Some(minimum) = self
-            .inner
-            .lock(crate::replica::Class::Background)
-            .await
-            .line_minimum(log)?
-        else {
-            return Ok(());
-        };
-        if head.epoch == 0 && head.minimum != minimum {
-            // A concurrent first join may refuse it; the head decides.
-            let _ = coordinator.configure(log, minimum).await;
-        }
-        let head = coordinator.log_head(log).await.map_err(coordination)?;
-        if head.minimum < minimum {
-            return Err(CoordinatedError::Refused(CoordinationError::Configuration));
-        }
-        Ok(())
-    }
 }
 /// Extends `refused` with every statement of `statements` that depends on
 /// one in it: an opening on a refused seal, a move off a refused seal's tip
@@ -705,8 +555,7 @@ fn dependents(
                 TipStatement::Bookmark(_)
                 | TipStatement::GenesisLine(_)
                 | TipStatement::Finality(_)
-                | TipStatement::Checkpoint(_)
-                | TipStatement::Carry(_) => {}
+                | TipStatement::Checkpoint(_) => {}
             }
         }
         let before = refused.len();
@@ -717,7 +566,6 @@ fn dependents(
                 TipStatement::Finality(record) => refused.contains(&record.seal),
                 TipStatement::Checkpoint(record) => refused.contains(&record.statement.seal),
                 TipStatement::GenesisLine(_) => false,
-                TipStatement::Carry(carry) => tips.contains(&carry.statement.tip),
                 TipStatement::Bookmark(movement) => {
                     movement
                         .statement
@@ -750,3 +598,22 @@ impl std::fmt::Display for Unconfirmed {
     }
 }
 impl std::error::Error for Unconfirmed {}
+
+/// Why the replica refused a call. `code` is the JSON error code.
+#[derive(Debug)]
+pub struct Refusal {
+    pub code: &'static str,
+    pub message: String,
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+impl std::error::Error for Refusal {}
+pub(in crate::replica) fn refusal(code: &'static str, message: &str) -> Error {
+    Error::Application(Box::new(Refusal {
+        code,
+        message: message.into(),
+    }))
+}

@@ -281,7 +281,6 @@ impl Node {
                         && self.application(&settings).await? == crate::DeclaredSchema::Ahead,
                     rebuilding: generation.plan.map(|plan| RebuildProgress {
                         schema: HEXLOWER.encode(&plan.schema),
-                        filled: plan.filled as u64,
                         tables: plan.tables as u64,
                     }),
                 },

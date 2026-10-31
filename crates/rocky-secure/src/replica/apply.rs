@@ -103,17 +103,6 @@ impl<A: RowApplication> Inner<A> {
                 ));
             }
         }
-        let logged = match self.existence_table(scope) {
-            true => writes
-                .iter()
-                .filter(|write| write.change.before.is_some() != write.change.after.is_some())
-                .count(),
-            false => 0,
-        };
-        // Fewer only where the author's rows were absent after seal finalization.
-        if operation.header.extensions.existence as usize > logged {
-            return Err(denied("frame miscounts its existence records"));
-        }
         let fields = self.path_fields(scope.domain, operation.header.extensions.tip)?;
         // Admission evidence names each birth by its place in the signed
         // write list, so ordinals survive the path filter.
@@ -270,18 +259,6 @@ impl<A: RowApplication> Inner<A> {
                     Ok(()) => {}
                     Err(error) if restoring && receipts::semantic_refusal(&error) => continue,
                     Err(error) => return Err(error),
-                }
-                // A row an abandoned coordinated write created never existed.
-                if current.is_none()
-                    && change.before.is_some()
-                    && self.abandoned_dependency(&operation.header).await?
-                {
-                    self.consume(
-                        operation.hash,
-                        "the row's creation was abandoned by an owner-signed cut",
-                    )
-                    .await?;
-                    continue;
                 }
                 if let Some(carried) = carried {
                     if payload.membership().is_none() {
@@ -554,7 +531,6 @@ impl<A: RowApplication> Inner<A> {
         let (rows, tombstones, digest, applied) = self.scope_state(id).await?;
         let mut sets = checkpoint::Sets::new();
         (sets.rows, sets.tombstones, sets.digest) = (rows, tombstones, digest);
-        let mut projections = Vec::new();
         for (change, record, old_record) in materialized {
             let row = match record.identity {
                 Some(id) => rocky_core::commitment("rocky.row-incarnation.v2", &id.to_le_bytes()),
@@ -596,30 +572,11 @@ impl<A: RowApplication> Inner<A> {
                 .await?;
             self.index_row_key(&encode(&change.scope)?, &row, old_record.as_ref(), &record)
                 .await?;
-            projections.push((change.scope, old_record, record));
-        }
-        for (scope, old, record) in projections {
-            self.project(scope, old.as_ref(), &record).await?;
-        }
-        // A SQL commit settles once every frame of its bundle is stored.
-        if !self.strict_projection {
-            Box::pin(self.resolve(None)).await?;
         }
         self.store_scope_state(id, sets.rows, sets.tombstones, &sets.digest, applied + 1)
             .await?;
         self.note_applied(id, operation).await?;
         self.note_row_positions(id, frame, payload).await?;
-        if let Some(held) = payload.reauthors() {
-            if payload.membership().is_none() {
-                return Err(denied("held re-authoring requires a transaction bundle"));
-            }
-            let authority = self.verify_chain(
-                frame.chain()?.credentials(),
-                operation.header.public_key,
-                now()?,
-            )?;
-            self.record_held_resolution(held, &authority).await?;
-        }
         self.conn
             .execute(
                 "UPDATE secure_operations SET status='applied' WHERE hash=?",

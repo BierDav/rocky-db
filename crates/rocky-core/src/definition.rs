@@ -2,9 +2,9 @@
 //! `LogicalSchema` from data a host language can write, without Room or Rust.
 //! See `docs/runtime/schema-definitions.md`.
 use crate::{
-    Affinity, Collation, ColumnClass, ConflictPolicy, IndexColumn, LOGICAL_SCHEMA_FORMAT,
-    LogicalAssertion, LogicalColumn, LogicalForeignKey, LogicalIndex, LogicalSchema, LogicalTable,
-    SchemaError, SchemaSource, TableClass, UpdatePolicy, commitment,
+    Affinity, Collation, ColumnClass, IndexColumn, LOGICAL_SCHEMA_FORMAT, LogicalAssertion,
+    LogicalColumn, LogicalForeignKey, LogicalIndex, LogicalSchema, LogicalTable, SchemaError,
+    SchemaSource, TableClass, commitment,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,28 +25,20 @@ pub struct SchemaDefinition {
     /// 64 hexadecimal digits.
     pub publisher: String,
     pub application: String,
-    #[serde(default = "changed")]
-    pub update_policy: UpdatePolicy,
     pub tables: Vec<TableDefinition>,
     #[serde(default)]
     pub views: Vec<crate::LogicalView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertions: Vec<LogicalAssertion>,
 }
-fn changed() -> UpdatePolicy {
-    UpdatePolicy::Changed
-}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableDefinition {
     pub name: String,
-    /// The mergeable table whose grants this table follows.
+    /// The replayed table whose grants this table follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_like: Option<String>,
     pub class: TableClass,
-    /// A replayed table whose writes go through the coordinated log.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub coordinated: bool,
     pub columns: Vec<ColumnDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<String>,
@@ -57,15 +49,11 @@ pub struct TableDefinition {
     pub partition_group: Option<String>,
     #[serde(default)]
     pub indexes: Vec<IndexDefinition>,
-    /// References to the identity of another mergeable table.
+    /// References to the identity of another replayed table.
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKeyDefinition>,
-    /// Every device of the domain reads the table's row creations and
-    /// deletions, so another reader scope may reference it.
-    #[serde(default)]
-    pub existence_log: bool,
 }
-/// What a child shows when its parent is not alive; see `docs/runtime/mergeable-constraints.md`.
+/// What deleting a parent does to its children, inside the same transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeleteAction {
@@ -80,7 +68,7 @@ pub struct ForeignKeyDefinition {
     /// The parent table.
     pub table: String,
     pub on_delete: DeleteAction,
-    /// Replayed only: checked when the transaction ends, as SQLite checks
+    /// Checked when the transaction ends, as SQLite checks
     /// a deferred key at `COMMIT`, instead of after each statement.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
@@ -98,8 +86,8 @@ pub struct ColumnDefinition {
     pub default: Option<serde_json::Value>,
     #[serde(default = "binary")]
     pub collation: Collation,
-    /// An expression over the row's replicated columns. On a replayed table
-    /// it is a stored SQLite generated column.
+    /// An expression over the row's replicated columns: a stored SQLite
+    /// generated column.
     #[serde(default)]
     pub derived: Option<String>,
     #[serde(default)]
@@ -115,13 +103,10 @@ pub struct IndexDefinition {
     pub columns: Vec<IndexColumn>,
     #[serde(default)]
     pub unique: bool,
-    /// Required for a unique index of a mergeable table.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_conflict: Option<ConflictPolicy>,
-    /// Replayed only: terms indexed after `columns`, such as `lower(name)`.
+    /// Terms indexed after `columns`, such as `lower(name)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expressions: Vec<String>,
-    /// Replayed only: indexes just the rows this expression holds for.
+    /// Indexes just the rows this expression holds for.
     #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
     pub predicate: Option<String>,
 }
@@ -237,11 +222,7 @@ impl SchemaDefinition {
                     on_update: "NO ACTION".into(),
                     deferred: key.deferred,
                 };
-                let clause = if table.class == TableClass::Replayed {
-                    crate::replayed_foreign_key_clause(&key)
-                } else {
-                    crate::foreign_key_clause(&key)
-                };
+                let clause = table.foreign_key_sql(&key);
                 table.create_sql.pop();
                 table.create_sql.push_str(&format!(", {clause})"));
                 table.foreign_keys.push(key);
@@ -262,7 +243,6 @@ impl SchemaDefinition {
                     .map(|byte| format!("{byte:02x}"))
                     .collect(),
             },
-            update_policy: self.update_policy,
             tables,
             views: self.views.clone(),
             assertions: self.assertions.clone(),
@@ -280,7 +260,7 @@ impl TableDefinition {
         let mut columns = Vec::new();
         let mut parts = Vec::new();
         for column in &self.columns {
-            if ["id", "row_kind"].contains(&column.name.as_str()) {
+            if column.name == "id" {
                 return invalid(format!(
                     "{name}.{} is supplied by Rocky; do not declare it",
                     column.name
@@ -292,7 +272,7 @@ impl TableDefinition {
             let class = match (&column.derived, column.local_only) {
                 (Some(rule), false) => ColumnClass::Derived { rule: rule.clone() },
                 (None, true) => ColumnClass::LocalOnly,
-                (None, false) => ColumnClass::Mergeable,
+                (None, false) => ColumnClass::Replicated,
                 (Some(_), true) => {
                     return invalid(format!(
                         "{name}.{} cannot be both derived and local-only",
@@ -326,23 +306,15 @@ impl TableDefinition {
                 class,
             });
         }
-        {
-            for (name, default) in [("id", None), ("row_kind", Some("0".to_string()))] {
-                let sql_default = default
-                    .as_ref()
-                    .map(|value| format!(" DEFAULT {value}"))
-                    .unwrap_or_default();
-                parts.push(format!("{} INTEGER NOT NULL{sql_default}", quoted(name)));
-                columns.push(LogicalColumn {
-                    sql_name: name.into(),
-                    affinity: Affinity::Integer,
-                    not_null: true,
-                    default,
-                    collation: Collation::Binary,
-                    class: ColumnClass::Mergeable,
-                });
-            }
-        }
+        parts.push(format!("{} INTEGER NOT NULL", quoted("id")));
+        columns.push(LogicalColumn {
+            sql_name: "id".into(),
+            affinity: Affinity::Integer,
+            not_null: true,
+            default: None,
+            collation: Collation::Binary,
+            class: ColumnClass::Replicated,
+        });
         // Table constraints follow every column.
         for check in &self.checks {
             if !crate::logical::single_expression(check) {
@@ -387,29 +359,18 @@ impl TableDefinition {
                 .predicate
                 .as_ref()
                 .map_or(String::new(), |sql| format!(" WHERE {sql}"));
-            if index.on_conflict.is_some() && !index.unique {
-                return invalid(format!(
-                    "{name}: on_conflict needs a unique index {}",
-                    index.name
-                ));
-            }
             let unique = if index.unique { "UNIQUE " } else { "" };
-            let create_sql = if index.on_conflict.is_some() && self.class == TableClass::Mergeable {
-                crate::unique_index_sql(name, &index.name, &index.columns)
-            } else {
-                format!(
-                    "CREATE {unique}INDEX IF NOT EXISTS {} ON {} ({}){predicate}",
-                    quoted(&index.name),
-                    quoted(name),
-                    terms.join(",")
-                )
-            };
+            let create_sql = format!(
+                "CREATE {unique}INDEX IF NOT EXISTS {} ON {} ({}){predicate}",
+                quoted(&index.name),
+                quoted(name),
+                terms.join(",")
+            );
             indexes.push(LogicalIndex {
                 name: index.name.clone(),
                 unique: index.unique,
                 columns: index.columns.clone(),
                 create_sql,
-                on_conflict: index.on_conflict,
                 expressions: index.expressions.clone(),
                 predicate: index.predicate.clone(),
             });
@@ -450,7 +411,6 @@ impl TableDefinition {
                         .collect::<Vec<_>>()
                         .join(",")
                 ),
-                on_conflict: None,
                 expressions: Vec::new(),
                 predicate: None,
             });
@@ -460,7 +420,6 @@ impl TableDefinition {
             sql_name: name.clone(),
             granted_like: self.granted_like.clone(),
             class: self.class,
-            coordinated: self.coordinated,
             create_sql: format!("CREATE TABLE {} ({})", quoted(name), parts.join(", ")),
             auto_generate: false,
             columns,
@@ -469,8 +428,6 @@ impl TableDefinition {
             partition_group: self.partition_group.clone(),
             indexes,
             foreign_keys: Vec::new(),
-
-            existence_log: self.existence_log,
         })
     }
 }
@@ -487,7 +444,7 @@ mod tests {
         "tables": [
             {
                 "name": "notes",
-                "class": "mergeable",
+                "class": "replayed",
                 "columns": [
                     {"name": "key", "type": "text", "not_null": true},
                     {"name": "folder", "type": "text", "not_null": true, "default": "inbox", "collation": "nocase"},
@@ -507,7 +464,7 @@ mod tests {
     }"#;
 
     #[test]
-    fn a_definition_builds_one_installable_descriptor_on_both_profiles() {
+    fn a_definition_builds_one_descriptor_only_the_secure_profile_replays() {
         let definition = SchemaDefinition::parse(DEFINITION.as_bytes()).unwrap();
         let schema = definition.build().unwrap();
         assert_eq!(schema, definition.build().unwrap());
@@ -523,46 +480,23 @@ mod tests {
         let notes = schema.table("notes").unwrap();
         assert_eq!(
             notes.create_sql,
-            "CREATE TABLE \"notes\" (\"key\" TEXT NOT NULL, \"folder\" TEXT NOT NULL DEFAULT 'inbox' COLLATE NOCASE, \"body\" TEXT, \"pinned\" INTEGER NOT NULL DEFAULT 0, \"id\" INTEGER NOT NULL, \"row_kind\" INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(\"key\"))"
+            "CREATE TABLE \"notes\" (\"key\" TEXT NOT NULL, \"folder\" TEXT NOT NULL DEFAULT 'inbox' COLLATE NOCASE, \"body\" TEXT, \"pinned\" INTEGER NOT NULL DEFAULT 0, \"id\" INTEGER NOT NULL, PRIMARY KEY(\"key\"))"
         );
         assert_eq!(notes.column("folder").unwrap().collation, Collation::Nocase);
         assert_eq!(
             crate::declared_collations(&notes.create_sql),
             vec![("folder".to_string(), "NOCASE".to_string())]
         );
-        schema.supported_on(Profile::Trusted).unwrap();
         schema.supported_on(Profile::Secure).unwrap();
+        assert_eq!(
+            schema.supported_on(Profile::Trusted),
+            Err(SchemaError::Incompatible {
+                table: "notes".into(),
+                reason: Incompatibility::Unsupported(TableClass::Replayed),
+            })
+        );
         let bytes = schema.canonical().unwrap();
         assert_eq!(LogicalSchema::parse(&bytes).unwrap(), schema);
-    }
-
-    #[test]
-    fn profile_gaps_are_diagnosed_before_installation() {
-        let mut definition = SchemaDefinition::parse(DEFINITION.as_bytes()).unwrap();
-
-        definition.tables[0].columns.push(ColumnDefinition {
-            name: "search".into(),
-            affinity: Affinity::Text,
-            not_null: false,
-            default: None,
-            collation: Collation::Binary,
-            derived: Some("lower(body)".into()),
-            local_only: false,
-        });
-        let schema = definition.build().unwrap();
-        schema.supported_on(Profile::Trusted).unwrap();
-        let reasons: Vec<_> = schema
-            .diagnose(Profile::Secure)
-            .into_iter()
-            .map(|error| match error {
-                SchemaError::Incompatible { reason, .. } => reason,
-                other => panic!("{other}"),
-            })
-            .collect();
-        assert_eq!(reasons, [Incompatibility::DerivedColumn("search".into())]);
-        assert!(schema.supported_on(Profile::Secure).is_err());
-        // A refused definition never reaches a file: TypedRows refuses it too.
-        assert!(crate::TypedRows::new(schema, Vec::new()).is_err());
     }
 
     #[test]
@@ -577,14 +511,14 @@ mod tests {
                 SchemaError::Invalid("unsupported schema definition format".into()).to_string()
             );
         }
-        for format in [0, 1, 2, 3, 4, 6, 7] {
+        for format in [0, 1, 2, 3, 4, 5, 7] {
             let mut descriptor = SchemaDefinition::parse(DEFINITION.as_bytes())
                 .unwrap()
                 .build()
                 .unwrap();
             descriptor.format = format;
             assert!(crate::TypedRows::new(descriptor.clone(), vec![]).is_err());
-            assert!(descriptor.supported_on(crate::Profile::Trusted).is_err());
+            assert!(descriptor.supported_on(crate::Profile::Secure).is_err());
         }
     }
 
@@ -621,14 +555,14 @@ mod identity_tests {
         assert_eq!(schema.format, crate::LOGICAL_SCHEMA_FORMAT);
         for table in &schema.tables {
             assert_eq!(table.column("id").unwrap().affinity, Affinity::Integer);
-            assert_eq!(
-                table.column("row_kind").unwrap().default.as_deref(),
-                Some("0")
+            assert!(
+                table
+                    .indexes
+                    .iter()
+                    .any(|index| table.is_identity_index(index))
             );
-            assert!(table.indexes.iter().any(LogicalIndex::is_identity));
         }
         schema.supported_on(crate::Profile::Secure).unwrap();
-        schema.supported_on(crate::Profile::Trusted).unwrap();
         let mut invalid = schema.clone();
         invalid.tables[0].indexes.clear();
         assert!(
@@ -649,13 +583,12 @@ mod identity_tests {
         );
         definition.tables[0].primary_key = vec!["id".into()];
         let id_key = definition.build().unwrap();
+        let notes = id_key.table("notes").unwrap();
         assert!(
-            !id_key
-                .table("notes")
-                .unwrap()
+            !notes
                 .indexes
                 .iter()
-                .any(LogicalIndex::is_identity)
+                .any(|index| index.name == "notes_identity")
         );
         assert_ne!(
             schema.replicated_fingerprint(),
@@ -665,204 +598,10 @@ mod identity_tests {
 }
 
 #[cfg(test)]
-mod constraint_tests {
-    use super::*;
-    use crate::{Incompatibility, Profile};
-
-    const SHOP: &str = r#"{
-        "format":6,
-        "publisher": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
-        "application": "shop",
-        "tables": [
-            {
-                "name": "lists",
-                "class": "mergeable",
-                "columns": [{"name": "title", "type": "text", "not_null": true}],
-                "primary_key": ["id"]
-            },
-            {
-                "name": "items",
-                "class": "mergeable",
-                "columns": [
-                    {"name": "list", "type": "integer", "not_null": true},
-                    {"name": "title", "type": "text", "collation": "nocase"},
-                    {"name": "code", "type": "text", "not_null": true},
-                    {"name": "moved", "type": "integer"}
-                ],
-                "primary_key": ["id"],
-                "indexes": [
-                    {"name": "items_title", "columns": [{"name": "title", "descending": false}], "unique": true, "on_conflict": "set_null"},
-                    {"name": "items_code", "columns": [{"name": "list", "descending": false}, {"name": "code", "descending": false}], "unique": true, "on_conflict": "latest_wins"}
-                ],
-                "foreign_keys": [
-                    {"columns": ["list"], "table": "lists", "on_delete": "cascade"},
-                    {"columns": ["moved"], "table": "lists", "on_delete": "set_null"}
-                ]
-            }
-        ]
-    }"#;
-    fn shop() -> SchemaDefinition {
-        SchemaDefinition::parse(SHOP.as_bytes()).unwrap()
-    }
-    fn reason(schema: &LogicalSchema) -> Option<Incompatibility> {
-        match schema.supported_on(Profile::Secure) {
-            Ok(()) => None,
-            Err(SchemaError::Incompatible { reason, .. }) => Some(reason),
-            Err(error) => panic!("{error}"),
-        }
-    }
-
-    #[test]
-    fn constraints_build_real_statements_secure_only() {
-        let schema = shop().build().unwrap();
-        schema.supported_on(Profile::Secure).unwrap();
-        let trusted: Vec<_> = schema
-            .diagnose(Profile::Trusted)
-            .into_iter()
-            .map(|error| match error {
-                SchemaError::Incompatible { reason, .. } => reason,
-                other => panic!("{other}"),
-            })
-            .collect();
-        assert_eq!(
-            trusted,
-            [
-                Incompatibility::UniqueConstraint,
-                Incompatibility::ForeignKey
-            ]
-        );
-        let items = schema.table("items").unwrap();
-        assert!(items.create_sql.ends_with(
-            "FOREIGN KEY(\"list\") REFERENCES \"lists\"(\"id\") DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY(\"moved\") REFERENCES \"lists\"(\"id\") DEFERRABLE INITIALLY DEFERRED)"
-        ));
-        let title = items
-            .indexes
-            .iter()
-            .find(|index| index.name == "items_title")
-            .unwrap();
-        assert_eq!(
-            title.create_sql,
-            "CREATE UNIQUE INDEX IF NOT EXISTS \"items_title\" ON \"items\" (\"title\") WHERE \"row_kind\" = 0"
-        );
-        assert_eq!(items.foreign_keys[1].on_delete, crate::DELETE_SET_NULL);
-        assert!(schema.constrained(schema.table("lists").unwrap()));
-        assert_eq!(
-            LogicalSchema::parse(&schema.canonical().unwrap()).unwrap(),
-            schema
-        );
-        // Policies are replicated: the same tables without them are another definition.
-        let mut plain = shop();
-        plain.tables[1].foreign_keys.clear();
-        for index in &mut plain.tables[1].indexes {
-            index.unique = false;
-            index.on_conflict = None;
-        }
-        let plain = plain.build().unwrap();
-        assert_ne!(
-            schema.replicated_fingerprint(),
-            plain.replicated_fingerprint()
-        );
-        let mut cascade = shop();
-        cascade.tables[1].foreign_keys[1].on_delete = DeleteAction::Cascade;
-        cascade.tables[1].columns[3].not_null = true;
-        let mut nullable = shop();
-        nullable.tables[1].columns[3].not_null = true;
-        nullable.tables[1].foreign_keys.pop();
-        assert_ne!(
-            cascade.build().unwrap().replicated_fingerprint(),
-            nullable.build().unwrap().replicated_fingerprint()
-        );
-    }
-
-    #[test]
-    fn unresolvable_constraints_are_refused_at_installation() {
-        let refused = |change: &dyn Fn(&mut SchemaDefinition)| {
-            let mut definition = shop();
-            change(&mut definition);
-            reason(&definition.build().unwrap())
-        };
-        assert_eq!(
-            refused(&|d| d.tables[1].indexes[1].on_conflict = None),
-            Some(Incompatibility::UniqueConstraint)
-        );
-        // SET NULL needs nullable columns outside the key.
-        assert_eq!(
-            refused(&|d| d.tables[1].columns[1].not_null = true),
-            Some(Incompatibility::ConflictPolicy("items_title".into()))
-        );
-        assert_eq!(
-            refused(&|d| d.tables[1].columns[3].not_null = true),
-            Some(Incompatibility::Reference("moved".into()))
-        );
-        assert_eq!(
-            refused(&|d| d.tables[1].foreign_keys[0].columns = vec!["code".into()]),
-            Some(Incompatibility::Reference("code".into()))
-        );
-        assert_eq!(
-            refused(&|d| d.tables[0].class = TableClass::LocalOnly),
-            Some(Incompatibility::Reference("list".into()))
-        );
-        assert_eq!(
-            refused(&|d| {
-                for table in &mut d.tables {
-                    table.class = TableClass::LocalOnly;
-                    table.indexes.clear();
-                }
-            }),
-            Some(Incompatibility::ForeignKey)
-        );
-        let mut unknown = shop();
-        unknown.tables[1].foreign_keys[0].table = "absent".into();
-        assert!(
-            unknown
-                .build()
-                .unwrap_err()
-                .to_string()
-                .contains("unknown table")
-        );
-        let mut loose = shop();
-        loose.tables[1].indexes[0].unique = false;
-        assert!(loose.build().is_err());
-        // Descriptors written elsewhere: restricting actions, natural keys
-        // and statements other than the generated ones.
-        let edited = |change: &dyn Fn(&mut LogicalTable)| {
-            let mut schema = shop().build().unwrap();
-            let items = schema
-                .tables
-                .iter_mut()
-                .find(|t| t.sql_name == "items")
-                .unwrap();
-            change(items);
-            reason(&schema)
-        };
-        assert_eq!(
-            edited(&|t| t.foreign_keys[0].on_delete = "RESTRICT".into()),
-            Some(Incompatibility::Reference("list".into()))
-        );
-        assert_eq!(
-            edited(&|t| t.foreign_keys[0].references = vec!["title".into()]),
-            Some(Incompatibility::Reference("list".into()))
-        );
-        assert_eq!(
-            edited(&|t| t.create_sql = t
-                .create_sql
-                .replace(" DEFERRABLE INITIALLY DEFERRED", " ON DELETE CASCADE")),
-            Some(Incompatibility::Reference("list".into()))
-        );
-        assert_eq!(
-            edited(&|t| t.indexes[0].create_sql = t.indexes[0]
-                .create_sql
-                .replace(" WHERE \"row_kind\" = 0", "")),
-            Some(Incompatibility::ConflictPolicy("items_code".into()))
-        );
-    }
-}
-
-#[cfg(test)]
 mod partition_tests {
     use super::*;
     fn definition() -> SchemaDefinition {
-        SchemaDefinition::parse(br#"{"format":6,"publisher":"1111111111111111111111111111111111111111111111111111111111111111","application":"partitions","tables":[{"name":"items","class":"mergeable","columns":[{"name":"list","type":"text","not_null":true,"collation":"nocase"},{"name":"key","type":"text","not_null":true}],"primary_key":["list","key"],"partition_by":["list"]}]}"#).unwrap()
+        SchemaDefinition::parse(br#"{"format":6,"publisher":"1111111111111111111111111111111111111111111111111111111111111111","application":"partitions","tables":[{"name":"items","class":"replayed","columns":[{"name":"list","type":"text","not_null":true,"collation":"nocase"},{"name":"key","type":"text","not_null":true}],"primary_key":["list","key"],"partition_by":["list"]}]}"#).unwrap()
     }
     #[test]
     fn partition_shape_identity_and_manifest_are_bound() {
@@ -881,7 +620,6 @@ mod partition_tests {
             "CREATE UNIQUE INDEX IF NOT EXISTS \"items_identity\" ON \"items\" (\"list\",\"id\")"
         );
         schema.supported_on(crate::Profile::Secure).unwrap();
-        schema.supported_on(crate::Profile::Trusted).unwrap();
         assert_eq!(
             LogicalSchema::parse(&schema.canonical().unwrap()).unwrap(),
             schema
@@ -912,144 +650,62 @@ mod partition_tests {
         };
         let items = |extra: &str| {
             format!(
-                r#"{{"format":6,"publisher":"1111111111111111111111111111111111111111111111111111111111111111","application":"partitions","tables":[{{"name":"lists","class":"mergeable","columns":[{{"name":"title","type":"text"}}],"primary_key":["id"]}},{{"name":"items","class":"mergeable","columns":[{{"name":"list","type":"text","not_null":true}},{{"name":"key","type":"text","not_null":true}},{{"name":"code","type":"text"}},{{"name":"parent","type":"integer"}}],"primary_key":["list","key"],"partition_by":["list"],"partition_group":"list"{extra}}}]}}"#
+                r#"{{"format":6,"publisher":"1111111111111111111111111111111111111111111111111111111111111111","application":"partitions","tables":[{{"name":"lists","class":"replayed","columns":[{{"name":"title","type":"text"}}],"primary_key":["id"]}},{{"name":"items","class":"replayed","columns":[{{"name":"list","type":"text","not_null":true}},{{"name":"key","type":"text","not_null":true}},{{"name":"code","type":"text"}},{{"name":"parent","type":"integer"}}],"primary_key":["list","key"],"partition_by":["list"],"partition_group":"list"{extra}}}]}}"#
             )
         };
-        assert_eq!(
-            reason(&items(
-                r#","indexes":[{"name":"items_code","columns":[{"name":"code","descending":false}],"unique":true,"on_conflict":"latest_wins"}]"#
-            )),
-            crate::Incompatibility::ConflictPolicy("items_code".into())
-        );
         assert_eq!(
             reason(&items(
                 r#","foreign_keys":[{"columns":["parent"],"table":"lists","on_delete":"set_null"}]"#
             )),
             crate::Incompatibility::CrossScopeReference(
-                "a partitioned child requires an unpartitioned logged parent outside its group"
-                    .into()
+                "a partitioned child cannot reference an unpartitioned parent".into()
             )
         );
-        let complete = items(
-            r#","indexes":[{"name":"items_code","columns":[{"name":"list","descending":false},{"name":"code","descending":false}],"unique":true,"on_conflict":"latest_wins"}]"#,
+        // A unique index of a partitioned table is checked within the
+        // partition it replays in.
+        let unique = items(
+            r#","indexes":[{"name":"items_code","columns":[{"name":"list","descending":false},{"name":"code","descending":false}],"unique":true}]"#,
         );
-        SchemaDefinition::parse(complete.as_bytes())
+        SchemaDefinition::parse(unique.as_bytes())
             .unwrap()
             .build()
             .unwrap()
             .supported_on(crate::Profile::Secure)
             .unwrap();
-        assert_eq!(
-            reason(&complete.replace("latest_wins", "set_null")),
-            crate::Incompatibility::ConflictPolicy("items_code".into())
-        );
-        assert_eq!(
-            reason(&complete.replace(",\"on_conflict\":\"latest_wins\"", "")),
-            crate::Incompatibility::UniqueConstraint
-        );
     }
     #[test]
-    fn removed_command_table_classes_are_refused() {
+    fn a_set_null_reference_with_a_partition_column_nulls_only_its_nullable_columns() {
+        let json = r#"{"format":6,"publisher":"1111111111111111111111111111111111111111111111111111111111111111","application":"shop","tables":[{"name":"categories","class":"replayed","columns":[{"name":"list","type":"integer","not_null":true}],"primary_key":["list","id"],"partition_by":["list"],"partition_group":"list"},{"name":"items","class":"replayed","columns":[{"name":"list","type":"integer","not_null":true},{"name":"category","type":"integer"}],"primary_key":["list","id"],"partition_by":["list"],"partition_group":"list","foreign_keys":[{"columns":["list","category"],"table":"categories","on_delete":"set_null"}]}]}"#;
+        let schema = SchemaDefinition::parse(json.as_bytes())
+            .unwrap()
+            .build()
+            .unwrap();
+        schema.supported_on(crate::Profile::Secure).unwrap();
+        let items = schema.table("items").unwrap();
+        assert!(items.create_sql.contains(
+            "FOREIGN KEY(\"list\",\"category\") REFERENCES \"categories\"(\"list\",\"id\") ON DELETE NO ACTION"
+        ));
+        assert_eq!(
+            schema.delete_triggers(|_| true),
+            ["CREATE TRIGGER \"rocky_set_null_items_0\" AFTER DELETE ON \"categories\" FOR EACH ROW BEGIN UPDATE \"items\" SET \"category\"=NULL WHERE \"list\"=OLD.\"list\" AND \"category\"=OLD.\"id\"; END"]
+        );
+        assert!(schema.delete_triggers(|name| name == "items").is_empty());
+    }
+    #[test]
+    fn removed_table_classes_are_refused() {
         let json = |class: &str| {
             format!(
                 r#"{{"format":6,"publisher":"1111111111111111111111111111111111111111111111111111111111111111","application":"stock","tables":[{{"name":"stock","class":"{class}","columns":[{{"name":"item","type":"text","not_null":true}}],"primary_key":["item"]}}]}}"#
             )
         };
-        SchemaDefinition::parse(json("mergeable").as_bytes()).unwrap();
-        for class in ["command_controlled", "confirmed_read_only"] {
+        SchemaDefinition::parse(json("replayed").as_bytes()).unwrap();
+        for class in ["mergeable", "command_controlled", "confirmed_read_only"] {
             assert!(SchemaDefinition::parse(json(class).as_bytes()).is_err());
         }
     }
     #[test]
-    fn existence_logs_bind_the_manifest_and_refuse_nondeterministic_support_rows() {
-        let shop = |lists: &str, extra: &str| {
-            format!(
-                r#"{{"format":6,"publisher":"1111111111111111111111111111111111111111111111111111111111111111","application":"logs","tables":[{{"name":"lists","class":"mergeable","columns":[{{"name":"title","type":"text","not_null":true}},{{"name":"owner","type":"integer","not_null":true}}],"primary_key":{lists},"foreign_keys":[{{"columns":["owner"],"table":"owners","on_delete":"cascade"}}]{extra}}},{{"name":"owners","class":"mergeable","columns":[{{"name":"name","type":"text","not_null":true}}],"primary_key":["name"]}}]}}"#
-            )
-        };
-        let build = |json: String| {
-            SchemaDefinition::parse(json.as_bytes())
-                .unwrap()
-                .build()
-                .unwrap()
-        };
-        let plain = build(shop(r#"["id"]"#, ""));
-        let logged = build(shop(r#"["id"]"#, r#","existence_log":true"#));
-        // Liveness is explicit in the current canonical descriptor.
-        assert!(
-            String::from_utf8(plain.canonical().unwrap())
-                .unwrap()
-                .contains("\"existence_log\":false")
-        );
-        assert!(
-            String::from_utf8(logged.canonical().unwrap())
-                .unwrap()
-                .contains("\"existence_log\":true")
-        );
-        assert_ne!(
-            plain.manifest(&[crate::DomainId([1; 16])]).hash(),
-            logged.manifest(&[crate::DomainId([1; 16])]).hash()
-        );
-        assert_eq!(
-            logged
-                .support_tables()
-                .iter()
-                .map(|table| table.sql_name.as_str())
-                .collect::<Vec<_>>(),
-            ["lists", "owners"]
-        );
-        // The virtual owner row needs an id key; so do puppets.
-        let refused = |schema: crate::LogicalSchema, profile| match schema.supported_on(profile) {
-            Err(SchemaError::Incompatible { table, reason }) => (table, reason),
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(
-            refused(logged.clone(), crate::Profile::Secure),
-            (
-                "owners".into(),
-                crate::Incompatibility::SupportRow("primary key (name)".into())
-            )
-        );
-        assert_eq!(
-            refused(
-                build(shop(r#"["title"]"#, r#","existence_log":true"#)),
-                crate::Profile::Secure
-            ),
-            (
-                "lists".into(),
-                crate::Incompatibility::SupportRow("primary key (title)".into())
-            )
-        );
-        let mut keyed = logged.clone();
-        keyed.tables.iter_mut().for_each(|table| {
-            if table.sql_name == "owners" {
-                table.primary_key = vec!["id".into()];
-                table.create_sql = table
-                    .create_sql
-                    .replace("PRIMARY KEY(\"name\")", "PRIMARY KEY(\"id\")");
-                table.indexes.clear();
-            }
-        });
-        keyed.supported_on(crate::Profile::Secure).unwrap();
-        assert!(matches!(
-            keyed.diagnose(crate::Profile::Trusted).first(),
-            Some(SchemaError::Incompatible {
-                reason: crate::Incompatibility::SupportRow(_),
-                ..
-            })
-        ));
-        // A build that does not know the entry refuses it as malformed.
-        let bytes = String::from_utf8(logged.canonical().unwrap()).unwrap();
-        assert!(
-            crate::LogicalSchema::parse(
-                bytes.replace("existence_log", "existence_logs").as_bytes()
-            )
-            .is_err()
-        );
-    }
-    #[test]
     fn invalid_and_legacy_partition_declarations_are_refused() {
-        for columns in [vec!["absent"], vec!["list", "list"], vec!["row_kind"]] {
+        for columns in [vec!["absent"], vec!["list", "list"], vec!["id"]] {
             let mut definition = definition();
             definition.tables[0].partition_by = columns.into_iter().map(String::from).collect();
             assert!(definition.build().is_err());
@@ -1075,7 +731,7 @@ mod replayed_tests {
     use crate::{Incompatibility, Profile};
 
     /// `teams` and its `members` replay in partition group `org`; `notes`
-    /// stays mergeable.
+    /// is unpartitioned.
     fn definition(extra: serde_json::Value) -> SchemaDefinition {
         let mut json = serde_json::json!({
             "format": 6,
@@ -1098,7 +754,7 @@ mod replayed_tests {
                                           {"name": "email", "descending": false}]}],
                  "foreign_keys": [{"columns": ["org", "team"], "table": "teams",
                                    "on_delete": "cascade", "deferred": true}]},
-                {"name": "notes", "class": "mergeable",
+                {"name": "notes", "class": "replayed",
                  "columns": [{"name": "body", "type": "text"}], "primary_key": ["id"]}
             ],
             "assertions": [{"name": "team_cap",
@@ -1132,7 +788,7 @@ mod replayed_tests {
         schema.supported_on(Profile::Secure).unwrap();
         let teams = schema.table("teams").unwrap();
         assert!(teams.create_sql.contains(
-            "\"row_kind\" INTEGER NOT NULL DEFAULT 0, CHECK (cap BETWEEN 1 AND 10), PRIMARY KEY"
+            "\"id\" INTEGER NOT NULL, CHECK (cap BETWEEN 1 AND 10), PRIMARY KEY"
         ));
         let members = schema.table("members").unwrap();
         assert!(members.create_sql.ends_with(
@@ -1227,7 +883,7 @@ mod replayed_tests {
             let refused = parsed(&|json| *json.pointer_mut(pointer).unwrap() = sql.into());
             assert!(matches!(refused, Err(SchemaError::Invalid(_))), "{sql}");
         }
-        let refused = parsed(&|json| json["tables"][0]["class"] = "mergeable".into());
+        let refused = parsed(&|json| json["tables"][0]["class"] = "local_only".into());
         assert!(matches!(refused, Err(SchemaError::Invalid(_))));
     }
 
@@ -1250,26 +906,28 @@ mod replayed_tests {
                 "{function}"
             );
         }
-        // Mergeable tables still refuse every CHECK.
-        let mut mergeable = definition(serde_json::Value::Null);
-        table(&mut mergeable, "notes").checks = vec!["length(body) < 10".into()];
-        assert_eq!(
-            refusal(&mergeable),
-            Some(("notes".into(), Incompatibility::CheckConstraint))
-        );
     }
 
     #[test]
-    fn replayed_unique_indexes_refuse_conflict_policies() {
-        let mut policy = definition(serde_json::Value::Null);
-        table(&mut policy, "members").indexes[0].on_conflict = Some(ConflictPolicy::LatestWins);
-        assert_eq!(
-            refusal(&policy),
-            Some((
-                "members".into(),
-                Incompatibility::ConflictPolicy("members_email".into())
-            ))
+    fn conflict_policies_existence_logs_and_update_policies_are_refused() {
+        let parsed = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut json = serde_json::json!({
+                "format": 6, "publisher": "00".repeat(32), "application": "removed",
+                "tables": [{"name": "items", "class": "replayed", "primary_key": ["id"],
+                    "columns": [{"name": "name", "type": "text", "not_null": true}],
+                    "indexes": [{"name": "by_name", "unique": true,
+                                 "columns": [{"name": "name", "descending": false}]}]}]
+            });
+            edit(&mut json);
+            SchemaDefinition::parse(&serde_json::to_vec(&json).unwrap())
+        };
+        parsed(&|_| {}).unwrap();
+        assert!(
+            parsed(&|json| json["tables"][0]["indexes"][0]["on_conflict"] = "latest_wins".into())
+                .is_err()
         );
+        assert!(parsed(&|json| json["tables"][0]["existence_log"] = true.into()).is_err());
+        assert!(parsed(&|json| json["update_policy"] = "assigned".into()).is_err());
     }
 
     #[test]
@@ -1292,7 +950,7 @@ mod replayed_tests {
         let other = |reason: &str| Some(Incompatibility::Assertion(reason.into()));
         assert_eq!(
             refused("SELECT * FROM members m, notes n WHERE n.body = m.email"),
-            other("notes is not a replayed table")
+            other("tables must share one partition group")
         );
         assert_eq!(
             refused("SELECT * FROM absent"),
@@ -1315,7 +973,7 @@ mod replayed_tests {
             refusal(&regrouped),
             Some((
                 "rule".into(),
-                other("tables must share one partition group and replay order").unwrap()
+                other("tables must share one partition group").unwrap()
             ))
         );
         // Names are identifiers and unique.

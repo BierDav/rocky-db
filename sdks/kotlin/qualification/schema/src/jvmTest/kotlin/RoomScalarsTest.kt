@@ -112,7 +112,7 @@ class RoomScalarsTest {
                 primaryKey("sensor", "sequence")
                 partitionBy("sensor")
             }
-            view("partial_partition_samples", "SELECT * FROM partition_samples WHERE row_kind = 0")
+            view("partial_partition_samples", "SELECT * FROM partition_samples")
         }
         assertEquals(handmade.definitionJson("09".repeat(32)), imported.definitionJson("09".repeat(32)))
         val directory = Files.createTempDirectory("rocky-partition-room").toFile()

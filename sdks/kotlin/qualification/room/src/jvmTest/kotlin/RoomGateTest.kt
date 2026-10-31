@@ -189,32 +189,6 @@ class RoomGateTest {
         assertEquals(roomB.shop().items("l1"), roomA.shop().items("l1"))
     }
 
-    @Test fun aRowInsertedAndDeletedInOneTransactionPublishesNothing() = pair {
-        roomA.shop().createList(ShopList("l1", "Groceries"), emptyList())
-        val before = bundles(File(directory, "a"))
-        roomA.useWriterConnection { writer ->
-            writer.immediateTransaction {
-                val inserted = roomA.shop().createItems(listOf(item("i1", "Milk"))).single()
-                roomA.shop().delete(inserted)
-            }
-        }
-        assertEquals(before, bundles(File(directory, "a")))
-        assertTrue(roomA.shop().items("l1").isEmpty())
-    }
-
-    @Test fun aWholeEntityUpdatePublishesOnlyChangedColumns() = pair {
-        roomA.shop().createList(ShopList("l1", "Groceries"), listOf(item("i1", "Milk")))
-        b.syncOnce()
-        val stale = roomA.shop().items("l1").single()
-        // Both devices write the whole entity, each changing one column, before they sync.
-        roomA.shop().update(stale.copy(title = "Oat milk"))
-        roomB.shop().update(roomB.shop().items("l1").single().copy(completed = true, quantity = 3))
-        assertTrue(b.syncOnce().peers.any { peer -> peer.attempts.any { attempt -> attempt.operation == rocky.AttemptOperation.Reconcile && attempt.outcome == rocky.AttemptOutcome.Completed } })
-        val expected = stale.copy(title = "Oat milk", completed = true, quantity = 3)
-        assertEquals(expected, roomA.shop().items("l1").single())
-        assertEquals(expected, roomB.shop().items("l1").single())
-    }
-
     @Test fun readersNeverBlockTheWriter() = pair {
         roomA.shop().createList(ShopList("l1", "Groceries"), listOf(item("i1", "Milk")))
         suspend fun count(connection: PooledConnection) = connection.usePrepared("SELECT count(*) FROM items") {

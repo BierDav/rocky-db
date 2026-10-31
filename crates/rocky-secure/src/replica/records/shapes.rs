@@ -118,38 +118,4 @@ impl<A: RowApplication> Inner<A> {
         dictionary.shape_ids.insert(fields.clone(), id);
         Ok(fields)
     }
-
-    pub(in crate::replica) fn seal_shape_predicate(
-        &self,
-        scope: ResourceScope,
-        tip: TipId,
-        first: usize,
-    ) -> Result<(String, Vec<SqlValue>), Error> {
-        let Some(typed) = &self.workspace.typed else {
-            return Ok(("0".into(), Vec::new()));
-        };
-        let Some(table) = typed.by_scope(scope) else {
-            return Ok(("0".into(), Vec::new()));
-        };
-        let sealed = self.path_fields(scope.domain, tip)?;
-        let required: BTreeSet<_> = table
-            .table
-            .fields
-            .iter()
-            .filter(|field| sealed.fields.contains(*field))
-            .copied()
-            .collect();
-        let clauses = required.iter().enumerate().map(|(index,_)| format!("NOT EXISTS(SELECT 1 FROM secure_record_shape_fields f WHERE f.shape=s.shape AND f.field=?{})",first+index)).collect::<Vec<_>>();
-        Ok((
-            if clauses.is_empty() {
-                "0".into()
-            } else {
-                clauses.join(" OR ")
-            },
-            required
-                .into_iter()
-                .map(|field| SqlValue::Blob(field.to_vec()))
-                .collect(),
-        ))
-    }
 }

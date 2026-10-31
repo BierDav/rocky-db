@@ -8,7 +8,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import rocky.RockyBinding
 import rocky.RockyDatabase
-import rocky.SqlChanges
 import rocky.sqlite.RockySQLiteDriver
 import rocky.sqlite.isRetryableRockyRead
 import kotlin.coroutines.CoroutineContext
@@ -150,20 +149,6 @@ suspend fun RoomDatabase.followRocky(database: RockyDatabase) {
     } finally {
         events.destroy()
     }
-}
-
-/** Moves through Rocky's atomic write surface and refreshes this Room projection after commit. */
-suspend fun RoomDatabase.moveRockyRow(
-    database: RockyDatabase,
-    handle: String,
-    table: String,
-    id: Long,
-    from: List<Any?>,
-    to: List<Any?>,
-    changes: SqlChanges.() -> Unit = {},
-) {
-    database.moveRow(handle, table, id, from, to, changes)
-    invalidationTracker.refreshAsync()
 }
 
 /**

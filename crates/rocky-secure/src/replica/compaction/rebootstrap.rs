@@ -16,8 +16,6 @@ pub struct SealRebootstrap {
     /// another node signed, newest seal first.
     pub listed: Vec<Commitment>,
     pub replay: FrameReplay,
-    /// The scope keeps an existence log, whose base comes with the import.
-    pub logged: bool,
 }
 
 impl<A: RowApplication> Inner<A> {
@@ -178,38 +176,18 @@ impl<A: RowApplication> Inner<A> {
             return Ok(None);
         }
         let listed = self.listed_at(graph, scope, path.iter().rev())?;
-        let logged = self.existence_table(scope);
-        let released = self
-            .existence_released(scope, &path.iter().copied().collect())
-            .await?;
         if unknown && !missing && !pruned && base.is_none_or(|seal| path.contains(&seal)) {
             return Ok(None);
         }
-        let replay = match (released, pruned || missing) {
-            (true, _) => FrameReplay::Unavailable,
-            (false, false) => FrameReplay::Local,
-            (false, true) => FrameReplay::Peers,
+        let replay = match pruned || missing {
+            false => FrameReplay::Local,
+            true => FrameReplay::Peers,
         };
         Ok(Some(SealRebootstrap {
             scope,
             listed,
             replay,
-            logged,
         }))
-    }
-    /// Whether `scope`'s existence records were folded at a seal outside
-    /// `path`: only a checkpoint with a signed existence base replaces them.
-    pub(in crate::replica) async fn existence_released(
-        &self,
-        scope: ResourceScope,
-        path: &BTreeSet<Commitment>,
-    ) -> Result<bool, Error> {
-        Ok(self.existence_table(scope)
-            && self
-                .existence_base(scope)
-                .await?
-                .and_then(|base| base.seal())
-                .is_some_and(|seal| !path.contains(&seal)))
     }
     /// Inside the caller's transaction, drops scope `id`'s replay base so
     /// its rows are rebuilt from frames. With `reset`, its applied state goes
@@ -263,6 +241,9 @@ impl<A: RowApplication> Inner<A> {
         }
         self.store_scope_state(id, 0, 0, &checkpoint::Lt::new(), 0)
             .await?;
+        if self.replayed_scope(scope) {
+            return self.reset_replayed(scope).await;
+        }
         self.reproject(scope).await
     }
     /// Inside the caller's transaction, installs the pulled state of every
@@ -394,8 +375,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
     }
     /// Rebuilds a scope that needs a seal rebootstrap from frames instead of
     /// a checkpoint: from those it holds, or with `reset` from those a peer
-    /// sends again. Refused where existence records were released at a
-    /// seal off the path.
+    /// sends again.
     pub async fn replay_at_seals(&self, scope: ResourceScope, reset: bool) -> Result<(), Error> {
         let mut inner = self.inner.lock(crate::replica::Class::Background).await;
         // Only this scope is checked, not every scope of its domain.
@@ -407,16 +387,8 @@ impl<A: RowApplication> EncryptedReplica<A> {
         }
         let need =
             need.ok_or_else(|| denied("the scope's base sits at a seal of the followed path"))?;
-        match (need.replay, reset) {
-            (FrameReplay::Unavailable, _) => {
-                return Err(denied(
-                    "existence records were released at a seal off the path; a checkpoint at the winning seal replaces them",
-                ));
-            }
-            (FrameReplay::Peers, false) => {
-                return Err(denied("pruned frames must come again from a peer"));
-            }
-            _ => {}
+        if need.replay == FrameReplay::Peers && !reset {
+            return Err(denied("pruned frames must come again from a peer"));
         }
         let id = inner.scope_id(scope).await?;
         transaction!(inner, |inner| {

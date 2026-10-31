@@ -2,7 +2,7 @@
 //! authorized secure rows project into, in the same transaction as every
 //! row change. See `docs/runtime/secure-sql.md`.
 use super::*;
-use crate::{capture::Plan, scoped_connection::Names, storage};
+use crate::{capture::Plan, scoped_connection::Names};
 use rocky_core::{LogicalSchema, Scope, TableClass, TypedRows, TypedTable};
 
 pub(super) const SCHEMA: &[&str] = &[
@@ -15,9 +15,6 @@ pub(super) const SCHEMA: &[&str] = &[
 pub(super) struct Projected {
     pub(super) table: TypedTable,
     pub(super) scope: ResourceScope,
-    pub(super) select: String,
-    pub(super) upsert: String,
-    pub(super) delete: String,
 }
 /// The installed typed tables of a replica.
 pub(super) struct Typed {
@@ -27,103 +24,37 @@ pub(super) struct Typed {
     /// Full signed declarations, including tables with no physical projection.
     pub(super) declarations: Vec<Projected>,
     pub(super) names: Names,
-    /// Whether these are the shadow tables of a projection plan.
-    pub(super) shadowed: bool,
-    /// Tables with unique indexes or foreign keys; never on shadows.
-    pub(super) constraints: Option<super::constraints::Constraints>,
 }
 pub(super) fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
-/// The stored name of a typed table, or of its shadow during a plan.
-pub(super) fn physical(sql_name: &str, shadow: bool) -> String {
-    if shadow {
-        format!("{SHADOW}_{sql_name}")
-    } else {
-        sql_name.to_string()
-    }
-}
-/// The namespace of shadow tables and their indexes.
-pub(super) const SHADOW: &str = "secure_shadow";
 impl Typed {
     pub(super) fn new(
         schema: LogicalSchema,
         domain: Scope,
         readers: &BTreeMap<String, Commitment>,
     ) -> Result<Self, Error> {
-        Self::build(schema, domain, readers, false)
-    }
-    /// The shadow tables a projection plan fills: the same columns under
-    /// `secure_shadow_` names, which applications cannot use.
-    pub(super) fn shadow(
-        schema: LogicalSchema,
-        domain: Scope,
-        readers: &BTreeMap<String, Commitment>,
-    ) -> Result<Self, Error> {
-        Self::build(schema, domain, readers, true)
-    }
-    fn build(
-        schema: LogicalSchema,
-        domain: Scope,
-        readers: &BTreeMap<String, Commitment>,
-        shadow: bool,
-    ) -> Result<Self, Error> {
         let incompatible = |reason: String| Error::Incompatible(reason);
-        // Rows written before a transition added a field lack it; the
-        // application admitted them, so they project with NULL or, for a
-        // required field, its default.
         let rows = TypedRows::new(schema.clone(), vec![domain.domain])
-            .and_then(|rows| rows.at_generation(1, rocky_core::fillable(&schema)))
             .map_err(|error| incompatible(error.to_string()))?;
         let mut tables = Vec::new();
         let typed: Vec<_> = rows.tables().collect();
         for table in typed.iter() {
-            let logical = schema
-                .table(&table.sql_name)
-                .ok_or_else(|| incompatible(format!("{} is not in the schema", table.sql_name)))?;
+            if schema.table(&table.sql_name).is_none() {
+                return Err(incompatible(format!(
+                    "{} is not in the schema",
+                    table.sql_name
+                )));
+            }
             let encryption = readers
                 .get(&table.sql_name)
                 .ok_or_else(|| incompatible(format!("{} has no reader scope", table.sql_name)))?;
-            let columns: Vec<String> = logical
-                .columns
-                .iter()
-                .map(|column| quoted(&column.sql_name))
-                .collect();
-            let key: Vec<String> = table
-                .key
-                .iter()
-                .map(|index| columns[*index].clone())
-                .collect();
-            let by_key = key
-                .iter()
-                .map(|column| format!("{column}=?"))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            let registers: Vec<String> = columns
-                .iter()
-                .filter(|column| !key.contains(column))
-                .map(|column| format!("{column}=excluded.{column}"))
-                .collect();
-            let name = quoted(&physical(&table.sql_name, shadow));
-            let conflict = if registers.is_empty() {
-                "DO NOTHING".to_string()
-            } else {
-                format!("DO UPDATE SET {}", registers.join(","))
-            };
             tables.push(Projected {
                 scope: ResourceScope {
                     domain,
                     encryption: *encryption,
                     table: table.id,
                 },
-                select: format!("SELECT {} FROM {name} WHERE {by_key}", columns.join(",")),
-                upsert: format!(
-                    "INSERT INTO {name}({}) VALUES({}) ON CONFLICT({}) {conflict}",
-                    columns.join(","),
-                    vec!["?"; columns.len()].join(","),
-                    key.join(","),
-                ),
-                delete: format!("DELETE FROM {name} WHERE {by_key}"),
                 table: (*table).clone(),
             });
         }
@@ -131,41 +62,38 @@ impl Typed {
             return Err(incompatible("a reader scope names no typed table".into()));
         }
         let statements = statements(&schema);
-        let constraints = super::constraints::Constraints::new(&schema, &tables)?;
-        if shadow && constraints.is_some() {
-            return Err(incompatible(
-                "tables with unique indexes or foreign keys change by export and reinstall".into(),
-            ));
-        }
         Ok(Self {
             names: Names::new(None, &statements),
             rows,
             domain,
             declarations: tables.clone(),
             tables,
-            shadowed: shadow,
-            constraints,
         })
     }
-    fn restrict(mut self, allowed: &BTreeSet<String>) -> Result<Self, Error> {
+    fn restrict(mut self, allowed: &BTreeSet<String>) -> Self {
         self.tables
             .retain(|table| allowed.contains(&table.table.sql_name));
-        self.constraints = super::constraints::Constraints::new(self.rows.schema(), &self.tables)?;
-        Ok(self)
+        self
     }
     pub(super) fn statements(&self) -> Vec<String> {
-        self.rows
-            .schema()
+        let schema = self.rows.schema();
+        let mut statements: Vec<_> = schema
             .tables
             .iter()
-            .filter(|table| {
-                table.class == TableClass::LocalOnly || self.by_name(&table.sql_name).is_some()
-            })
+            .filter(|table| self.installs(&table.sql_name))
             .flat_map(|table| {
                 std::iter::once(table.create_sql.clone())
                     .chain(table.indexes.iter().map(|index| index.create_sql.clone()))
             })
-            .collect()
+            .collect();
+        statements.extend(schema.delete_triggers(|name| self.installs(name)));
+        statements
+    }
+    /// Whether this projection installs table `name`.
+    pub(super) fn installs(&self, name: &str) -> bool {
+        self.rows.schema().table(name).is_some_and(|table| {
+            table.class == TableClass::LocalOnly || self.by_name(&table.sql_name).is_some()
+        })
     }
     pub(super) fn partitioned(&self, table: &Projected) -> bool {
         self.rows
@@ -210,12 +138,7 @@ impl Typed {
                     && table.scope.table == scope.table)
         })
     }
-    pub(super) fn declared_by_name(&self, sql_name: &str) -> Option<&Projected> {
-        self.declarations
-            .iter()
-            .find(|table| table.table.sql_name.eq_ignore_ascii_case(sql_name))
-    }
-    /// The tables a session may name: every local table and the mergeable
+    /// The tables a session may name: every local table and the replayed
     /// tables of `scopes`.
     pub(super) fn plan(&self, scopes: &BTreeSet<ResourceScope>) -> Result<Plan, Error> {
         let schema = self.rows.schema();
@@ -230,22 +153,10 @@ impl Typed {
             }
             None => table.class == TableClass::LocalOnly,
         };
-        // A table with an existence log that a named table references is
-        // nameable too; the statement check shows none of its support rows.
         let tables: Vec<&str> = schema
             .tables
             .iter()
-            .filter(|table| {
-                named(table)
-                    || (table.existence_log
-                        && schema.tables.iter().any(|child| {
-                            named(child)
-                                && child
-                                    .foreign_keys
-                                    .iter()
-                                    .any(|key| key.table.eq_ignore_ascii_case(&table.sql_name))
-                        }))
-            })
+            .filter(|table| named(table))
             .map(|table| table.sql_name.as_str())
             .collect();
         Plan::bound(&[crate::capture::Part {
@@ -280,7 +191,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
             inner.validate_typed(&schema, domain)?;
             let typed = Typed::new(schema.clone(), domain, &readers)?;
             let allowed = inner.readable_names(&typed)?;
-            typed.restrict(&allowed)?;
             transaction!(inner, |inner| {
                 let previous = inner.projection_access().await?;
                 if previous.is_none() && inner.installed_typed().await?.is_some() {
@@ -354,13 +264,8 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 }
                 None => {}
             }
-            for sql in typed.statements().iter().chain(
-                typed
-                    .constraints
-                    .iter()
-                    .flat_map(super::constraints::Constraints::statements),
-            ) {
-                inner.conn.execute(sql.clone(), ()).await?;
+            for sql in typed.statements() {
+                inner.conn.execute(sql, ()).await?;
             }
             inner
                 .conn
@@ -369,32 +274,14 @@ impl<A: RowApplication> EncryptedReplica<A> {
                     bindings(expected),
                 )
                 .await?;
-            for table in &typed.tables {
-                if typed
-                    .constraints
-                    .as_ref()
-                    .and_then(|c| c.node(table.scope))
-                    .is_none()
-                {
-                    reproject(inner, &typed, table).await?;
-                }
-            }
             Ok(false)
         })?;
         if planned {
             drop(inner);
             return self.run_plan().await;
         }
-        verify_constraint_indexes(&inner.conn, &typed).await?;
-        let constrained = typed.constraints.is_some();
         inner.workspace.typed = Some(Arc::new(typed));
         transaction!(inner, |inner| inner.install_history().await)?;
-        if constrained {
-            transaction!(inner, |inner| Box::pin(
-                inner.rebuild_constraints(None, None)
-            )
-            .await)?;
-        }
         inner.start_events();
         Ok(())
     }
@@ -452,7 +339,7 @@ impl<A: RowApplication> Inner<A> {
                 now()?,
             )
             .map_err(credential)?;
-        let mut allowed: BTreeSet<String> = typed
+        Ok(typed
             .tables
             .iter()
             .filter(|table| {
@@ -466,34 +353,13 @@ impl<A: RowApplication> Inner<A> {
                     })
             })
             .map(|table| table.table.sql_name.clone())
-            .collect();
-        loop {
-            let before = allowed.len();
-            for table in &typed.rows.schema().tables {
-                if allowed.contains(&table.sql_name) {
-                    for key in &table.foreign_keys {
-                        if typed
-                            .rows
-                            .schema()
-                            .table(&key.table)
-                            .is_some_and(|parent| parent.existence_log)
-                        {
-                            allowed.insert(key.table.clone());
-                        }
-                    }
-                }
-            }
-            if before == allowed.len() {
-                break;
-            }
-        }
-        Ok(allowed)
+            .collect())
     }
     pub(super) async fn authorized_projection(&self, typed: Typed) -> Result<Typed, Error> {
         match self.projection_access().await? {
             Some(_) => {
                 let allowed = self.readable_names(&typed)?;
-                typed.restrict(&allowed)
+                Ok(typed.restrict(&allowed))
             }
             None => Ok(typed),
         }
@@ -537,386 +403,67 @@ impl<A: RowApplication> Inner<A> {
         let typed = self
             .authorized_projection(Typed::new(schema, decode(domain)?, &decode(readers)?)?)
             .await?;
-        verify_constraint_indexes(&self.conn, &typed).await?;
         self.workspace.typed = Some(Arc::new(typed));
         transaction!(self, |inner| inner.install_history().await)?;
         self.start_events();
         Ok(())
     }
-    /// Follows one stored row into its typed table, inside the caller's
-    /// transaction. An unchanged typed row is not written again, so rows a
-    /// SQL session wrote fire no second trigger. In `strict` mode, during
-    /// a SQL session's commit, a difference fails the commit instead.
-    pub(super) async fn project(
-        &self,
-        scope: ResourceScope,
-        old: Option<&Materialized>,
-        new: &Materialized,
-    ) -> Result<(), Error> {
-        if let Some(shadow) = self.workspace.shadow.clone()
-            && let Some(table) = shadow.by_scope(scope)
-        {
-            self.project_into(&shadow, table, scope, old, new, false)
-                .await?;
-        }
-        let Some(typed) = self.workspace.typed.clone() else {
-            return Ok(());
-        };
-        // Candidates follow every write; `resolve` settles them once the
-        // frame or the SQL commit stored all of its rows.
-        if let Some(node) = typed.constraints.as_ref().and_then(|c| c.node(scope)) {
-            return Box::pin(self.follow(&typed, node, scope, new)).await;
-        }
-        if self.strict_projection {
-            return Ok(());
-        }
-        let Some(table) = typed.by_scope(scope) else {
-            return Ok(());
-        };
-        self.project_into(&typed, table, scope, old, new, self.strict_projection)
-            .await
-    }
-    pub(super) async fn verify_sql_projection(&self, writes: &[RowWrite]) -> Result<(), Error> {
-        if !self.strict_projection {
-            return Ok(());
-        }
-        let typed = self
-            .workspace
-            .typed
-            .clone()
-            .ok_or_else(|| Error::Corrupt("missing SQL projection".into()))?;
-        let written = writes
-            .iter()
-            .map(|write| (write.change.scope, write.change.row))
-            .collect();
-        Box::pin(self.resolve(Some(&written))).await?;
-        let constraints = typed.constraints.as_ref();
-        for write in writes {
-            let change = &write.change;
-            if constraints.and_then(|c| c.node(change.scope)).is_some() {
-                continue;
-            }
-            let table = typed
-                .by_scope(change.scope)
-                .ok_or_else(|| Error::Corrupt("missing SQL table".into()))?;
-            let record = self
-                .row(change.scope, self.storage_row(change)?)
-                .await?
-                .ok_or_else(|| Error::Corrupt("missing SQL incarnation".into()))?;
-            let old = change.before.as_ref().map(|fields| {
-                let mut old = record.clone();
-                old.fields = fields.clone();
-                old.deleted = false;
-                old
-            });
-            self.project_into(&typed, table, change.scope, old.as_ref(), &record, true)
-                .await?;
-        }
-        Ok(())
-    }
-    /// Follows one stored row into one table, typed or shadow.
-    async fn project_into(
-        &self,
-        typed: &Typed,
-        table: &Projected,
-        scope: ResourceScope,
-        old: Option<&Materialized>,
-        new: &Materialized,
-        strict: bool,
-    ) -> Result<(), Error> {
-        let winner = if new.identity.is_some() {
-            self.winner(
-                scope,
-                new.key
-                    .ok_or_else(|| Error::Corrupt("missing incarnation key".into()))?,
-            )
-            .await?
-        } else {
-            Some(new.clone())
-        };
-        let live = |record: &Materialized| (!record.deleted).then(|| record.fields.clone());
-        let corrupt = |reason: String| Error::Corrupt(reason);
-        let current = match winner
-            .as_ref()
-            .and_then(live)
-            .or_else(|| old.and_then(live))
-            .or_else(|| live(new))
-        {
-            Some(fields) => typed.rows.values(&table.table, &fields).map_err(corrupt)?,
-            None => return Ok(()),
-        };
-        let key = |values: &[SqlValue]| -> Vec<SqlValue> {
-            table
-                .table
-                .key
-                .iter()
-                .filter_map(|index| values.get(*index).cloned())
-                .collect()
-        };
-        let stored: Vec<Vec<SqlValue>> =
-            rows_with(&self.conn, &table.select, key(&current)).await?;
-        let wanted = winner.as_ref().and_then(live).map(|_| current.clone());
-        self.index_seal_slot(
-            typed,
-            scope,
-            new.key
-                .ok_or_else(|| Error::Corrupt("missing projection key".into()))?,
-            wanted.as_deref(),
-        )
-        .await?;
-        if stored.first() == wanted.as_ref() || (stored.is_empty() && wanted.is_none()) {
-            return Ok(());
-        }
-        if strict {
-            return Err(Error::Sql(crate::sql::SqlError::Capture(format!(
-                "the projection of {} differs from the transaction's rows",
-                table.table.sql_name
-            ))));
-        }
-        if !typed.shadowed {
-            self.touch(&table.table.sql_name);
-        }
-        match wanted {
-            Some(values) => {
-                self.conn
-                    .execute(table.upsert.clone(), bindings(values))
-                    .await?
-            }
-            None => {
-                self.conn
-                    .execute(table.delete.clone(), bindings(key(&current)))
-                    .await?
-            }
-        };
-        Ok(())
-    }
     /// Empties a scope's typed table, as its rows are evicted.
+    /// Replaces the `SET NULL` triggers with `typed`'s: a rebuilt parent
+    /// drops its own.
+    pub(super) async fn install_delete_triggers(&self, typed: &Typed) -> Result<(), Error> {
+        for record in rows(
+            &self.conn,
+            &format!(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '{}%'",
+                rocky_core::DELETE_TRIGGERS
+            ),
+        )
+        .await?
+        {
+            let [SqlValue::Text(name)] = record.as_slice() else {
+                return Err(Error::Corrupt("delete trigger".into()));
+            };
+            self.conn
+                .execute(format!("DROP TRIGGER IF EXISTS {}", quoted(name)), ())
+                .await?;
+        }
+        for sql in typed
+            .rows
+            .schema()
+            .delete_triggers(|name| typed.installs(name))
+        {
+            self.conn.execute(sql, ()).await?;
+        }
+        Ok(())
+    }
     pub(crate) async fn clear_typed(&self, scope: ResourceScope) -> Result<(), Error> {
-        self.restart_plan(scope).await?;
+        if self.replayed_scope(scope) {
+            return self.reset_replayed(scope).await;
+        }
+        self.require_declared(scope, "eviction")
+    }
+    /// Reindexes a scope's stored rows after a bulk change of
+    /// `secure_row_records`. A replayed table's rows are its only copy.
+    pub(super) async fn reproject(&self, scope: ResourceScope) -> Result<(), Error> {
+        if self.replayed_scope(scope) {
+            return Ok(());
+        }
+        self.index_row_keys().await?;
+        self.reindex_move_scope(scope).await?;
+        self.require_declared(scope, "rebuild")
+    }
+    /// Typed tables are replayed: a stored-row scope of a typed schema is
+    /// one whose table this replica may not read.
+    fn require_declared(&self, scope: ResourceScope, purpose: &str) -> Result<(), Error> {
         if self
             .workspace
             .typed
             .as_ref()
             .is_some_and(|typed| typed.declared_by_scope(scope).is_none())
         {
-            return Err(Error::Corrupt("missing typed scope for eviction".into()));
-        }
-        if let Some(typed) = &self.workspace.typed
-            && typed
-                .constraints
-                .as_ref()
-                .and_then(|c| c.node(scope))
-                .is_some()
-        {
-            // Children elsewhere lose their parents with it.
-            return Box::pin(self.rebuild_constraints(Some(scope), Some(scope))).await;
-        }
-        if let Some(table) = self
-            .workspace
-            .typed
-            .as_ref()
-            .and_then(|typed| typed.by_scope(scope))
-        {
-            self.touch(&table.table.sql_name);
-            let typed = self
-                .workspace
-                .typed
-                .as_ref()
-                .ok_or_else(|| denied("missing typed schema"))?;
-            self.in_bulk(
-                std::slice::from_ref(&table.table.sql_name),
-                reproject(self, typed, table),
-            )
-            .await?;
+            return Err(Error::Corrupt(format!("missing typed scope for {purpose}")));
         }
         Ok(())
     }
-    /// Rebuilds a scope's typed table from its stored rows, after a bulk
-    /// change of `secure_row_records`.
-    pub(super) async fn reproject(&self, scope: ResourceScope) -> Result<(), Error> {
-        self.index_row_keys().await?;
-        self.reindex_move_scope(scope).await?;
-        self.restart_plan(scope).await?;
-        let Some(typed) = self.workspace.typed.clone() else {
-            return Ok(());
-        };
-        if typed
-            .constraints
-            .as_ref()
-            .and_then(|c| c.node(scope))
-            .is_some()
-        {
-            return Box::pin(self.rebuild_constraints(Some(scope), None)).await;
-        }
-        match typed.by_scope(scope) {
-            Some(table) => {
-                self.touch(&table.table.sql_name);
-                self.in_bulk(
-                    std::slice::from_ref(&table.table.sql_name),
-                    reproject(self, &typed, table),
-                )
-                .await
-            }
-            None if typed.declared_by_scope(scope).is_some() => Ok(()),
-            None => Err(Error::Corrupt("missing typed scope for rebuild".into())),
-        }
-    }
-}
-
-async fn rows_with(
-    conn: &crate::scoped_connection::ScopedConnection,
-    sql: &str,
-    params: Vec<SqlValue>,
-) -> Result<Vec<Vec<SqlValue>>, Error> {
-    collect_rows(conn.query(sql.to_string(), bindings(params)).await?).await
-}
-
-/// Replaces a typed table's rows by the live stored rows of its scope, or
-/// of every partition scope of a partitioned table.
-pub(super) async fn reproject<A: RowApplication>(
-    inner: &Inner<A>,
-    typed: &Typed,
-    table: &Projected,
-) -> Result<(), Error> {
-    let conn = &inner.conn;
-    conn.execute(format!("DELETE FROM {}", quoted(&table.table.sql_name)), ())
-        .await?;
-    let records = if typed.partitioned(table) {
-        stored_winners(inner, None, |scope| {
-            typed
-                .by_scope(scope)
-                .is_some_and(|projected| projected.table.id == table.table.id)
-        })
-        .await?
-    } else {
-        winners(inner, table.scope).await?
-    };
-    for record in records {
-        let values = typed
-            .rows
-            .values(&table.table, &record.fields)
-            .map_err(Error::Corrupt)?;
-        let scope = typed.row_scope(table, &values)?;
-        inner
-            .index_seal_slot(
-                typed,
-                scope,
-                record
-                    .key
-                    .ok_or_else(|| Error::Corrupt("missing projection key".into()))?,
-                Some(&values),
-            )
-            .await?;
-        conn.execute(table.upsert.clone(), storage::bindings(values))
-            .await?;
-    }
-    Ok(())
-}
-/// The live incarnation with the latest creation at each key of a scope.
-pub(super) async fn winners<A: RowApplication>(
-    inner: &Inner<A>,
-    scope: ResourceScope,
-) -> Result<Vec<Materialized>, Error> {
-    stored_winners(inner, Some(scope), |_| true).await
-}
-/// The live winners of `scope`, or of every stored scope `keep` accepts.
-async fn stored_winners<A: RowApplication>(
-    inner: &Inner<A>,
-    scope: Option<ResourceScope>,
-    keep: impl Fn(ResourceScope) -> bool,
-) -> Result<Vec<Materialized>, Error> {
-    let conn = &inner.conn;
-    let mut after = (Vec::new(), Vec::new());
-    let mut winners: BTreeMap<(ResourceScope, Commitment), Materialized> = BTreeMap::new();
-    loop {
-        let (sql, params) = match scope {
-            Some(scope) => (
-                "SELECT scope,row,fields FROM secure_row_records WHERE scope=? AND row>? ORDER BY row LIMIT 256",
-                vec![
-                    SqlValue::Blob(encode(&scope)?),
-                    SqlValue::Blob(after.1.clone()),
-                ],
-            ),
-            None => (
-                "SELECT scope,row,fields FROM secure_row_records WHERE (scope,row)>(?,?) ORDER BY scope,row LIMIT 256",
-                vec![
-                    SqlValue::Blob(after.0.clone()),
-                    SqlValue::Blob(after.1.clone()),
-                ],
-            ),
-        };
-        let chunk = collect_rows(conn.query(sql, bindings(params)).await?).await?;
-        for record in &chunk {
-            let [
-                SqlValue::Blob(scope),
-                SqlValue::Blob(row),
-                SqlValue::Blob(bytes),
-            ] = record.as_slice()
-            else {
-                return Err(Error::Corrupt("stored row".into()));
-            };
-            after = (scope.clone(), row.clone());
-            let scope: ResourceScope = decode(scope)?;
-            if !keep(scope) {
-                continue;
-            }
-            let record = inner.decode_record(bytes).await?;
-            if record.deleted {
-                continue;
-            }
-            let key = record.key.map(Ok).unwrap_or_else(|| {
-                row.as_slice()
-                    .try_into()
-                    .map_err(|_| Error::Corrupt("row key".into()))
-            })?;
-            let key = (scope, key);
-            if winners.get(&key).is_none_or(|held| {
-                (record.created.as_ref(), record.identity) > (held.created.as_ref(), held.identity)
-            }) {
-                winners.insert(key, record);
-            }
-        }
-        if chunk.len() < 256 {
-            return Ok(winners.into_values().collect());
-        }
-    }
-}
-
-/// Refuse a missing or changed index before using persisted projections.
-pub(super) async fn verify_constraint_indexes(
-    conn: &crate::scoped_connection::ScopedConnection,
-    typed: &Typed,
-) -> Result<(), Error> {
-    let Some(constraints) = &typed.constraints else {
-        return Ok(());
-    };
-    let catalog = rows(conn, "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL").await?;
-    let expected = typed
-        .rows
-        .schema()
-        .tables
-        .iter()
-        .filter(|table| {
-            table.class == TableClass::LocalOnly || typed.by_name(&table.sql_name).is_some()
-        })
-        .flat_map(|table| table.indexes.iter().map(|index| &index.create_sql))
-        .chain(constraints.statements().filter(|sql| {
-            sql.starts_with("CREATE ")
-                && (sql.contains(" INDEX ") || sql.starts_with("CREATE TABLE "))
-        }));
-    for sql in expected
-        .map(String::as_str)
-        .chain(super::constraints::SCHEMA.iter().copied())
-    {
-        let canonical = sql.replace(" IF NOT EXISTS", "");
-        if !catalog
-            .iter()
-            .any(|row| row == &[SqlValue::Text(canonical.clone())])
-        {
-            return Err(Error::Incompatible(format!(
-                "missing or changed constraint index: {canonical}"
-            )));
-        }
-    }
-    Ok(())
 }

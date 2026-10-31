@@ -2,12 +2,11 @@ package rocky
 
 import kotlinx.serialization.json.*
 
-/** A format-6 definition: every table has implicit `id` and `row_kind` columns and is written with SQL. */
+/** A format-6 definition: every table has an implicit `id` column and is written with SQL. */
 data class Schema(
     val application: String,
     val version: Int = 1,
     val tables: List<Table>,
-    val updatePolicy: UpdatePolicy = UpdatePolicy.Changed,
     val views: Map<String, String> = emptyMap(),
     val migrations: List<Migration> = emptyList(),
     val assertions: List<Assertion> = emptyList(),
@@ -33,7 +32,6 @@ data class Schema(
         put("version", version)
         put("format", 6)
         put("tables", JsonArray(tables.sortedBy { it.name }.map { it.definition() }))
-        put("update_policy", updatePolicy.wire)
         if (views.isNotEmpty()) put("views", viewsJson())
         if (assertions.isNotEmpty()) put("assertions", assertionsJson())
         if (migrations.isNotEmpty()) put("migrations", JsonArray(migrations.map { it.json() }))
@@ -48,7 +46,6 @@ data class Schema(
             put("application", application)
             if (views.isNotEmpty()) put("views", viewsJson())
             if (assertions.isNotEmpty()) put("assertions", assertionsJson())
-            put("update_policy", updatePolicy.wire)
             put("tables", JsonArray(tables.sortedBy { it.name }.map { it.definition() }))
         }.toString()
     }
@@ -114,11 +111,10 @@ data class Table(
     val columns: List<Column>,
     val primaryKey: List<String> = emptyList(),
     val indexes: List<Index> = emptyList(),
-    val tableClass: TableClass = TableClass.Mergeable,
+    val tableClass: TableClass = TableClass.Replayed,
     val foreignKeys: List<ForeignKey> = emptyList(),
     val partitionBy: List<String> = emptyList(),
     internal val roomIdentityIndex: List<String>? = null,
-    val existenceLog: Boolean = false,
     val partitionGroup: String? = null,
     /** The table whose grants this one follows; see [TableBuilder.grantedLike]. */
     val grantedLike: String? = null,
@@ -141,7 +137,6 @@ data class Table(
         if (foreignKeys.isNotEmpty()) put("foreign_keys", JsonArray(foreignKeys.sortedBy { it.columns.joinToString(",") }.map { it.json() }))
         if (partitionBy.isNotEmpty()) put("partition_by", JsonArray(partitionBy.map(::JsonPrimitive)))
         partitionGroup?.let { put("partition_group", it) }
-        if (existenceLog) put("existence_log", true)
     }
 
     /** Rows in primary-key order, the `id` first, as [Row.decode] reads them. */

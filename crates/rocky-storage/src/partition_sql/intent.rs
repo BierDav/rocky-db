@@ -62,7 +62,7 @@ pub enum IntentRefusal {
     RowId,
     /// AUTOINCREMENT in a replayed table's schema.
     Autoincrement,
-    /// A write to a partition column moves its row; moves are routed apart.
+    /// A write to a partition column would move its row between partitions.
     PartitionMove {
         table: String,
         column: String,
@@ -292,7 +292,6 @@ pub fn split_intent_within<E>(
         complete: true,
         held: Vec::new(),
         waiting: Vec::new(),
-        support: false,
     });
     if rule.columns.is_empty() && !rule.complete {
         return Err(IntentRefusal::Unavailable {
@@ -364,7 +363,6 @@ pub fn split_intent_within<E>(
                 complete: rule.columns.is_empty(),
                 held: vec![partition.clone()],
                 waiting: Vec::new(),
-                support: rule.support,
             },
         )]);
         let mut filter = Filter {

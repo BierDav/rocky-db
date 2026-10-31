@@ -301,11 +301,11 @@ async fn a_crash_while_a_seal_redoes_its_late_transactions_reopens_and_converges
     finalization_crash(CrashPoint::Redo).await;
 }
 
-/// A checkpoint holds no replayed rows, so a replayed partition's frames
-/// are never pruned under one: a member joining after compaction replays
-/// them.
+/// Compaction signs a replayed partition's rows at the seal as its base;
+/// with every frame still retained, a member joining after it replays
+/// them instead of installing the base.
 #[tokio::test]
-async fn compaction_prunes_no_replayed_frames_and_a_later_member_replays_them() {
+async fn compaction_signs_a_replayed_base_and_a_later_member_replays_the_frames() {
     let f = Fixture::build_class(false, PrivateKey::new(), "replayed");
     let root = tempfile::tempdir().unwrap();
     let mut owner = Author::open(&f, root.path(), 1).await;
@@ -318,7 +318,7 @@ async fn compaction_prunes_no_replayed_frames_and_a_later_member_replays_them() 
     assert!(report.compacted.is_some());
     assert_eq!(
         owner.replica.prune(f.scope("A")).await.unwrap().blocked,
-        Some(crate::PruneBlock::NoCheckpoint)
+        Some(crate::PruneBlock::NoPolicy)
     );
     let later = Author::open(&f, root.path(), 2).await;
     exchange_graphs(&owner.replica, &later.replica, f.domain).await;

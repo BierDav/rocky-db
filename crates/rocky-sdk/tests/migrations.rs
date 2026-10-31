@@ -15,20 +15,20 @@ use std::{path::Path, sync::Arc};
 /// `tags`, keyed by name, with one row per item. Running it twice would
 /// double each position.
 const POSITIONED: &str = r#"{"application":"shopping","version":2,"format":6,"tables":[
- {"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]},
- {"name":"tags","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"label","type":"text","not_null":true}],"primary_key":["key"]}],
+ {"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]},
+ {"name":"tags","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"label","type":"text","not_null":true}],"primary_key":["key"]}],
  "migrations":[{"version":2,"statements":["UPDATE items SET position = position || title",
   {"insert":"tags","select":"SELECT 'tag-' || key AS key, title AS label FROM items"}]}]}"#;
 /// `POSITIONED` whose migration asks for an id, which no migration may.
 const ASKS_FOR_IDS: &str = r#"{"application":"shopping","version":2,"format":6,"tables":[
- {"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]},
- {"name":"tags","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"label","type":"text","not_null":true}],"primary_key":["key"]}],
+ {"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]},
+ {"name":"tags","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"label","type":"text","not_null":true}],"primary_key":["key"]}],
  "migrations":[{"version":2,"statements":["UPDATE items SET position = rocky_next_id('items')"]}]}"#;
 /// The fixed release after `ASKS_FOR_IDS`: the same tables, the version 2
 /// migration of `POSITIONED`.
 const FIXED: &str = r#"{"application":"shopping","version":3,"format":6,"tables":[
- {"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]},
- {"name":"tags","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"label","type":"text","not_null":true}],"primary_key":["key"]}],
+ {"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]},
+ {"name":"tags","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"label","type":"text","not_null":true}],"primary_key":["key"]}],
  "migrations":[{"version":2,"statements":["UPDATE items SET position = position || title",
   {"insert":"tags","select":"SELECT 'tag-' || key AS key, title AS label FROM items"}]}]}"#;
 
@@ -73,8 +73,8 @@ const TAGS: &str = "SELECT key, label FROM tags ORDER BY key";
 /// `POSITIONED` whose migration inserts one tag key twice: it fails while
 /// it runs, after the seal and opening were signed and staged.
 const DUPLICATES: &str = r#"{"application":"shopping","version":2,"format":6,"tables":[
- {"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]},
- {"name":"tags","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"label","type":"text","not_null":true}],"primary_key":["key"]}],
+ {"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]},
+ {"name":"tags","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"label","type":"text","not_null":true}],"primary_key":["key"]}],
  "migrations":[{"version":2,"statements":["UPDATE items SET position = position || title",
   {"insert":"tags","select":"SELECT 'same' AS key, title AS label FROM items"}]}]}"#;
 
@@ -213,11 +213,11 @@ async fn issuers_that_cannot_reach_each_other_both_migrate_and_converge() -> Res
 }
 
 const LISTS: &str = r#"{"format":6,"application":"lists","version":1,"tables":[
- {"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],
+ {"name":"lists","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],
   "primary_key":["id"],"partition_by":["id"],"partition_group":"list"}]}"#;
 /// Requires `position` of every list, which a migration fills.
 const POSITIONED_LISTS: &str = r#"{"format":6,"application":"lists","version":2,"tables":[
- {"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true},{"name":"position","type":"text","not_null":true,"default":""}],
+ {"name":"lists","class":"replayed","columns":[{"name":"title","type":"text","not_null":true},{"name":"position","type":"text","not_null":true,"default":""}],
   "primary_key":["id"],"partition_by":["id"],"partition_group":"list"}],
  "migrations":[{"version":2,"statements":["UPDATE lists SET position = title"]}]}"#;
 
@@ -273,7 +273,7 @@ async fn an_issuer_without_a_partitions_key_keeps_the_households_generation() ->
         json!({"state": "full_access_required"})
     );
     let query = a
-        .call(json!({"type": "read", "query": {"sql": "SELECT position FROM lists WHERE row_kind = 0", "values": [], "max_rows": 8}}))
+        .call(json!({"type": "read", "query": {"sql": "SELECT position FROM lists", "values": [], "max_rows": 8}}))
         .await
         .err()
         .ok_or("a query on the new field answered")?;
@@ -293,7 +293,7 @@ async fn an_issuer_without_a_partitions_key_keeps_the_households_generation() ->
     assert_eq!(
         rows(
             &a,
-            "SELECT title, position FROM lists WHERE row_kind = 0 ORDER BY title"
+            "SELECT title, position FROM lists ORDER BY title"
         )
         .await,
         json!([
@@ -313,7 +313,7 @@ async fn an_issuer_without_a_partitions_key_keeps_the_households_generation() ->
     assert_eq!(
         rows(
             &b,
-            "SELECT title, position FROM lists WHERE row_kind = 0 ORDER BY title"
+            "SELECT title, position FROM lists ORDER BY title"
         )
         .await,
         json!([
@@ -328,15 +328,15 @@ async fn an_issuer_without_a_partitions_key_keeps_the_households_generation() ->
 
 /// Adds a nullable note and seeds `LARGE` items with a migration.
 const SEEDED: &str = r#"{"application":"shopping","version":2,"format":6,"tables":[
- {"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"note","type":"text"},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}],
+ {"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"note","type":"text"},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}],
  "migrations":[{"version":2,"statements":[{"insert":"items","select":"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000) SELECT printf('k%06d', i) AS key, 0 AS completed, printf('item %06d', i) AS title FROM n"}]}]}"#;
 /// `SEEDED` with a nullable tag: an additive switch in place.
 const TAGGED: &str = r#"{"application":"shopping","version":3,"format":6,"tables":[
- {"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"note","type":"text"},{"name":"tag","type":"text"},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}],
+ {"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"note","type":"text"},{"name":"tag","type":"text"},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}],
  "migrations":[{"version":2,"statements":[{"insert":"items","select":"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000) SELECT printf('k%06d', i) AS key, 0 AS completed, printf('item %06d', i) AS title FROM n"}]}]}"#;
 /// Requires `position` of every item, filled from its title.
 const FILLED: &str = r#"{"application":"shopping","version":4,"format":6,"tables":[
- {"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"note","type":"text"},{"name":"position","type":"text","not_null":true,"default":""},{"name":"tag","type":"text"},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}],
+ {"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"completed","type":"integer","not_null":true},{"name":"note","type":"text"},{"name":"position","type":"text","not_null":true,"default":""},{"name":"tag","type":"text"},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}],
  "migrations":[{"version":2,"statements":[{"insert":"items","select":"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000) SELECT printf('k%06d', i) AS key, 0 AS completed, printf('item %06d', i) AS title FROM n"}]},
   {"version":4,"statements":["UPDATE items SET position = title"]}]}"#;
 const FILLED_COUNT: &str =
@@ -719,7 +719,7 @@ async fn a_member_writes_its_shared_partition_after_following_a_migration() -> R
     b.ok(json!({"type": "sql", "sql": "COMMIT"})).await;
     sync(&b).await;
     assert_eq!(
-        rows(&a, "SELECT title, position FROM lists WHERE row_kind = 0").await,
+        rows(&a, "SELECT title, position FROM lists").await,
         json!([[text("Monthly"), text("Weekly")]])
     );
     b.close().await;

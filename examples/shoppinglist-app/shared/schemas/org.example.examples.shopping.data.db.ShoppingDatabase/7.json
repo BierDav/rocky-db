@@ -6,7 +6,7 @@
     "entities": [
       {
         "tableName": "lists",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `title` TEXT NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `title` TEXT NOT NULL, PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -19,12 +19,6 @@
             "columnName": "title",
             "affinity": "TEXT",
             "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
-            "affinity": "INTEGER",
-            "notNull": true
           }
         ],
         "primaryKey": {
@@ -36,7 +30,7 @@
       },
       {
         "tableName": "categories",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `id` INTEGER NOT NULL, `name` TEXT NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`list`, `id`), FOREIGN KEY(`list`) REFERENCES `lists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `id` INTEGER NOT NULL, `name` TEXT NOT NULL, PRIMARY KEY(`list`, `id`), FOREIGN KEY(`list`) REFERENCES `lists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
         "fields": [
           {
             "fieldPath": "list",
@@ -54,12 +48,6 @@
             "fieldPath": "name",
             "columnName": "name",
             "affinity": "TEXT",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
-            "affinity": "INTEGER",
             "notNull": true
           }
         ],
@@ -86,7 +74,7 @@
       },
       {
         "tableName": "items",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `key` TEXT NOT NULL, `title` TEXT NOT NULL, `completed` INTEGER NOT NULL, `category` INTEGER, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, `position` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`list`, `key`), FOREIGN KEY(`list`) REFERENCES `lists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY(`list`, `category`) REFERENCES `categories`(`list`, `id`) ON UPDATE NO ACTION ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `key` TEXT NOT NULL, `title` TEXT NOT NULL, `completed` INTEGER NOT NULL, `category` INTEGER, `id` INTEGER NOT NULL, `position` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`list`, `key`), FOREIGN KEY(`list`) REFERENCES `lists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY(`list`, `category`) REFERENCES `categories`(`list`, `id`) ON UPDATE NO ACTION ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED)",
         "fields": [
           {
             "fieldPath": "list",
@@ -120,12 +108,6 @@
           {
             "fieldPath": "id",
             "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
             "affinity": "INTEGER",
             "notNull": true
           },
@@ -215,7 +197,7 @@
       },
       {
         "tableName": "item_categories",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `item` INTEGER NOT NULL, `category` INTEGER NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`list`, `item`, `category`), FOREIGN KEY(`list`, `item`) REFERENCES `items`(`list`, `id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY(`list`, `category`) REFERENCES `categories`(`list`, `id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `item` INTEGER NOT NULL, `category` INTEGER NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`list`, `item`, `category`), FOREIGN KEY(`list`, `item`) REFERENCES `items`(`list`, `id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY(`list`, `category`) REFERENCES `categories`(`list`, `id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
         "fields": [
           {
             "fieldPath": "list",
@@ -238,12 +220,6 @@
           {
             "fieldPath": "id",
             "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
             "affinity": "INTEGER",
             "notNull": true
           }
@@ -309,7 +285,7 @@
       },
       {
         "tableName": "requests",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `title` TEXT NOT NULL, `note` TEXT NOT NULL, `requester` TEXT NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`key`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `title` TEXT NOT NULL, `note` TEXT NOT NULL, `requester` TEXT NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`key`))",
         "fields": [
           {
             "fieldPath": "key",
@@ -340,12 +316,6 @@
             "columnName": "id",
             "affinity": "INTEGER",
             "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
-            "affinity": "INTEGER",
-            "notNull": true
           }
         ],
         "primaryKey": {
@@ -368,7 +338,7 @@
       },
       {
         "tableName": "decisions",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `approved` INTEGER NOT NULL, `decider` TEXT NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`key`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `approved` INTEGER NOT NULL, `decider` TEXT NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`key`))",
         "fields": [
           {
             "fieldPath": "key",
@@ -391,12 +361,6 @@
           {
             "fieldPath": "id",
             "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
             "affinity": "INTEGER",
             "notNull": true
           }

@@ -32,7 +32,6 @@ const STATE_TABLES: &[&str] = &[
     "secure_seal_anchors",
     "secure_seal_bounds",
     "secure_checkpoints",
-    "secure_existence_base",
     "secure_subscriptions",
     "secure_roles",
     "secure_evicted_logs",
@@ -239,8 +238,7 @@ impl<A: RowApplication> Inner<A> {
                         FrameReplay::Local => ClearsBy::LocalWork,
                         // Only a listed checkpoint replaces released existence
                         // records; a trusted peer holding one lists it first.
-                        FrameReplay::Unavailable if need.listed.is_empty() => ClearsBy::NoPeer,
-                        FrameReplay::Peers | FrameReplay::Unavailable => ClearsBy::AnyPeer,
+                        FrameReplay::Peers => ClearsBy::AnyPeer,
                     },
                 ),
             );

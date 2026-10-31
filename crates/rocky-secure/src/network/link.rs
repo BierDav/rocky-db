@@ -3,7 +3,7 @@ use super::*;
 use tokio::io::{ReadHalf, WriteHalf};
 
 /// The handshake's version; its signing label carries it, so another is refused.
-pub(super) const HANDSHAKE_VERSION: u32 = 18;
+pub(super) const HANDSHAKE_VERSION: u32 = 19;
 pub const CHANNELS: u16 = 6;
 pub mod channels;
 mod lanes;
@@ -460,7 +460,6 @@ pub async fn scope_token<A: RowApplication>(
             .into_iter()
             .map(|log| (log.author, log.held))
             .collect();
-        let existence: Vec<_> = inner.existence_frontier(scope).await?.into_iter().collect();
         let mut metadata = Vec::new();
         if let Some(graph) = inner.graphs.get(&scope.domain) {
             for seal in &graph.seals {
@@ -481,9 +480,6 @@ pub async fn scope_token<A: RowApplication>(
             for checkpoint in &graph.checkpoints {
                 metadata.push(checkpoint.id().map_err(credential)?);
             }
-            for carry in &graph.carries {
-                metadata.push(carry.id().map_err(credential)?);
-            }
         }
         for (_, batch) in inner.pending_tips(None).await? {
             for statement in batch.iter().filter(|s| s.scope() == scope.domain) {
@@ -492,7 +488,7 @@ pub async fn scope_token<A: RowApplication>(
         }
         metadata.sort_unstable();
         metadata.dedup();
-        let bytes = encode(&(logs, existence, metadata))?;
+        let bytes = encode(&(logs, metadata))?;
         (bytes, inner.flusher.clone(), inner.commit)
     };
     flusher.flush(commit)?;
@@ -819,7 +815,7 @@ mod tests {
         assert_eq!(rocky_core::net::Protocol::named(b"rocky/link/2"), None);
         assert_eq!(rocky_core::net::Protocol::named(b"rocky/link/3"), None);
         assert_eq!(rocky_core::net::Protocol::named(b"rocky/link/4"), None);
-        assert_eq!(session_label(HANDSHAKE_VERSION), "rocky.link.v18");
+        assert_eq!(session_label(HANDSHAKE_VERSION), "rocky.link.v19");
     }
 }
 

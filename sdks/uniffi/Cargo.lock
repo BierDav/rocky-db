@@ -3398,8 +3398,6 @@ dependencies = [
  "rocky-storage",
  "serde",
  "serde_bytes",
- "serde_json",
- "sqlparser",
  "tokio",
  "tracing",
 ]

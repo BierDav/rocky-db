@@ -7,12 +7,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 pub const SCHEMA: &str = r#"{"format":6,"application":"chaos","version":1,"tables":[
- {"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],
+ {"name":"lists","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],
   "primary_key":["id"],"partition_by":["id"],"partition_group":"list"},
- {"name":"items","class":"mergeable","columns":[{"name":"list","type":"integer","not_null":true},{"name":"title","type":"text","not_null":true},{"name":"done","type":"integer","not_null":true}],
+ {"name":"items","class":"replayed","columns":[{"name":"list","type":"integer","not_null":true},{"name":"title","type":"text","not_null":true},{"name":"done","type":"integer","not_null":true}],
   "primary_key":["list","id"],"partition_by":["list"],"partition_group":"list",
   "foreign_keys":[{"columns":["list"],"table":"lists","on_delete":"cascade"}]},
- {"name":"notes","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"body","type":"text","not_null":true}],"primary_key":["key"]}
+ {"name":"notes","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"body","type":"text","not_null":true}],"primary_key":["key"]}
 ]}"#;
 
 pub fn options(dir: &str, port: u16, mode: Value) -> Value {

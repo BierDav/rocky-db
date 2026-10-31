@@ -18,7 +18,7 @@ use tokio::{
 
 mod common;
 
-const SCHEMA: &str = r#"{"application":"counters","version":1,"format":6,"tables":[{"name":"counters","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"amount","type":"integer","not_null":true}],"primary_key":["key"]},{"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"amount","type":"integer","not_null":true}],"primary_key":["key"]}]}"#;
+const SCHEMA: &str = r#"{"application":"counters","version":1,"format":6,"tables":[{"name":"counters","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"amount","type":"integer","not_null":true}],"primary_key":["key"]},{"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"amount","type":"integer","not_null":true}],"primary_key":["key"]}]}"#;
 const TABLES: [&str; 2] = ["counters", "items"];
 const WARM_UP: usize = 50;
 const SAMPLES: usize = 600;

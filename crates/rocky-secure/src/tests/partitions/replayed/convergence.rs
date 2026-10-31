@@ -202,7 +202,7 @@ fn canonical_sealed(f: &Fixture, eras: &[&[EncryptedFrame]], sealed: usize) -> C
     }
     let db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch(
-        "CREATE TABLE items(list TEXT NOT NULL,key TEXT NOT NULL,amount INTEGER NOT NULL,id INTEGER NOT NULL,row_kind INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(list,key));
+        "CREATE TABLE items(list TEXT NOT NULL,key TEXT NOT NULL,amount INTEGER NOT NULL,id INTEGER NOT NULL,PRIMARY KEY(list,key));
          CREATE UNIQUE INDEX items_identity ON items(list,id);",
     )
     .unwrap();

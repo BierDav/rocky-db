@@ -454,8 +454,8 @@ impl Database {
         Ok(NetworkService::new(&self.shared, id))
     }
     /// Makes this device a trusted node of its domain's coordinated logs,
-    /// so it may make and store coordinated writes through the log of the
-    /// tip it follows; `None` ends that. The log is the application's and
+    /// which it ends with seals and whose terminal entries it acknowledges;
+    /// `None` ends that. The log is the application's and
     /// is never closed by Rocky. A database composed with a coordination
     /// service uses that service's log.
     pub async fn coordinate(
@@ -779,10 +779,8 @@ impl Session {
     pub async fn seal(&self, close: bool) -> Result<crate::TipStatus, Failure> {
         self.tips(json!({"action":"seal","close":close})).await
     }
-    /// The owner recovers the followed tip when no in-sync node of its
-    /// coordinated log can append: one `continue` seal that abandons the
-    /// committed entries no reachable device holds. See
-    /// `docs/runtime/stuck-recovery.md`.
+    /// The owner recovers the followed tip when no ordinary seal can end its
+    /// coordinated log: one `continue` seal replacing the log's exact head.
     pub async fn recover(&self) -> Result<crate::TipStatus, Failure> {
         self.tips(json!({"action":"recover"})).await
     }
@@ -1849,7 +1847,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let schema = crate::Schema::builder("reactor_timing", 1)
             .table(
-                crate::Table::mergeable("items")
+                crate::Table::replayed("items")
                     .column(crate::Column::new("title", crate::Affinity::Text)),
             )
             .build()?;
@@ -1953,7 +1951,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn old_database_is_refused_before_enrollment_or_database_writes() -> Result<(), Failure> {
-        const SCHEMA: &str = r#"{"format":6,"application":"refusal","version":1,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"]}]}"#;
+        const SCHEMA: &str = r#"{"format":6,"application":"refusal","version":1,"tables":[{"name":"items","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"]}]}"#;
         for format in [0, 1, 2, 3, 5] {
             let directory = tempfile::tempdir()?;
             let path = directory.path().join("rocky.sqlite");
@@ -2009,7 +2007,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn populated_numeric_consumer_continues_node_author_after_reopen() -> Result<(), Failure>
     {
-        const SCHEMA: &str = r#"{"format":6,"application":"reopen_numeric","version":1,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"]}]}"#;
+        const SCHEMA: &str = r#"{"format":6,"application":"reopen_numeric","version":1,"tables":[{"name":"items","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"]}]}"#;
         async fn call(
             database: &Database,
             session: &Session,
@@ -2055,11 +2053,10 @@ mod tests {
         let rows = call(
             &database,
             &session,
-            json!({"type":"read","query":{"sql":"SELECT id,row_kind FROM items","max_rows":8}}),
+            json!({"type":"read","query":{"sql":"SELECT id FROM items","max_rows":8}}),
         )
         .await?;
         assert_eq!(rows["rows"][0][0]["value"], first);
-        assert_eq!(rows["rows"][0][1]["value"], "0");
         call(&database, &session, json!({"type":"sql","sql":"BEGIN"})).await?;
         let second = call(
             &database,
@@ -2093,7 +2090,7 @@ mod tests {
             Open {
                 identity: None,
                 directory: directory.path(),
-                schema: r#"{"application":"saturation","version":1,"format":6,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}]}"#,
+                schema: r#"{"application":"saturation","version":1,"format":6,"tables":[{"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}]}"#,
                 secrets: None,
                 network: None,
                 coordination: None,

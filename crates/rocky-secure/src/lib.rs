@@ -7,8 +7,6 @@ use rocky_storage::{
 };
 pub mod network;
 mod replica;
-#[cfg(any(test, feature = "intent-shapes"))]
-pub mod shapes;
 mod store;
 mod wire;
 #[cfg(feature = "qualification")]
@@ -17,25 +15,21 @@ pub use replica::CHUNK_PAGES;
 pub use replica::CrashPoint;
 pub use replica::{
     AuditReport, Buffered, CheckpointPage, CheckpointState, CheckpointStatement, CheckpointStatus,
-    CiphertextPage, CommittedEntry, CompactReport, CompactionStatus, Companion, CoordinatedCommit,
-    CoordinatedEntry, CoordinatedError, CoordinatedStatus, CoveredMark, CurrentValue,
-    CustodySummary, Describe, ENTRY_DEADLINE, EXISTENCE_FORMAT, EarlierEpochWrites,
-    EncryptedReplica, EntryPeers, EvictReport, ExistenceBaseAttachment, ExistenceBasePage,
-    ExistenceBasis, ExistenceEvent, ExistencePage, ExistenceRecord, FrameReplay, FrontierLog,
-    GenerationStatus, HeldChange, HeldField, HeldKind, HeldRow, HeldSeal, Holding,
+    CiphertextPage, CompactReport, CompactionStatus, Companion, CoveredMark, CurrentValue,
+    CustodySummary, Describe, EarlierEpochWrites, EncryptedReplica, EvictReport, FrameReplay,
+    FrontierLog, GenerationStatus, HeldChange, HeldField, HeldKind, HeldRow, HeldSeal, Holding,
     InstalledTipSchema, KeptSeals, KeyMaterial, LineNode, LogPosition, MAX_BUNDLE_BYTES,
-    MAX_BUNDLE_FRAMES, MAX_BUNDLE_ROWS, MAX_CATCH_UP_ENTRIES, MAX_CHECKPOINT_LOGS,
-    MAX_EXISTENCE_PAGE, MAX_PLACEMENTS, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_ROWS,
-    MAX_UNCONFIGURED_PEERS, MigrationMembership, MigrationStorage, OutcomeDivergence, PLAN_ROWS,
-    PUBLICATION_CHUNK_BUNDLES, PeerFuture, PeerLag, PeerScopeFrontier, PendingSchema, Placement,
-    PlacementPage, PlacementRequest, ProjectionPlan, PruneBlock, PruneReport, PrunedPage,
-    Publication, ROWS_PER_FRAME, RangePage, RebootstrapReport, ReceiveStatus, Refusal, RemotePage,
-    ReplicaRole, ReplicaStatus, RetentionLimits, RetentionPolicy, RoleConfig, SchemaConfig,
-    SchemaStage, ScopeFrontier, ScopeStatus, SealRebootstrap, SealViews, SecureCommit,
-    SecureConfig, SecurePage, SecureRows, SecureSession, SecureSnapshot, SecureSql,
-    SecureTransaction, SessionStatus, SetSummary, SignedCheckpoint, SignedVoid, Slot,
-    StagedCloseStatus, StateAdvice, TipDevice, TipNodeObservation, TipObservation, TipStatement,
-    UpdateMode, entry_hash, installed_tip_schema,
+    MAX_BUNDLE_FRAMES, MAX_BUNDLE_ROWS, MAX_CHECKPOINT_LOGS, MAX_PLACEMENTS, MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_ROWS, MAX_UNCONFIGURED_PEERS, MigrationMembership, MigrationStorage,
+    OutcomeDivergence, PUBLICATION_CHUNK_BUNDLES, PeerLag, PeerScopeFrontier, PendingSchema,
+    Placement, PlacementPage, PlacementRequest, ProjectionPlan, PruneBlock, PruneReport,
+    PrunedPage, Publication, ROWS_PER_FRAME, RangePage, RebootstrapReport, ReceiveStatus, Refusal,
+    RemotePage, ReplicaRole, ReplicaStatus, RetentionLimits, RetentionPolicy, RoleConfig,
+    SchemaConfig, SchemaStage, ScopeFrontier, ScopeStatus, SealRebootstrap, SealViews,
+    SecureCommit, SecureConfig, SecurePage, SecureRows, SecureSession, SecureSnapshot, SecureSql,
+    SecureTransaction, SessionStatus, SetSummary, SignedCheckpoint, SignedVoid, StagedCloseStatus,
+    StateAdvice, TipDevice, TipNodeObservation, TipObservation, TipStatement, UpdateMode,
+    installed_tip_schema,
 };
 pub use rocky_core::{Blocker, BlockerKind, ClearsBy, WaitReason, domain_label, scope_label};
 /// The credential types live in `rocky-credentials`; these are the same types.
@@ -75,7 +69,7 @@ fn page_len<T: Serialize>(items: &[T], limit: usize) -> Result<usize, Error> {
     }
     Ok(count)
 }
-/// Retained protocol artifacts, such as stored coordinated entries. Row
+/// Retained protocol artifacts, such as journaled tip statements. Row
 /// operations are bounded by `RetentionLimits` instead.
 pub const MAX_SECURE_RECORDS: usize = 4096;
 /// One native session, and the default soft bound on retained row operations.
@@ -148,9 +142,6 @@ thread_local! {
     /// Transactions that apply operations this test thread may still commit
     /// before the pending pass is interrupted. Discovery does not spend it.
     static APPLY_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    static BINDING_TRACE: std::cell::RefCell<Option<Vec<(usize, usize, usize)>>> = const { std::cell::RefCell::new(None) };
-    static AUTHOR_PAYLOAD_TRACE: std::cell::RefCell<Option<Vec<(EncryptedFrame, usize)>>> = const { std::cell::RefCell::new(None) };
-    static AUTHOR_PAYLOAD_FRAME: std::cell::Cell<Option<Hash>> = const { std::cell::Cell::new(None) };
 }
 /// Spends one apply transaction of the thread's budget; false once it ran out.
 #[cfg(test)]

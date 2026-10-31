@@ -894,28 +894,6 @@ fn selected_row_replay_does_not_materialize_the_remaining_history() {
     );
 }
 
-#[test]
-fn seal_drop_pages_do_not_materialize_the_remaining_candidates() {
-    let db = rusqlite::Connection::open_in_memory().unwrap();
-    db.execute_batch("CREATE TABLE secure_scope_state(id INTEGER PRIMARY KEY,scope BLOB UNIQUE);
-        INSERT INTO secure_scope_state VALUES(1,X'01');
-        CREATE TABLE secure_rows(scope INTEGER,row INTEGER,fields BLOB,live INTEGER,shape INTEGER,PRIMARY KEY(scope,row)) WITHOUT ROWID;
-        CREATE TABLE secure_seal_candidates(scope INTEGER,row INTEGER,PRIMARY KEY(scope,row)) WITHOUT ROWID;
-        CREATE TABLE secure_scope_shapes(scope INTEGER,shape INTEGER,PRIMARY KEY(scope,shape)) WITHOUT ROWID;
-        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<128)
-        INSERT INTO secure_rows SELECT 1,i,X'01',i<>4,CASE WHEN i=8 THEN 2 ELSE 1 END FROM n;
-        INSERT INTO secure_seal_candidates SELECT scope,row FROM secure_rows WHERE row NOT IN(4,8);
-        INSERT INTO secure_scope_shapes VALUES(1,1),(1,2);").unwrap();
-    let sql = crate::replica::checkpoint::seal_drop_rows("s.shape=2");
-    let mut query = db.prepare(&sql).unwrap();
-    let result: Vec<i64> = query
-        .query_map(rusqlite::params![vec![1u8], 0, 8, 1], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(result, (1..=8).collect::<Vec<_>>());
-}
-
 #[tokio::test]
 async fn the_writer_bounds_both_main_and_temporary_page_caches() {
     let f = Fixture::new();

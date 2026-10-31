@@ -26,7 +26,10 @@ sealed interface Coordinated {
     data class Failed(val message: String) : Coordinated
 }
 
-/** Ordinary request rows and coordinated decisions; the first committed decision stands. */
+/**
+ * Ordinary request and decision rows. Rocky orders no writes through the coordination service, so concurrent decisions
+ * on different devices are not excluded; this device decides only a request it holds undecided.
+ */
 class Approvals internal constructor(
     private val database: ShoppingDatabase,
     private val rocky: RockyDatabase,
@@ -65,22 +68,16 @@ class Approvals internal constructor(
         return null
     }
 
-    private class Unchanged(val reason: String) : Exception(reason)
-
-    /** Decides once at the committed log head; a competing writer retries after catching up. */
+    /** Decides a request this device holds undecided, as an ordinary write. */
     suspend fun decide(key: String, approve: Boolean): String? {
         check(coordinated && rocky.isIssuer) { "Only a trusted device with coordination may decide" }
-        return try {
-            rocky.coordinatedRetrying {
-                if (query("SELECT key FROM requests WHERE key=?", key).isEmpty()) throw Unchanged("The request has not reached this device yet")
-                val previous = query("SELECT approved FROM decisions WHERE key=?", key).singleOrNull()
-                if (previous != null) throw Unchanged(if (previous.boolean(0)) "Another device already approved it" else "Another device already declined it")
-                execute("INSERT INTO decisions(key,approved,decider,id) VALUES(?,?,?,?)", key, approve, self, nextId("decisions"))
-            }
-            null
-        } catch (unchanged: Unchanged) {
-            unchanged.reason
+        if (database.approvals().requests().first().none { it.key == key }) return "The request has not reached this device yet"
+        val previous = database.approvals().decisions().first().firstOrNull { it.key == key }
+        if (previous != null) return if (previous.approved) "Another device already approved it" else "Another device already declined it"
+        rocky.write {
+            execute("INSERT INTO decisions(key,approved,decider,id) VALUES(?,?,?,?)", key, approve, self, nextId("decisions"))
         }
+        return null
     }
 
     /** Keeps the domain's trusted-node control registered until cancelled. */

@@ -8,15 +8,15 @@ mod support;
 use support::secrets;
 
 const SCHEMA: &str = r#"{"format":6,"application":"lists","version":1,"tables":[
- {"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],
+ {"name":"lists","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],
   "primary_key":["id"],"partition_by":["id"],"partition_group":"list"},
- {"name":"categories","class":"mergeable","columns":[{"name":"list","type":"integer","not_null":true},{"name":"name","type":"text","not_null":true}],
+ {"name":"categories","class":"replayed","columns":[{"name":"list","type":"integer","not_null":true},{"name":"name","type":"text","not_null":true}],
   "primary_key":["list","id"],"partition_by":["list"],"partition_group":"list",
   "foreign_keys":[{"columns":["list"],"table":"lists","on_delete":"cascade"}]},
- {"name":"items","class":"mergeable","columns":[
+ {"name":"items","class":"replayed","columns":[
    {"name":"list","type":"integer","not_null":true},{"name":"title","type":"text","not_null":true},{"name":"category","type":"integer"}],
   "primary_key":["list","id"],"partition_by":["list"],"partition_group":"list",
-  "indexes":[{"name":"index_items_list_title","unique":true,"columns":[{"name":"list","descending":false},{"name":"title","descending":false}],"on_conflict":"latest_wins"}],
+  "indexes":[{"name":"index_items_list_title","unique":true,"columns":[{"name":"list","descending":false},{"name":"title","descending":false}]}],
   "foreign_keys":[{"columns":["list"],"table":"lists","on_delete":"cascade"},
    {"columns":["list","category"],"table":"categories","on_delete":"set_null"}]}
 ]}"#;
@@ -24,19 +24,19 @@ const TABLES: [&str; 3] = ["lists", "categories", "items"];
 /// Version 2: ordered items in any number of categories, migrated from one
 /// category per item, as the shopping example's version 7.
 const ORDERED: &str = r#"{"format":6,"application":"lists","version":2,"tables":[
- {"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],
+ {"name":"lists","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],
   "primary_key":["id"],"partition_by":["id"],"partition_group":"list"},
- {"name":"categories","class":"mergeable","columns":[{"name":"list","type":"integer","not_null":true},{"name":"name","type":"text","not_null":true}],
+ {"name":"categories","class":"replayed","columns":[{"name":"list","type":"integer","not_null":true},{"name":"name","type":"text","not_null":true}],
   "primary_key":["list","id"],"partition_by":["list"],"partition_group":"list",
   "foreign_keys":[{"columns":["list"],"table":"lists","on_delete":"cascade"}]},
- {"name":"items","class":"mergeable","columns":[
+ {"name":"items","class":"replayed","columns":[
    {"name":"list","type":"integer","not_null":true},{"name":"title","type":"text","not_null":true},{"name":"category","type":"integer"},
    {"name":"position","type":"text","not_null":true,"default":""}],
   "primary_key":["list","id"],"partition_by":["list"],"partition_group":"list",
-  "indexes":[{"name":"index_items_list_title","unique":true,"columns":[{"name":"list","descending":false},{"name":"title","descending":false}],"on_conflict":"latest_wins"}],
+  "indexes":[{"name":"index_items_list_title","unique":true,"columns":[{"name":"list","descending":false},{"name":"title","descending":false}]}],
   "foreign_keys":[{"columns":["list"],"table":"lists","on_delete":"cascade"},
    {"columns":["list","category"],"table":"categories","on_delete":"set_null"}]},
- {"name":"item_categories","granted_like":"items","class":"mergeable","columns":[
+ {"name":"item_categories","granted_like":"items","class":"replayed","columns":[
    {"name":"list","type":"integer","not_null":true},{"name":"item","type":"integer","not_null":true},{"name":"category","type":"integer","not_null":true}],
   "primary_key":["list","item","category"],"partition_by":["list"],"partition_group":"list",
   "foreign_keys":[{"columns":["list","item"],"table":"items","on_delete":"cascade"},
@@ -159,7 +159,7 @@ async fn checkpoint_writer(
     writer.call(json!({"type":"sync"})).await?;
     assert_eq!(
         writer
-            .column("SELECT title FROM lists WHERE row_kind=0")
+            .column("SELECT title FROM lists")
             .await?,
         [json!("Base list")]
     );
@@ -334,7 +334,7 @@ async fn an_insert_author_creates_only_its_own_partition_and_shares_its_key() ->
     issuer.call(json!({"type":"sync"})).await?;
     assert_eq!(
         issuer
-            .column("SELECT title FROM lists WHERE row_kind=0 ORDER BY title")
+            .column("SELECT title FROM lists ORDER BY title")
             .await?,
         [json!("Base list"), json!("Member list")]
     );

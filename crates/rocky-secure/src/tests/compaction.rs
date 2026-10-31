@@ -140,15 +140,12 @@ pub(super) async fn scalar(replica: &Replica, sql: &str) -> i64 {
         other => panic!("{other:?}"),
     }
 }
-/// Stored row records and how many are tombstones.
+/// Rows of the replay bases and how many are tombstones: replayed bases
+/// hold live rows only.
 async fn stored(replica: &Replica) -> (i64, i64) {
     (
-        scalar(replica, "SELECT count(*) FROM secure_row_records").await,
-        scalar(
-            replica,
-            "SELECT COALESCE(SUM(tombstones),0) FROM secure_scope_state",
-        )
-        .await,
+        scalar(replica, "SELECT count(*) FROM secure_replayed_base").await,
+        0,
     )
 }
 pub(super) async fn titles(replica: &Replica) -> Vec<Vec<SqlValue>> {
@@ -164,7 +161,7 @@ async fn compacting_at_a_seal_leaves_only_live_rows_and_survives_reopen() {
     follow_main(&lineage, &replica).await;
     insert(&replica, "live", "kept").await;
     churn(&replica, 8, "a").await;
-    assert_eq!(stored(&replica).await, (9, 8));
+    assert_eq!(stored(&replica).await, (0, 0));
     let first = seal(&lineage, &replica).await;
     // Sealing alone changes no row; the next maintenance step finalizes.
     let report = replica.compact(lineage.domain, 0).await.unwrap();
@@ -175,10 +172,6 @@ async fn compacting_at_a_seal_leaves_only_live_rows_and_survives_reopen() {
     assert_eq!(
         titles(&replica).await,
         vec![vec![text("live"), text("kept")]]
-    );
-    assert_eq!(
-        scalar(&replica, "SELECT count(*) FROM secure_stubs").await,
-        1
     );
 
     // Writes after the seal: the next seal finalizes and compacts them too.
@@ -416,7 +409,6 @@ async fn a_seal_left_uncompacted_that_loses_is_rebuilt_and_a_compacted_one_reboo
             scope,
             listed: Vec::new(),
             replay: crate::FrameReplay::Local,
-            logged: false,
         }]
     );
     // A reset must replay retained frames without waiting for another incoming frame.
@@ -924,19 +916,20 @@ async fn compaction_at_seals_plateaus_under_insert_delete_churn() {
             .await,
         );
         println!("seal compaction churn: cycles={cycle}; {counts:?}");
-        // One live row, its creation witness and the latest empty-scope proof.
-        assert_eq!(counts, ((1, 0), 1, 0, 0, 4, 1, 1));
+        // One live base row and the latest empty-scope proof.
+        assert_eq!(counts, ((1, 0), 0, 0, 0, 4, 1, 1));
         if let Some(previous) = plateau {
             assert_eq!(previous, counts);
         }
         plateau = Some(counts);
         let measured = receipts::accounting(&a, &dir.path().join("a.db"), cycle).await;
+        // Replayed inserts are no births: admission evidence does not grow.
         if let Some(previous) = admission {
-            assert_eq!(measured.entries - previous.entries, 48);
-            assert_eq!(measured.grants - previous.grants, 48);
-            assert_eq!(measured.chains - previous.chains, 48);
+            assert_eq!(measured.entries, previous.entries);
+            assert_eq!(measured.grants, previous.grants);
+            assert_eq!(measured.chains, previous.chains);
             assert_eq!(measured.bounded, previous.bounded);
-            assert!(measured.logical_bytes - previous.logical_bytes >= 48 * 288);
+            assert_eq!(measured.logical_bytes, previous.logical_bytes);
         }
         admission = Some(measured);
     }
@@ -982,11 +975,8 @@ mod eligibility;
 mod identities;
 mod own;
 mod partial_reads;
-mod provenance;
 mod readiness;
 mod receipts;
-mod replay_scope;
-mod returning;
 mod scope_local;
 mod staged_switches;
 

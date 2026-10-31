@@ -279,7 +279,8 @@ async fn following_a_branch_of_the_same_schema_and_back_behaves_the_same() {
 }
 
 /// The owner moves `main` back from B, which removed `note`, to A: A's
-/// note returns, and only Alice's write at B, which A does not see, is held.
+/// note returns, and Alice's unsent write at B, which A does not see, is
+/// withdrawn with the line.
 async fn rolled_back(rebuild: Rebuild, removing: bool) {
     let lineage = Lineage::new();
     let dir = TempDir::new().unwrap();
@@ -349,7 +350,9 @@ async fn rolled_back(rebuild: Rebuild, removing: bool) {
         note_rows(&[("0001", "title", Some("old"))]),
         "{rebuild:?}"
     );
-    assert_eq!(alice.held_changes().await.unwrap().len(), 1, "{rebuild:?}");
+    // Intents have no rows to re-author: the unsent write goes with its
+    // line.
+    assert!(alice.held_changes().await.unwrap().is_empty(), "{rebuild:?}");
     alice.audit(lineage.scope("items")).await.unwrap();
 }
 
@@ -361,14 +364,14 @@ fn bookmark_move(lineage: &Lineage, from: TipId, to: TipId) -> TipStatement {
 }
 
 #[tokio::test]
-async fn an_owner_rollback_past_a_removal_restores_the_field_and_holds_only_unseen_writes() {
+async fn an_owner_rollback_past_a_removal_restores_the_field_and_withdraws_unseen_writes() {
     for rebuild in [Rebuild::Replay, Rebuild::Base, Rebuild::Rewind] {
         rolled_back(rebuild, true).await;
     }
 }
 
 #[tokio::test]
-async fn an_owner_rollback_within_one_schema_holds_the_same_writes() {
+async fn an_owner_rollback_within_one_schema_withdraws_the_same_writes() {
     for rebuild in [Rebuild::Rewind, Rebuild::Base, Rebuild::Replay] {
         rolled_back(rebuild, false).await;
     }

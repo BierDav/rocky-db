@@ -22,11 +22,9 @@ class Tips internal constructor(private val client: RockyClient) {
     suspend fun seal(close: Boolean = false): TipStatus = TipStatus.decode(call("seal") { put("close", close) })
 
     /**
-     * The owner recovers the followed tip when no in-sync node of its coordinated log can append: after collecting
-     * what reachable devices hold, one `continue` seal abandons the committed entries nobody holds, and every bookmark
-     * on the tip follows it. Abandoned writes return to their authors as held changes. Fails [RockyException]
-     * `rejected` on another device or when this device holds every entry (then [seal]), and `stale_recovery` when the
-     * log moved meanwhile.
+     * The owner recovers the followed tip when no ordinary seal can end its coordinated log: one `continue` seal
+     * replaces the log's exact head, and every bookmark on the tip follows it. Fails [RockyException] `rejected` on
+     * another device and `stale_recovery` when the log moved meanwhile.
      */
     suspend fun recover(): TipStatus = TipStatus.decode(call("recover"))
 

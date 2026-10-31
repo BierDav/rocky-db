@@ -141,7 +141,7 @@ async fn stored_reconstruction_reuses_only_owned_syntax_and_reopens_cold() {
         .frames
         .remove(0);
     same_frame(
-        &frames(&replica)
+        &stored_frames(&replica, "SELECT header,body FROM secure_operations")
             .await
             .into_iter()
             .find(|f| f.id().unwrap() == ordinary.id().unwrap())
@@ -158,7 +158,10 @@ async fn stored_reconstruction_reuses_only_owned_syntax_and_reopens_cold() {
         .await
         .unwrap();
     let inner = replica.inner.lock(crate::replica::Class::Background).await;
-    // Open's tail reconstruction already made the first cold parse on the new Inner.
+    // Opening replays no row records, so the first reconstruction on the
+    // new Inner parses cold and the next one reuses it.
+    assert_eq!(inner.migration_syntax_stats(), (0, 0, 0, 0));
+    same_frame(&reconstruct(&inner, &frame).await.unwrap(), &frame);
     assert_eq!(
         inner.migration_syntax_stats(),
         (1, 0, 1, signed.to_bytes().unwrap().len())

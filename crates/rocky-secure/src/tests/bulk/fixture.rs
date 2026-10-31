@@ -10,27 +10,18 @@ pub(super) async fn candidate(n: usize) -> Candidate {
     candidate_tables(n, false).await
 }
 pub(super) async fn candidate_tables(n: usize, tags: bool) -> Candidate {
-    candidate_kind(n, tags, false, false).await.0
+    candidate_kind(n, tags, false).await.0
 }
 pub(super) async fn issuer_candidate() -> (Candidate, PrivateKey) {
-    let (candidate, issuer) = candidate_kind(1, false, true, false).await;
+    let (candidate, issuer) = candidate_kind(1, false, true).await;
     (candidate, issuer.unwrap())
 }
-pub(super) async fn logged_candidate(n: usize) -> Candidate {
-    candidate_kind(n, false, false, true).await.0
-}
-async fn candidate_kind(
-    n: usize,
-    tags: bool,
-    issuer: bool,
-    existence: bool,
-) -> (Candidate, Option<PrivateKey>) {
-    let mut l = if issuer {
+async fn candidate_kind(n: usize, tags: bool, issuer: bool) -> (Candidate, Option<PrivateKey>) {
+    let l = if issuer {
         Lineage::pinned(139)
     } else {
         Lineage::new()
     };
-    l.existence = existence;
     let issuer = issuer.then(|| PrivateKey::from_bytes(&[140; 32]));
     let signer = issuer.as_ref().unwrap_or(l.publisher());
     let endorsement = issuer
@@ -170,6 +161,10 @@ async fn candidate_kind(
         .unwrap();
     }
     sql.commit_publication(publication).await.unwrap();
+    replica
+        .author_staged_publication(publication)
+        .await
+        .unwrap();
     let (s, writer) = replica
         .migration_intent(publication)
         .await
@@ -191,10 +186,14 @@ pub(super) async fn release(
         .await
         .unwrap();
 }
+/// The migration frames `replica` stores, in sequence order.
 pub(super) async fn frames(replica: &EncryptedReplica<TypedRows>) -> Vec<EncryptedFrame> {
     stored_frames(
         replica,
         "SELECT header,body FROM secure_operations ORDER BY sequence",
     )
     .await
+    .into_iter()
+    .filter(|frame| frame.migration.is_some())
+    .collect()
 }

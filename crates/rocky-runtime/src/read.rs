@@ -495,8 +495,6 @@ struct Pooled {
 /// Read-only connections of one file. The file's writer attaches the path
 /// once the file is installed and closes the pool before releasing the file.
 pub(crate) struct ReadPool {
-    /// Snapshot cursors of the file; closed with the pool.
-    cursors: Arc<crate::cursor::CursorHost>,
     permits: tokio::sync::Semaphore,
     state: Mutex<Pooled>,
     returned: Condvar,
@@ -504,7 +502,6 @@ pub(crate) struct ReadPool {
 impl ReadPool {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            cursors: crate::cursor::CursorHost::new(),
             permits: tokio::sync::Semaphore::new(POOL_CONNECTIONS),
             state: Mutex::new(Pooled {
                 path: None,
@@ -515,16 +512,6 @@ impl ReadPool {
             returned: Condvar::new(),
         })
     }
-    pub(crate) fn cursors(&self) -> Arc<crate::cursor::CursorHost> {
-        self.cursors.clone()
-    }
-    pub(crate) fn path(&self) -> Result<PathBuf, Error> {
-        let state = self.state.lock().map_err(|_| Error::Closed)?;
-        match (&state.path, state.closed) {
-            (Some(path), false) => Ok(path.clone()),
-            _ => Err(Error::Closed),
-        }
-    }
     pub(crate) fn attach(&self, path: PathBuf) {
         if let Ok(mut state) = self.state.lock() {
             state.path = Some(path);
@@ -533,7 +520,6 @@ impl ReadPool {
     /// Refuses new reads, waits for running ones and closes every connection.
     /// A running read is bounded by `READ_TRANSACTION_BOUND`.
     pub(crate) fn close(&self) {
-        self.cursors.close();
         self.permits.close();
         let Ok(mut state) = self.state.lock() else {
             return;

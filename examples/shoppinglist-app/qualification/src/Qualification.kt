@@ -303,7 +303,7 @@ internal class Run(val root: File, val peer: File, val notes: MutableList<String
 
     /**
      * The release gate: phones A and B are never online together and meet only the custody process. A duplicate
-     * title converges by policy, a moved item keeps an offline tick, a deleted category hides only its links,
+     * title drops the transaction replayed later, a move drops an earlier offline tick, a deleted category deletes only its links,
      * a deleted list cascades, and an offline phone catches up after the deletes.
      */
     fun gate() {
@@ -369,21 +369,22 @@ internal class Run(val root: File, val peer: File, val notes: MutableList<String
         for (phone in listOf(a, b)) phone.call("addPeer", "contact" to custody.contact)
         a.online(true)
         a.call("add", "list" to weekly, "title" to "Bread")
-        a.call("move", "from" to weekly, "id" to milk, "to" to weekend, "handle" to "07".repeat(32))
+        a.call("move", "from" to weekly, "id" to milk, "to" to weekend)
         relay(a, b)
         relay(b, a)
-        val moved = mapOf(weekly to listOf("Bread", "Butter #$dairy"), weekend to listOf("Milk [x]"), party to listOf("Cake"))
+        // The move inserted the values A read: B's tick, ordered before it, stays with the deleted row.
+        val moved = mapOf(weekly to listOf("Bread", "Butter #$dairy"), weekend to listOf("Milk"), party to listOf("Cake"))
         for (phone in listOf(a, b)) expect(lists.associateWith { phone.items(it) } == moved) { "${phone.name}: ${lists.map { phone.items(it) }}" }
-        notes += "duplicate title kept one Bread; the moved Milk kept B's offline tick and left its category"
+        notes += "duplicate title kept one Bread; the moved Milk left B's offline tick and its category behind"
 
         a.online(true)
         a.call("deleteCategory", "list" to weekly, "category" to dairy)
         a.call("deleteList", "list" to party)
         relay(a, b)
-        val deleted = mapOf(weekly to listOf("Bread", "Butter"), weekend to listOf("Milk [x]"), party to emptyList())
+        val deleted = mapOf(weekly to listOf("Bread", "Butter"), weekend to listOf("Milk"), party to emptyList())
         expect(lists.associateWith { b.items(it) } == deleted) { "B after deletes: ${lists.map { b.items(it) }}" }
         expect(b.lists().sorted() == listOf("Weekend", "Weekly")) { "B lists: ${b.lists()}" }
-        notes += "category delete hid only its links; deleting Party cascaded to its items"
+        notes += "category delete removed only its links; deleting Party cascaded to its items"
 
         c.online(true)
         repeat(2) { c.sync() }
@@ -393,7 +394,7 @@ internal class Run(val root: File, val peer: File, val notes: MutableList<String
 
         b.call("add", "list" to weekend, "title" to "Eggs")
         relay(b, a)
-        expect(a.items(weekend) == listOf("Eggs", "Milk [x]")) { "A after catch-up: ${a.items(weekend)}" }
+        expect(a.items(weekend) == listOf("Eggs", "Milk")) { "A after catch-up: ${a.items(weekend)}" }
     }
 
     /** Scenario 2: a list shared with B and not C never reaches C; revoking C rotates the list it held. */
@@ -433,7 +434,7 @@ internal class Run(val root: File, val peer: File, val notes: MutableList<String
         notes += "revoked C cannot sync and never reads rows written after revocation"
     }
 
-    /** Scenario 3: an item deleted and added again while another device edits the old incarnation offline. */
+    /** Scenario 3: an item deleted and added again while another device edits the old row offline. */
     fun relink() {
         val (a, b, _) = phones()
         val list = a.call("createList", "title" to "Weekly").asLong
@@ -447,7 +448,7 @@ internal class Run(val root: File, val peer: File, val notes: MutableList<String
         b.online(true)
         repeat(2) { b.sync() }
         expect(a.items(list) == listOf("Milk") && b.items(list) == a.items(list)) { "A ${a.items(list)} B ${b.items(list)}" }
-        notes += "the relinked Milk converged unticked: the edit to the deleted incarnation is dropped"
+        notes += "the relinked Milk converged unticked: the edit to the deleted row matches nothing"
     }
 
     /** Scenario 4: the creator device is lost; a second issuer revokes it, invites, shares and renews. */

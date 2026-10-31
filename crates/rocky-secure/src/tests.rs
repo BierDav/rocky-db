@@ -1582,16 +1582,14 @@ mod scaling;
 mod checkpoint;
 
 mod admission;
-mod author_payload;
 pub(crate) mod blockers;
 mod bundles;
 mod chains;
 mod compaction;
-mod constraints;
 mod coordinated;
 mod delegation;
 mod delivery;
-mod existence;
+mod failed_commit;
 mod formats;
 mod generations;
 mod group;
@@ -1610,8 +1608,6 @@ mod tip_drop;
 mod tip_network;
 mod tip_schemas;
 mod tips;
-
-mod partition_foreign_keys;
 
 pub(crate) mod group_sync_measurement;
 

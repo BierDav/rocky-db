@@ -105,7 +105,6 @@ pub(crate) enum GroupFault {
     ExitAfterCommit,
     FailBeforeCommit,
     FailAfterCommits(usize),
-    FailApplicationBeforeCommit,
 }
 
 impl<A: RowApplication> EncryptedReplica<A> {
@@ -216,7 +215,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
                     let rows = inner.rows_written.load(Ordering::Relaxed) - before.1;
                     let frames = inner.frames_written.load(Ordering::Relaxed) - before.0;
                     let requests = inner.applied_frames - before.2;
-                    inner.row_work(row_bound, rows);
+                    inner.row_work(row_bound);
                     inner.units("applied_row", rows);
                     inner.units("applied_frame", frames);
                     inner.units("applied_request", requests);
@@ -615,7 +614,7 @@ impl<A: RowApplication> Inner<A> {
                     // under the replica lock, inside the write transaction.
                     Ok(None) => match self.check_authority(*authority) {
                         Ok(()) => self
-                            .author_bundle(*handle, *input, writes, dependencies, time, None)
+                            .author_bundle(*handle, *input, writes, dependencies, time)
                             .await
                             .map(Staged::Bundle),
                         Err(error) => Err(error),
@@ -650,12 +649,7 @@ impl<A: RowApplication> Inner<A> {
                         let before = self.applied_frames;
                         let applied = self.apply_received(frame, time).await;
                         #[cfg(test)]
-                        let applied = if self.applied_frames != before
-                            && (!crate::apply_allowed()
-                                || matches!(
-                                    self.group_fault,
-                                    Some(GroupFault::FailApplicationBeforeCommit)
-                                )) {
+                        let applied = if self.applied_frames != before && !crate::apply_allowed() {
                             Err(Error::InjectedFailure)
                         } else {
                             applied

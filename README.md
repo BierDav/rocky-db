@@ -1,7 +1,7 @@
 # Rocky
 
 Rocky provides local-first SQLite storage, encrypted peer replication,
-credentials, coordinated writes and optional iroh networking.
+credentials, seal coordination and optional iroh networking.
 
 Implementation follows [features_13](docs/features_13/README.md), including its
 remaining prerequisites. [features_14](docs/features_14/README.md) records

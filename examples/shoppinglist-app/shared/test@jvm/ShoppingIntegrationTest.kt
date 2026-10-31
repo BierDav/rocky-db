@@ -108,6 +108,34 @@ class ShoppingIntegrationTest {
         }
     }
 
+    @Test fun `a duplicate title drops one transaction and both devices report it`() = runBlocking {
+        val unique = schema("shopping") {
+            table("items") {
+                text("title")
+                boolean("completed")
+                primaryKey("id")
+                unique("title")
+            }
+        }
+        val root = directory()
+        val a = RockyDatabase.create(File(root, "a"), unique, loopback(), automaticSync = false)
+        var b: RockyDatabase? = null
+        try {
+            b = RockyDatabase.join(File(root, "b"), unique, a.pairing(writer).uri, loopback(), automaticSync = false)
+            // The device whose replay drops a transaction reports it.
+            val drop = async(start = CoroutineStart.UNDISPATCHED) { withTimeout(20_000) { merge(a.drops(), b.drops()).first() } }
+            a.insertItem("Bread")
+            b.insertItem("Bread")
+            repeat(2) { b.syncOnce() }
+            assertEquals("constraint", drop.await().outcome.reason)
+            for (database in listOf(a, b)) assertEquals(listOf("Bread"), Row.decode(database.read(unique.table("items").query())).map { it.text("title") })
+        } finally {
+            b?.close()
+            a.close()
+            root.deleteRecursively()
+        }
+    }
+
     @Test fun `members sync directly while the creator is closed`() = runBlocking {
         val root = directory()
         val a = RockyDatabase.create(File(root, "a"), ItemsSchema, loopback(), automaticSync = false)
@@ -267,7 +295,7 @@ class ShoppingIntegrationTest {
         }
     }
 
-    @Test fun `a failed move preserves category links and a successful move replays atomically`() = runBlocking {
+    @Test fun `a failed move preserves category links and a move deletes and inserts in one transaction`() = runBlocking {
         val root = directory()
         val rocky = RockyDatabase.create(File(root, "a"), ShoppingSchema, local(), automaticSync = false)
         val room = openShoppingDatabase(File(root, "a"), rocky)
@@ -277,14 +305,13 @@ class ShoppingIntegrationTest {
             val to = repository.createList("To")
             val category = repository.addCategory(from, "Dairy")
             val item = repository.add(from, "Milk", setOf(category))
-            val handle = RockyDatabase.newHandle()
-            assertFailsWith<Exception> { repository.move(from, item, Long.MAX_VALUE, handle) }
+            assertFailsWith<Exception> { repository.move(from, item, Long.MAX_VALUE) }
             assertEquals(listOf(item), room.items().all(from).map { it.id })
             assertEquals(listOf(item to category), room.itemCategories().observe(from).first().map { it.item to it.category })
-            repository.move(from, item, to, handle)
-            repository.move(from, item, to, handle)
+            val moved = assertNotNull(repository.move(from, item, to))
+            assertNull(repository.move(from, item, to))
             assertTrue(room.items().all(from).isEmpty())
-            assertEquals(listOf(item), room.items().all(to).map { it.id })
+            assertEquals(listOf(moved to "Milk"), room.items().all(to).map { it.id to it.title })
             assertTrue(room.itemCategories().observe(from).first().isEmpty())
             assertTrue(room.itemCategories().observe(to).first().isEmpty())
         } finally {

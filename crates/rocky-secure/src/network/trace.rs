@@ -68,19 +68,3 @@ impl Request {
         self.span.record("outcome", outcome);
     }
 }
-/// A coordinated log call: `append`, `acknowledge` or `resolve`.
-pub(crate) async fn coordinated<T>(
-    call: &'static str,
-    future: impl std::future::Future<Output = Result<T, rocky_core::CoordinationError>>,
-) -> Result<T, rocky_core::CoordinationError> {
-    let span = tracing::debug_span!("coordinated_call", call, outcome = Empty);
-    let result = tracing::Instrument::instrument(future, span.clone()).await;
-    span.record(
-        "outcome",
-        match &result {
-            Ok(_) => "ok",
-            Err(error) => error.category(),
-        },
-    );
-    result
-}

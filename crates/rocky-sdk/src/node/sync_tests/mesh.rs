@@ -394,7 +394,7 @@ async fn contact_requests_are_bounded_and_a_wrong_node_hash_is_refused() -> Resu
 async fn a_needed_partition_reaches_its_keyless_custody_peer_within_two_passes()
 -> Result<(), Failure> {
     tokio::task::LocalSet::new().run_until(async {
-        let schema = Schema::parse(r#"{"application":"mesh_partition","version":1,"format":6,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"list","type":"text","not_null":true},{"name":"key","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],"primary_key":["list","key"],"partition_by":["list"]}]}"#)?;
+        let schema = Schema::parse(r#"{"application":"mesh_partition","version":1,"format":6,"tables":[{"name":"items","class":"replayed","columns":[{"name":"list","type":"text","not_null":true},{"name":"key","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],"primary_key":["list","key"],"partition_by":["list"]}]}"#)?;
         let root = tempfile::tempdir()?;
         let hub = Arc::new(Hub::default());
         let a = enrolled_schema(&root.path().join("a"), &hub, "a", None, &schema).await?;
@@ -427,7 +427,7 @@ async fn a_needed_partition_reaches_its_keyless_custody_peer_within_two_passes()
         assert!(b.scopes().iter().filter(|scope| !b.domain().partitioned_table(scope)).all(|scope| held.contains(scope)));
         assert!(hub.dials_to("d") > 0);
         }
-        let page = command(&b, json!({"type":"read","query":{"sql":"SELECT title FROM items WHERE row_kind=0","max_rows":8}})).await?;
+        let page = command(&b, json!({"type":"read","query":{"sql":"SELECT title FROM items","max_rows":8}})).await?;
         assert_eq!(page["rows"][0][0]["value"], "custody row");
         for node in [&a, &b, &c, &d] { node.detach(None).await; }
         Ok(())

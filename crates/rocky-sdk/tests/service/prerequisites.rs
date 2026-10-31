@@ -5,11 +5,7 @@ async fn real_voters_finalize_an_owner_seal_after_a_trusted_write() -> Result<()
     let root = tempfile::tempdir()?;
     let (bundle, _admin) = service(root.path()).await?;
     let (a, t) = household(root.path(), &bundle).await?;
-    assert_eq!(
-        t.write("main", 11, true).await?["committed"]["position"],
-        "1"
-    );
-    // Committed-entry requests carry metadata; range sync supplies their frames.
+    assert!(!t.write("main", 11).await?["committed"].is_null());
     a.sync().await?;
     assert_eq!(a.keys().await?, t.keys().await?);
     let tip = a.tips("status", json!({})).await?["tip"].clone();
@@ -30,21 +26,15 @@ async fn real_voters_finalize_an_owner_seal_after_a_trusted_write() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_voters_keep_branch_positions_separate_from_main() -> Result<(), Failure> {
+async fn real_voters_keep_branch_logs_separate_from_main() -> Result<(), Failure> {
     let root = tempfile::tempdir()?;
     let (bundle, _admin) = service(root.path()).await?;
     let (a, t) = household(root.path(), &bundle).await?;
-    assert_eq!(
-        t.write("before", 21, true).await?["committed"]["position"],
-        "1"
-    );
+    assert!(!t.write("before", 21).await?["committed"].is_null());
     a.sync().await?;
     let latest = a.tips("seal", json!({})).await?["tip"].clone();
     final_on_both(&a, &t, &latest).await?;
-    assert_eq!(
-        t.write("main only", 22, true).await?["committed"]["position"],
-        "1"
-    );
+    assert!(!t.write("main only", 22).await?["committed"].is_null());
     let main = t.call(json!({"type":"coordinated"})).await?;
     let main_rows = t.keys().await?;
     let main_head = head(&bundle, &root.path().join("t"), &t.scope, &main["tip"]).await?;
@@ -57,13 +47,9 @@ async fn real_voters_keep_branch_positions_separate_from_main() -> Result<(), Fa
     t.tips("pull", json!({"seal":latest})).await?;
     t.sync().await?;
     t.tips("follow", json!({"name":"dev"})).await?;
-    assert_eq!(
-        t.write("dev only", 23, true).await?["committed"]["position"],
-        "1"
-    );
+    assert!(!t.write("dev only", 23).await?["committed"].is_null());
     let branch = t.call(json!({"type":"coordinated"})).await?;
     assert_eq!(branch["tip"], dev);
-    assert_eq!(branch["position"], "1");
     assert_ne!(branch["tip"], main["tip"]);
     t.tips("follow", json!({"name":"main"})).await?;
     assert_eq!(t.call(json!({"type":"coordinated"})).await?, main);
@@ -78,28 +64,6 @@ async fn real_voters_keep_branch_positions_separate_from_main() -> Result<(), Fa
             main_head.terminal
         )
     );
-    t.close().await?;
-    a.close().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_coordinator_commits_while_peer_networking_is_disabled() -> Result<(), Failure> {
-    let root = tempfile::tempdir()?;
-    let (bundle, _admin) = service(root.path()).await?;
-    let (a, t) = household(root.path(), &bundle).await?;
-    t.session.set_networking_enabled(false).await?;
-    assert_eq!(t.sync().await?["skip"], "networking_disabled");
-    assert_eq!(
-        t.write("peer offline", 31, true).await?["committed"]["position"],
-        "1"
-    );
-    assert_eq!(
-        t.call(json!({"type":"coordinated"})).await?["position"],
-        "1"
-    );
-    assert_eq!(t.sync().await?["skip"], "networking_disabled");
-    assert_eq!(a.keys().await?, json!([]));
     t.close().await?;
     a.close().await?;
     Ok(())

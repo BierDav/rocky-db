@@ -148,10 +148,10 @@ impl<A: RowApplication> Inner<A> {
         }
         Ok(None)
     }
-    /// Inside the caller's transaction, signs scope `id`'s state at kept
-    /// `seal` and keeps its rows to serve. None when the seal is not kept
-    /// under the installed schema, the replay base lies past it, or a row's
-    /// creation is no longer known.
+    /// Inside the caller's transaction, signs replayed scope `id`'s rows at
+    /// kept `seal` and keeps them to serve. None when the seal is not kept
+    /// under the installed schema, the replay base lies past it, or the
+    /// covered identities are no longer known.
     async fn sign_kept(
         &mut self,
         scope: ResourceScope,
@@ -164,11 +164,12 @@ impl<A: RowApplication> Inner<A> {
         let Some((mark, through)) = kept.at(id) else {
             return Ok(None);
         };
-        let signed_seal = self
+        let tip = self
             .graph_for(scope.domain)?
             .seal_by_id(seal)
             .map_err(credential)?
-            .clone();
+            .statement
+            .tip;
         let previous = self
             .checkpoint_record(id, true)
             .await?
@@ -178,142 +179,51 @@ impl<A: RowApplication> Inner<A> {
         {
             return Ok(None);
         }
-        let blob = encode(&scope)?;
+        let Some(rows) = self.kept_images(scope, (seal, mark)).await? else {
+            return Ok(None);
+        };
+        let (frontier, operations) = self.covered_frontier(id, previous.as_ref(), through).await?;
+        let previous_marks = previous
+            .as_ref()
+            .map_or(&[][..], |(_, signed)| &signed.statement.identities);
+        let Some(identities) = self
+            .covered_identity_marks(id, previous_marks, &frontier)
+            .await?
+            .filter(|marks| self.check_base_identities(scope, tip, &rows, marks).is_ok())
+        else {
+            return Ok(None);
+        };
         for sql in [
             "DELETE FROM secure_served WHERE scope=?",
             "DELETE FROM secure_served_rows WHERE scope=?",
         ] {
             self.conn.execute(sql, [id]).await?;
         }
-        self.conn
-            .execute(
-                format!(
-                    "INSERT INTO secure_served_rows SELECT ?3,row,fields FROM ({})",
-                    history::KEPT_ROWS
-                ),
-                bindings(vec![
-                    SqlValue::Blob(blob),
-                    SqlValue::Integer(mark),
-                    SqlValue::Integer(id),
-                ]),
-            )
-            .await?;
-        let mut sets = Sets::new();
-        let mut creations = BTreeSet::new();
-        let mut after = Vec::new();
-        loop {
-            let records = collect_rows(
-                self.conn
-                    .query(
-                        "SELECT row,fields FROM secure_served_rows WHERE scope=? AND row>? ORDER BY row LIMIT ?",
-                        bindings(vec![
-                            SqlValue::Integer(id),
-                            SqlValue::Blob(after.clone()),
-                            SqlValue::Integer(STEP_ROWS as i64),
-                        ]),
-                    )
-                    .await?,
-            )
-            .await?;
-            for record in &records {
-                let [SqlValue::Blob(row), SqlValue::Blob(fields)] = record.as_slice() else {
-                    return Err(Error::Corrupt("served row".into()));
-                };
-                after = row.clone();
-                sets.replace_stored(self, &row_of(row)?, None, fields)
-                    .await?;
-                creations.insert(self.decode_record(fields).await?.creation);
-            }
-            if records.len() < STEP_ROWS {
-                break;
-            }
-        }
-        for creation in creations {
-            let Some(clock) = self.creation_clock(creation).await? else {
-                for sql in [
-                    "DELETE FROM secure_served WHERE scope=?",
-                    "DELETE FROM secure_served_rows WHERE scope=?",
-                ] {
-                    self.conn.execute(sql, [id]).await?;
-                }
-                return Ok(None);
-            };
-            sets.create(creation, clock);
-        }
-        // Operations the seal covers: the base's, then those applied
-        // after it through the bound.
-        let mut frontier = BTreeMap::<PublicKey, LogPosition>::new();
-        let mut operations = previous
-            .as_ref()
-            .map_or(0, |(_, signed)| signed.statement.operations);
-        if let Some((_, signed)) = &previous {
-            for log in &signed.statement.frontier {
-                frontier.insert(log.author, log.clone());
-            }
-        }
-        let from = previous.as_ref().map_or(0, |(position, _)| *position);
-        for record in collect_rows(
+        for (row, image) in &rows {
             self.conn
-                .query(
-                    "SELECT a.hash,o.header FROM secure_applied a JOIN secure_operations o ON o.hash=a.hash WHERE a.scope=? AND a.position>? AND a.position<=? ORDER BY a.position",
-                    [id, from, through],
+                .execute(
+                    "INSERT INTO secure_served_rows VALUES(?,?,?)",
+                    bindings(vec![
+                        SqlValue::Integer(id),
+                        SqlValue::Blob(row.to_vec()),
+                        SqlValue::Blob(image.clone()),
+                    ]),
                 )
-                .await?,
-        )
-        .await?
-        {
-            let [SqlValue::Blob(hash), SqlValue::Blob(header)] = record.as_slice() else {
-                return Err(Error::Corrupt("covered operation".into()));
-            };
-            let header: p2panda_core::Header<Extensions> = decode(header)?;
-            operations += 1;
-            let log = LogPosition {
-                author: header.public_key,
-                sequence: header.seq_num,
-                hash: hash_of(hash)?,
-                clock: header.timestamp,
-            };
-            if frontier
-                .get(&log.author)
-                .is_none_or(|known| known.sequence < log.sequence)
-            {
-                frontier.insert(log.author, log);
-            }
+                .await?;
         }
-        let tip = signed_seal.statement.tip;
+        let sets = replay::base_sets(&rows);
         let (handles, handle_digest) = self.handle_set().await?;
-        let previous_marks = previous
-            .as_ref()
-            .map_or(&[][..], |(_, signed)| &signed.statement.identities);
-        let identities = match self
-            .covered_identity_marks(id, previous_marks, &frontier)
-            .await?
-        {
-            Some(identities)
-                if self
-                    .check_covered_identities("secure_served_rows", id, &identities)
-                    .await
-                    .is_ok() =>
-            {
-                identities
-            }
-            _ => {
-                for sql in [
-                    "DELETE FROM secure_served WHERE scope=?",
-                    "DELETE FROM secure_served_rows WHERE scope=?",
-                ] {
-                    self.conn.execute(sql, [id]).await?;
-                }
-                return Ok(None);
-            }
-        };
         let frontier: Vec<LogPosition> = frontier.into_values().collect();
         let statement = CheckpointStatement {
             format: CHECKPOINT_FORMAT,
             seal: Some(seal),
             partition: self.partitions.get(&scope).cloned(),
             identities,
-            moves: self.served_moves(id).await?,
+            // Replayed rows never move.
+            moves: SetSummary {
+                count: 0,
+                digest: [0; 32],
+            },
             tip,
             schema: self
                 .generation_of(self.manifest_of_tip(tip)?, false)?
@@ -335,7 +245,7 @@ impl<A: RowApplication> Inner<A> {
             frontier,
             operations,
             rows: sets.rows_summary(),
-            tombstones: sets.tombstones,
+            tombstones: 0,
             creations: sets.creations_summary(),
             handles: SetSummary {
                 count: handles,
@@ -344,7 +254,6 @@ impl<A: RowApplication> Inner<A> {
             custody: self.custody_summary(id, through).await?,
         };
         let signed = self.sign_checkpoint(statement)?;
-        self.index_page_headers(id, &Served::Kept).await?;
         self.conn
             .execute(
                 "INSERT INTO secure_served VALUES(?,?,?)",

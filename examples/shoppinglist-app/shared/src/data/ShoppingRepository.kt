@@ -11,7 +11,6 @@ import rocky.GrantProfile
 import rocky.RecipientDelivery
 import rocky.RockyDatabase
 import rocky.room.createRockyPartition
-import rocky.room.moveRockyRow
 import rocky.room.settledOnRocky
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
@@ -36,7 +35,7 @@ class ShoppingRepository(private val database: ShoppingDatabase, private val roc
         database.lists().rename(list, title)
     }
 
-    /** Hides the list's categories and items too. */
+    /** Deletes the list's categories and items too. */
     suspend fun deleteList(list: Long) {
         database.lists().delete(list)
     }
@@ -47,7 +46,7 @@ class ShoppingRepository(private val database: ShoppingDatabase, private val roc
         return database.categories().add(list, name).id
     }
 
-    /** Items of the category keep their place in the list; only their links to it are hidden. */
+    /** Items of the category keep their place in the list; only their links to it are deleted. */
     suspend fun deleteCategory(list: Long, category: Long) {
         database.categories().delete(list, category)
     }
@@ -97,15 +96,12 @@ class ShoppingRepository(private val database: ShoppingDatabase, private val roc
     }
 
     /**
-     * Moves an item to another held list in one commit, keeping its id and field stamps; it leaves its categories,
-     * which stay in their list. A device that ticked the item offline sees its tick follow it. Retrying with the same
-     * [handle] never moves twice.
+     * Moves an item to another held list in one write: it is deleted from [from], leaving its categories, which stay in
+     * their list, and inserted at the end of [to] under a new id, which this returns; null when [from] no longer holds
+     * it, so a retry moves nothing twice. The insert binds the values this device read: a tick another device made
+     * offline, ordered before the move, does not follow the item.
      */
-    suspend fun move(from: Long, id: Long, to: Long, handle: String = RockyDatabase.newHandle()) {
-        database.moveRockyRow(rocky, handle, "items", id, listOf(from), listOf(to)) {
-            execute("DELETE FROM item_categories WHERE list = ? AND item = ?", from, id)
-        }
-    }
+    suspend fun move(from: Long, id: Long, to: Long): Long? = database.items().move(from, id, to)
 
     /**
      * Shares a held list with [recipients] by node; members choose a discovered peer. Sync carries each envelope to its device

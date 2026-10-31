@@ -1,5 +1,4 @@
 //! Persistent local replicas. See `docs/runtime/local-replica.md` for lifecycle and APIs.
-mod binding;
 mod bootstrap;
 mod checkpoint;
 mod layout;
@@ -12,10 +11,7 @@ mod runtime;
 mod schema_evolution;
 /// Versioned language-neutral SDK session over the precise runtime contract.
 pub mod sdk;
-mod sql;
-pub use binding::Database;
 pub use relocation::migrate_placement;
-pub use rocky_storage::capture::{CatalogColumn, CatalogIndex, CatalogTable};
 pub use rocky_storage::cursor::{
     CursorLimits, CursorPage, MAX_CURSOR_LIFETIME, MAX_SESSION_CURSORS, ResultColumn,
     SnapshotCursor, SnapshotRows,
@@ -23,11 +19,6 @@ pub use rocky_storage::cursor::{
 pub use rocky_storage::observe::{Cause, TableChange, TableObserver};
 /// How a session reads a statement's transaction control.
 pub use rocky_storage::sql::{Control as SqlControl, classify as classify_sql};
-pub use sql::{
-    AbortReason, Certainty, DomainOutcome, MAX_SAVEPOINTS, MAX_TRANSACTION_TIMEOUT, SqlCursor,
-    SqlError, SqlOptions, SqlRows, SqlSession, SqlState, SqlStatement, TransactionOutcome,
-    Unavailable, operation_handle,
-};
 mod tracking;
 pub use query::{
     BoundQuery, Completeness, CursorKind, ReadCursor, ReadObserver, ReadOptions, ReadSnapshot,
@@ -62,9 +53,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub use rocky_storage::{CommitClass, Error, FailureReason, MAX_FRAME_BYTES, StorageFailure};
-pub(crate) use rocky_storage::{
-    capture, cursor, database, digest, observe, scoped_connection, sqlite, statement,
-};
+pub(crate) use rocky_storage::{database, digest, observe, scoped_connection, sqlite};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
@@ -203,7 +192,6 @@ enum Command<R> {
     Close(Reply<()>),
     Sync(replication::Request, Reply<replication::Response>),
     Retention(Box<checkpoint::Request>, Reply<checkpoint::Response>),
-    Sql(sql::Request, Reply<sql::Response>),
     #[cfg(test)]
     Fault(worker::Fault, Reply<()>),
 }
@@ -224,7 +212,6 @@ impl<R> Command<R> {
             Self::Flush(_) => true,
             Self::Sync(request, _) => request.exposes(),
             Self::Retention(request, _) => request.exposes(),
-            Self::Sql(request, _) => request.exposes(),
             _ => false,
         }
     }
@@ -246,7 +233,6 @@ impl<R> Command<R> {
             Self::Close(reply) => drop(reply.send(Err(error))),
             Self::Sync(_, reply) => drop(reply.send(Err(error))),
             Self::Retention(_, reply) => drop(reply.send(Err(error))),
-            Self::Sql(_, reply) => drop(reply.send(Err(error))),
             #[cfg(test)]
             Self::Fault(_, reply) => drop(reply.send(Err(error))),
         }
@@ -639,7 +625,6 @@ impl<R> CommandQueue<R> {
                 | Command::Query(_)
                 | Command::LookupMutation(_, _)
                 | Command::Flush(_)
-                | Command::Sql(_, _)
         );
         let weight = match command {
             Command::Mutate(_, mutation, _, _) => mutation.payload.len(),
@@ -793,10 +778,7 @@ mod retention_tests;
 mod wide_schema_tests;
 
 #[cfg(all(test, unix))]
-mod sql_tests;
-
-#[cfg(all(test, unix))]
-mod binding_tests;
+mod relocation_tests;
 
 #[cfg(test)]
 mod roles_tests;

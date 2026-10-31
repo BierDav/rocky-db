@@ -8,7 +8,6 @@
 //! watermark. Nothing leaves the device above that watermark: a request whose
 //! reply is exposed (`Command::exposes`) waits until its domain is clean, and
 //! the writer then flushes once for every waiting exposure.
-mod sql;
 use crate::{
     Command, Durability, QueuedCommand, Reply, RuntimeOptions,
     database::DatabaseOwner,
@@ -95,11 +94,6 @@ pub struct WriterStats {
     /// WAL frames after the latest commit, and the most seen.
     pub wal_frames: u64,
     pub wal_frames_max: u64,
-    /// SQL transactions that held the writer, the time they held it in
-    /// total and the longest one. Nothing else committed meanwhile.
-    pub leases: u64,
-    pub lease_micros: u64,
-    pub lease_max_micros: u64,
 }
 /// The kind of request a writer step ran, for `WriterStats` attribution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,9 +131,6 @@ pub(crate) struct Metrics {
     truncate_micros: AtomicU64,
     wal_frames: AtomicU64,
     wal_frames_max: AtomicU64,
-    leases: AtomicU64,
-    lease_micros: AtomicU64,
-    lease_max_micros: AtomicU64,
     /// Bounded record of the most recent checkpoint intervals, plus how many
     /// intervals were dropped once the bound filled.
     checkpoint_log: std::sync::Mutex<CheckpointLog>,
@@ -208,9 +199,6 @@ impl Metrics {
             truncate_micros: self.truncate_micros.load(Relaxed),
             wal_frames: self.wal_frames.load(Relaxed),
             wal_frames_max: self.wal_frames_max.load(Relaxed),
-            leases: self.leases.load(Relaxed),
-            lease_micros: self.lease_micros.load(Relaxed),
-            lease_max_micros: self.lease_max_micros.load(Relaxed),
         }
     }
     /// Records one completed checkpoint interval, dropping the oldest when the
@@ -389,8 +377,6 @@ struct File {
 }
 pub(crate) struct Writer<A: StoredApplication> {
     slots: Vec<Slot<A>>,
-    /// Open SQL sessions of the file's domains.
-    sessions: Vec<sql::Session>,
     file: Option<File>,
     group: usize,
     cursor: usize,
@@ -450,7 +436,6 @@ where
             .collect();
         Ok(Self {
             slots,
-            sessions: Vec::new(),
             file: Some(File {
                 conn,
                 _owner: owner,
@@ -481,15 +466,8 @@ where
             if self.slots.iter().all(|slot| slot.worker.is_none()) {
                 break;
             }
-            if self.slots.iter().all(|slot| slot.deferred.is_empty())
-                && !self.sessions.iter().any(sql::Session::ready)
-            {
+            if self.slots.iter().all(|slot| slot.deferred.is_empty()) {
                 self.wait().await;
-            }
-            // A session takes one turn between groups; a transaction's turn
-            // lasts until it ends.
-            if self.serve_sessions().await {
-                break;
             }
             let (group, exposing) = self.collect().await;
             if group.is_empty() {
@@ -514,9 +492,6 @@ where
     /// Waits, without polling for more, until any domain has work.
     async fn wait(&mut self) {
         std::future::poll_fn(|context| {
-            if self.poll_sessions(context) {
-                return Poll::Ready(());
-            }
             let mut ready = true;
             for slot in &mut self.slots {
                 if slot.worker.is_none() || slot.drained {
@@ -630,13 +605,7 @@ where
                 slot.receiver.close();
                 slot.closing = Some(reply);
             }
-            command @ (Command::Query(_) | Command::Sql(..)) if closing => {
-                command.refuse(Error::Closed);
-            }
-            Command::Sql(crate::sql::Request::Open(opening), reply) => {
-                let opened = self.open_session(index, *opening);
-                let _ = reply.send(opened.map(|()| crate::sql::Response::Opened));
-            }
+            command @ Command::Query(_) if closing => command.refuse(Error::Closed),
             #[cfg(test)]
             Command::Fault(_, reply) if closing => drop(reply.send(Err(Error::Closed))),
             #[cfg(test)]

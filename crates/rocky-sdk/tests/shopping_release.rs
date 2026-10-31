@@ -7,16 +7,16 @@ use serde_json::{Value, json};
 use std::{path::Path, sync::Arc};
 
 const SCHEMA: &str = r#"{"format":6,"application":"shopping","version":3,"tables":[
- {"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],
+ {"name":"lists","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],
   "primary_key":["id"],"partition_by":["id"],"partition_group":"list"},
- {"name":"categories","class":"mergeable","columns":[{"name":"list","type":"integer","not_null":true},{"name":"name","type":"text","not_null":true}],
+ {"name":"categories","class":"replayed","columns":[{"name":"list","type":"integer","not_null":true},{"name":"name","type":"text","not_null":true}],
   "primary_key":["list","id"],"partition_by":["list"],"partition_group":"list",
   "foreign_keys":[{"columns":["list"],"table":"lists","on_delete":"cascade"}]},
- {"name":"items","class":"mergeable","columns":[
+ {"name":"items","class":"replayed","columns":[
    {"name":"list","type":"integer","not_null":true},{"name":"title","type":"text","not_null":true},
    {"name":"completed","type":"integer","not_null":true},{"name":"category","type":"integer"}],
   "primary_key":["list","id"],"partition_by":["list"],"partition_group":"list",
-  "indexes":[{"name":"index_items_list_title","unique":true,"columns":[{"name":"list","descending":false},{"name":"title","descending":false}],"on_conflict":"latest_wins"}],
+  "indexes":[{"name":"index_items_list_title","unique":true,"columns":[{"name":"list","descending":false},{"name":"title","descending":false}]}],
   "foreign_keys":[{"columns":["list"],"table":"lists","on_delete":"cascade"},
    {"columns":["list","category"],"table":"categories","on_delete":"set_null"}]}
 ]}"#;
@@ -120,6 +120,21 @@ impl Peer {
             ),
         )
         .await
+    }
+    /// Moves item `id` to list `to` in one transaction: a new row there
+    /// with the values read here, and the old one deleted.
+    async fn move_item(&self, from: &str, id: &str, to: &str) -> Result<String, Failure> {
+        self.call(json!({"type":"sql","sql":"BEGIN"})).await?;
+        let moved = self
+            .call(json!({"type":"next_id","table":"items","partition_values":values(to)}))
+            .await?["id"]
+            .clone();
+        self.call(json!({"type":"sql","sql":format!("INSERT INTO items(id,list,title,completed) SELECT ?,{to},title,completed FROM items WHERE list={from} AND id={id}"),"values":[{"type":"integer","value":moved}]}))
+            .await?;
+        self.execute(&format!("DELETE FROM items WHERE list={from} AND id={id}"))
+            .await?;
+        self.call(json!({"type":"sql","sql":"COMMIT"})).await?;
+        Ok(moved.as_str().ok_or("id")?.to_owned())
     }
     async fn execute(&self, sql: &str) -> Result<(), Failure> {
         self.call(json!({"type":"sql","sql":sql})).await.map(drop)
@@ -251,7 +266,7 @@ async fn two_phones_never_online_together_pass_the_release_gate_through_custody(
     // Custody holds every list's frames but cannot read them.
     assert!(
         custody
-            .rows("SELECT title FROM items WHERE row_kind = 0")
+            .rows("SELECT title FROM items")
             .await
             .map_or(true, |rows| rows.is_empty())
     );
@@ -266,18 +281,14 @@ async fn two_phones_never_online_together_pass_the_release_gate_through_custody(
     b.sync().await?;
     b.online(false).await?;
     a.add(&weekly, "Bread", None).await?;
-    a.call(
-        json!({"type":"move_row","handle":vec![7u8; 32],"table":"items","id":milk,
-        "from":values(&weekly),"to":values(&weekend)}),
-    )
-    .await?;
+    a.move_item(&weekly, &milk, &weekend).await?;
     relay(a, b).await?;
     relay(b, a).await?;
     let converged = vec![
         vec![json!(weekly), json!("Bread"), json!("0"), Value::Null],
         vec![json!(weekly), json!("Butter"), json!("0"), json!(dairy)],
-        // The tick followed the move; the category stayed in Weekly.
-        vec![json!(weekend), json!("Milk"), json!("1"), Value::Null],
+        // The move wrote the values A read: B's tick changed the old row.
+        vec![json!(weekend), json!("Milk"), json!("0"), Value::Null],
         vec![json!(party), json!("Cake"), json!("0"), Value::Null],
     ];
     assert_eq!(a.items().await?, converged);
@@ -295,7 +306,7 @@ async fn two_phones_never_online_together_pass_the_release_gate_through_custody(
     let deleted = vec![
         vec![json!(weekly), json!("Bread"), json!("0"), Value::Null],
         vec![json!(weekly), json!("Butter"), json!("0"), Value::Null],
-        vec![json!(weekend), json!("Milk"), json!("1"), Value::Null],
+        vec![json!(weekend), json!("Milk"), json!("0"), Value::Null],
     ];
     assert_eq!(b.items().await?, deleted);
     assert_eq!(
@@ -324,12 +335,8 @@ async fn a_device_joining_after_a_move_starts_the_list_from_a_checkpoint() -> Re
     let weekly = a.create_list("Weekly").await?;
     let weekend = a.create_list("Weekend").await?;
     let milk = a.add(&weekly, "Milk", None).await?;
-    a.call(
-        json!({"type":"move_row","handle":vec![9u8; 32],"table":"items","id":milk,
-        "from":values(&weekly),"to":values(&weekend)}),
-    )
-    .await?;
-    // The weekly checkpoint holds the moved row's tombstone, which has no image.
+    a.move_item(&weekly, &milk, &weekend).await?;
+    // The weekly checkpoint no longer holds the moved row.
     let c = Peer::new(
         Database::join(
             open(&_root.path().join("c"), &hub, "c"),

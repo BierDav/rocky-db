@@ -11,8 +11,6 @@ license-file.workspace = true
 [features]
 # Deterministic simulator fault hooks; never enabled in published artifacts.
 qualification = ["rocky-storage/qualification"]
-# Test-only capture of committed SQL transaction shapes; never in published artifacts.
-intent-shapes = ["dep:sqlparser", "dep:serde_json"]
 
 [dependencies]
 tracing.workspace = true
@@ -27,12 +25,9 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 chacha20poly1305 = "=0.10.1"
 rand = "=0.8.8"
-sqlparser = { version = "0.63", default-features = false, features = ["std", "visitor"], optional = true }
-serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
-sqlparser = { version = "0.63", default-features = false, features = ["std", "visitor"] }
 employees-app = { path = "../../examples/employees-app" }
 rocky-coordinator = { path = "../rocky-coordinator" }
 rocky-storage = { path = "../rocky-storage", features = ["test-support"] }
@@ -42,7 +37,3 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
-
-[[example]]
-name = "intent_shapes"
-required-features = ["intent-shapes"]

@@ -71,18 +71,19 @@ pub(super) const ROWS_INSERT: &str = concat!(
 /// Deletes the stored versions no kept seal needs any more.
 pub(super) const PRUNE_ROWS: &str = "DELETE FROM secure_stored_history WHERE NOT EXISTS(SELECT 1 FROM secure_kept_marks AS k WHERE k.mark<secure_stored_history.version AND k.mark>=COALESCE((SELECT MAX(p.version) FROM secure_stored_history AS p WHERE p.scope=secure_stored_history.scope AND p.row=secure_stored_history.row AND p.version<secure_stored_history.version),-1))";
 
-/// Stored rows of scope `?1` at the kept seal marked `?2`.
-pub(in crate::replica) const KEPT_ROWS: &str = "SELECT r.row AS row,r.fields AS fields FROM secure_row_records AS r WHERE r.scope=?1 AND NOT EXISTS(SELECT 1 FROM secure_stored_history AS p WHERE p.scope=r.scope AND p.row=r.row AND p.version>?2) UNION ALL SELECT h.row,h.fields FROM secure_stored_history AS h WHERE h.scope=?1 AND h.version>?2 AND h.fields IS NOT NULL AND h.version=(SELECT MIN(p.version) FROM secure_stored_history AS p WHERE p.scope=h.scope AND p.row=h.row AND p.version>?2)";
 
 const BEFORE: &str = "secure_stored_history_before";
 
 /// A kept seal stored rows rebuild from.
 pub(in crate::replica) struct Rewind {
-    pub(in crate::replica) seal: Commitment,
+    seal: Commitment,
     mark: i64,
     bounds: Vec<KeptBound>,
 }
 impl Rewind {
+    pub(in crate::replica) fn mark(&self) -> (Commitment, i64) {
+        (self.seal, self.mark)
+    }
     /// The seal's mark and scope `id`'s bound there.
     pub(in crate::replica) fn at(&self, id: i64) -> Option<(i64, i64)> {
         self.bounds
@@ -271,22 +272,12 @@ impl<A: RowApplication> Inner<A> {
         Ok(None)
     }
     /// Whether scope `id` rebuilds from a kept seal of the followed path:
-    /// its replay base, if any, lies on the path before it, and no
-    /// constraint group spans it.
+    /// its replay base, if any, lies on the path before it.
     pub(in crate::replica) async fn rewinds(
         &self,
         scope: ResourceScope,
         id: i64,
     ) -> Result<bool, Error> {
-        let constrained = self
-            .workspace
-            .typed
-            .as_ref()
-            .and_then(|typed| typed.constraints.as_ref())
-            .is_some_and(|constraints| constraints.node(scope).is_some());
-        if constrained {
-            return Ok(false);
-        }
         Ok(match self.checkpoint_record(id, true).await? {
             None => true,
             Some(record) => record
@@ -362,7 +353,6 @@ impl<A: RowApplication> Inner<A> {
         let (count, tombstones, digest, applied) = self.scope_state(id).await?;
         let mut sets = Sets::new();
         (sets.rows, sets.tombstones, sets.digest) = (count, tombstones, digest);
-        let mut projections = Vec::new();
         let mut touched = BTreeSet::new();
         let mut after = Vec::new();
         loop {
@@ -424,28 +414,10 @@ impl<A: RowApplication> Inner<A> {
                     }
                     (None, None) => continue,
                 }
-                let old: Option<Materialized> = self.optional_record(old.as_deref()).await?;
-                let new: Option<Materialized> = self.optional_record(new.as_deref()).await?;
-                projections.push((old, new));
             }
             if chunk.len() < STEP_ROWS {
                 break;
             }
-        }
-        // Every stored row is in place before any is projected: an
-        // incarnation's winner depends on the others at its key.
-        for (old, new) in projections {
-            let new = match (new, &old) {
-                (Some(new), _) => new,
-                (None, Some(old)) => Materialized {
-                    deleted: true,
-                    fields: BTreeMap::new(),
-                    stamps: BTreeMap::new(),
-                    ..old.clone()
-                },
-                (None, None) => continue,
-            };
-            self.project(scope, old.as_ref(), &new).await?;
         }
         self.store_scope_state(id, sets.rows, sets.tombstones, &sets.digest, applied)
             .await?;

@@ -1,6 +1,6 @@
 //! Consumes Kotlin qualification output; run through `sdks/kotlin/gradlew -p sdks/kotlin :qualification:schema:qualify`.
 use rocky_core::{DomainId, LogicalSchema, Profile, SchemaDefinition, TypedRows};
-use rocky_sdk::{Database, Failure, Open, TypedApp};
+use rocky_sdk::{Database, Failure, Open};
 use serde_json::{Value, json};
 use std::{fs, path::Path};
 
@@ -21,7 +21,6 @@ async fn main() -> Result<(), Failure> {
         ("constraints-hand", "constraints-import"),
         ("partitions-hand", "partitions-import"),
         ("groups-hand", "groups-import"),
-        ("existence-hand", "existence-import"),
         ("lists-hand", "lists-import"),
     ] {
         let hand = descriptor(&directory.join(format!("{hand}.json")))?;
@@ -32,15 +31,6 @@ async fn main() -> Result<(), Failure> {
             hand.replicated_fingerprint(),
             imported.replicated_fingerprint()
         );
-        if hand
-            .tables
-            .iter()
-            .any(|table| !table.foreign_keys.is_empty())
-        {
-            assert!(hand.supported_on(Profile::Trusted).is_err());
-        } else {
-            hand.supported_on(Profile::Trusted)?;
-        }
         hand.supported_on(Profile::Secure)?;
         if hand
             .partition_groups()?
@@ -57,23 +47,6 @@ async fn main() -> Result<(), Failure> {
                 hand.group_address(scope, "items", &[rocky_core::SqlValue::Integer(42)])?
             );
         }
-        if hand
-            .tables
-            .iter()
-            .any(|table| !table.foreign_keys.is_empty())
-        {
-            assert!(TypedApp::new(hand.clone(), &[DomainId([1; 16])]).is_err());
-        } else {
-            TypedApp::new(hand.clone(), &[DomainId([1; 16])])?;
-        }
-        if hand.existence_tables().next().is_some() {
-            // The reference crosses reader scopes; installation lists the log.
-            let names: Vec<_> = hand
-                .existence_tables()
-                .map(|table| table.sql_name.as_str())
-                .collect();
-            assert_eq!(names, ["parents"]);
-        }
         TypedRows::new(imported, vec![DomainId([1; 16])])?;
     }
     let scratch = tempfile::tempdir()?;
@@ -84,7 +57,6 @@ async fn main() -> Result<(), Failure> {
         ("constraints-hand", "constraints-import"),
         ("partitions-hand", "partitions-import"),
         ("groups-hand", "groups-import"),
-        ("existence-hand", "existence-import"),
         ("lists-hand", "lists-import"),
     ] {
         let path = scratch.path().join(hand);
@@ -104,7 +76,7 @@ async fn main() -> Result<(), Failure> {
             "samples"
         } else if hand == "shopping-hand" {
             "shopping_items"
-        } else if hand == "constraints-hand" || hand == "existence-hand" {
+        } else if hand == "constraints-hand" {
             "children"
         } else if hand == "groups-hand" || hand == "lists-hand" {
             "items"

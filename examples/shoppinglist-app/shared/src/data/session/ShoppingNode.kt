@@ -182,7 +182,7 @@ class ShoppingNode private constructor(
         }
 
         /**
-         * Only trusted devices compose the coordination service: they alone write coordinated entries and end logs.
+         * Only trusted devices compose the coordination service: they alone end tips' logs.
          * A member that composed it would hold every seal of a coordinated tip back until it could confirm the
          * terminal itself, which only trusted nodes can. [trusted] is null when the kind is read from the device.
          */

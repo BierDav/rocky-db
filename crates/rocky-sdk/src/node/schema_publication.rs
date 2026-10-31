@@ -46,7 +46,6 @@ impl Node {
             settings.mesh,
             settings.domain,
             self.declared.version,
-            &BTreeSet::new(),
         )?;
         let seal = SignedSeal::endorse(
             SealStatement {
@@ -98,11 +97,7 @@ impl Node {
         if !migrates && self.replica.domain_log().is_some() {
             // A continue carries no migration rows. Its ordinary terminal
             // settles while the original workspace still follows the source.
-            match self
-                .replica
-                .publish_tip_statements_through(&statements, &super::coordinated::LinkPeers(self))
-                .await
-            {
+            match self.replica.publish_tip_statements(&statements).await {
                 Ok(_) => {}
                 Err(error)
                     if error.to_string().contains("unconfirmed")
@@ -248,7 +243,6 @@ impl Node {
         }
         self.replica.finalize_path(scope).await?;
         self.replica.compact(scope, 0).await?;
-        self.sign_existence_bases(scope).await?;
         self.list_checkpoints(scope).await?;
         self.observations.touch();
         Ok(())

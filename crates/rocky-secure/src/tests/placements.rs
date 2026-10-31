@@ -310,7 +310,7 @@ async fn a_later_held_frame_places_gaps_before_an_older_seals_frontier() {
 }
 
 #[tokio::test]
-async fn forged_out_of_range_held_scope_staged_and_revoked_placements_are_refused() {
+async fn forged_out_of_range_held_scope_and_revoked_placements_are_refused() {
     let pair = pair().await;
     let (alice, bob) = (&pair.alice, &pair.bob);
     let credentials = chain(&bob.1).await;
@@ -422,30 +422,6 @@ async fn forged_out_of_range_held_scope_staged_and_revoked_placements_are_refuse
         scalar(&bob.1, "SELECT count(*) FROM secure_placements").await,
         0
     );
-    // An uncommitted coordinated frame is not shown.
-    {
-        let inner = alice.inner.lock(crate::replica::Class::Background).await;
-        inner
-            .conn
-            .execute(
-                "INSERT INTO secure_staged SELECT hash,scope FROM secure_operations",
-                (),
-            )
-            .await
-            .unwrap();
-    }
-    let PlacementPage::Headers { headers: none, .. } = answer(*request).await.unwrap() else {
-        panic!("custody")
-    };
-    assert!(none.is_empty());
-    {
-        let inner = alice.inner.lock(crate::replica::Class::Background).await;
-        inner
-            .conn
-            .execute("DELETE FROM secure_staged", ())
-            .await
-            .unwrap();
-    }
     // A revoked requester is refused.
     let user = PrivateKey::from_bytes(&rocky_core::commitment(
         "lineage.user",

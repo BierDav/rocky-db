@@ -59,9 +59,6 @@ pub enum FrameReplay {
     /// Frames were pruned: it keeps the ones it holds and the rest come
     /// again from a peer that retains them.
     Peers,
-    /// Its existence records were released at a seal off the path; only a
-    /// checkpoint with a signed existence base replaces them.
-    Unavailable,
 }
 
 /// Who can clear a blocker.

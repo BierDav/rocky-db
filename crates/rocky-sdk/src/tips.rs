@@ -45,8 +45,8 @@ pub struct TipAuthorMark {
     pub author: u32,
     pub sequence: u64,
 }
-/// What the owner's recovery seal abandons: the committed entries of its
-/// tip's coordinated log after `retained` through `replaced`.
+/// The coordinated log positions the owner's recovery seal retains and
+/// replaces.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TipRecovery {
     pub retained: u64,

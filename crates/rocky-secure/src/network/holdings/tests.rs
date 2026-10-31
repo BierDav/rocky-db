@@ -171,39 +171,6 @@ fn requests(scope: ResourceScope) -> Vec<Message> {
             max_rows: 1,
         }
         .into(),
-        ExistenceMessage::BaseOffer {
-            scope,
-            expected: None,
-        }
-        .into(),
-        ExistenceMessage::BasePull {
-            scope,
-            base: [0; 32],
-            after: None,
-        }
-        .into(),
-        ExistenceMessage::BaseStage {
-            scope,
-            page: ExistenceBasePage {
-                base: [0; 32],
-                rows: vec![],
-                next: None,
-            },
-        }
-        .into(),
-        ExistenceMessage::BaseFinish { scope }.into(),
-        ExistenceMessage::Frontier { scope }.into(),
-        ExistenceMessage::Pull {
-            scope,
-            known: Default::default(),
-            after: None,
-        }
-        .into(),
-        ExistenceMessage::Push {
-            scope,
-            records: vec![],
-        }
-        .into(),
     ]
 }
 
@@ -451,10 +418,7 @@ async fn custody_tuple_offers_relay_only_with_both_grants() {
         .await;
     let scope = f.scope("customers", 1);
     f.keys(&writer, 1, &["customers"]).await;
-    writer
-        .author_bundle([1; 32], vec![f.write("customers", 1)], vec![])
-        .await
-        .unwrap();
+    f.insert(&writer, 1, &["customers"], [1; 32]).await;
     let (mut c, mut s) = pair(&writer, &custody).await;
     let serve = s.serve_to_end(&custody);
     let ask = async {
@@ -548,10 +512,7 @@ async fn frontier_acknowledgments_require_proved_custody() {
         .register_partition(f.scope("customers", 1), f.tuple("customers", 1))
         .await
         .unwrap();
-    writer
-        .author_bundle([1; 32], vec![f.write("customers", 1)], vec![])
-        .await
-        .unwrap();
+    f.insert(&writer, 1, &["customers"], [1; 32]).await;
     let scope = f.scope("customers", 1);
     let frontier = member.frontier(scope).await.unwrap();
     let refused = refusal(&member, &writer, RowMessage::Held { frontier }.into()).await;

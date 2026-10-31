@@ -5,8 +5,6 @@ use super::*;
 use rocky_credentials::{SealAction, SignedSeal};
 
 mod employees;
-mod incarnations;
-mod matching_source;
 mod source_availability;
 pub(in crate::tests) mod source_validation;
 mod staging;
@@ -330,8 +328,15 @@ async fn additive_switch_changes(rows: usize) -> (i64, usize) {
         .unwrap();
     follow_main(&lineage, &replica).await;
     let writer = session(&replica).await;
-    writer.run("BEGIN IMMEDIATE", vec![]).await.unwrap();
+    // A transaction holds at most 256 intent statements.
     for row in 0..rows {
+        if row % 200 == 0 {
+            if row > 0 {
+                let handle = rocky_core::commitment("switch rows", &row.to_be_bytes());
+                writer.commit(handle).await.unwrap();
+            }
+            writer.run("BEGIN IMMEDIATE", vec![]).await.unwrap();
+        }
         super::generations::identity_insert(
             &writer,
             "INSERT INTO items(key,title) VALUES(?,?)",
@@ -343,7 +348,7 @@ async fn additive_switch_changes(rows: usize) -> (i64, usize) {
         .await
         .unwrap();
     }
-    writer.commit([7; 32]).await.unwrap();
+    writer.commit([8; 32]).await.unwrap();
     drop(writer);
     let original = replica.followed_tip().await;
     let mut statement = sign_seal(

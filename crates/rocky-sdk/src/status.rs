@@ -154,7 +154,6 @@ pub struct Generation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebuildProgress {
     pub schema: String,
-    pub filled: u64,
     pub tables: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,5 +1,4 @@
 //! Canonical operation protocol and the application boundary for pure reducers.
-mod binding;
 mod blocker;
 pub use blocker::*;
 mod capture;
@@ -9,7 +8,7 @@ pub use coordinated::*;
 mod definition;
 pub use definition::*;
 mod generation;
-pub use generation::{Generation, Removed, SchemaChange, Unsupported, classify};
+pub use generation::{Generation, Removed, SchemaChange, Unsupported, classify, removed};
 mod manifest;
 pub use manifest::*;
 mod secure_row;
@@ -31,8 +30,7 @@ mod storage;
 mod types;
 mod value;
 
-pub use binding::{BindingError, BoundTable, DatabaseBinding, MAX_BOUND_DOMAINS, MAX_BOUND_TABLES};
-pub use capture::{CapturedRow, Intent, SqlWrites, TransactionToken, intent_commitment};
+pub use capture::{Intent, TransactionToken};
 pub use history::{AppliedOperations, Delivery};
 pub use key::{KeyColumn, MAX_KEY_BYTES, bound_key, key_components, key_values};
 pub use logical::*;
@@ -110,4 +108,4 @@ mod row_identity;
 pub use row_identity::{RowIdentity, RowIdentityError};
 
 mod typed_rows;
-pub use typed_rows::{TypedRows, TypedTable, default_value, fillable};
+pub use typed_rows::{TypedRows, TypedTable, default_value};

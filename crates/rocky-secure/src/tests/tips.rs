@@ -1004,14 +1004,12 @@ async fn backward_bookmark_close_and_move_roll_back_together_then_hold_abandoned
 }
 
 #[tokio::test]
-async fn offline_across_close_is_held_and_relayed_unchanged_by_every_holder_and_reauthoring_converges()
- {
+async fn offline_across_close_is_held_and_relayed_unchanged_by_every_holder() {
     let f = Fixture::new();
     let dir = TempDir::new().unwrap();
     let identity = PrivateKey::new();
     let (a_key, b_key, c_key) = (PrivateKey::new(), PrivateKey::new(), PrivateKey::new());
-    let (a, identity_chain) =
-        identity_replica(&f, &dir.path().join("a.db"), &identity, &a_key).await;
+    let (a, _) = identity_replica(&f, &dir.path().join("a.db"), &identity, &a_key).await;
     let b = open(&f, &dir.path().join("b.db"), &b_key).await;
     let c = open(&f, &dir.path().join("c.db"), &c_key).await;
     main(&f, &a).await;
@@ -1070,47 +1068,6 @@ async fn offline_across_close_is_held_and_relayed_unchanged_by_every_holder_and_
         assert_eq!(offered.len(), 1);
         assert_eq!(offered[0].to_bytes().unwrap(), offline.to_bytes().unwrap());
         assert!(replica.snapshot(f.public).await.unwrap().rows.is_empty());
-    }
-    let node = PrivateKey::new();
-    a.register_line_node(LineNode {
-        credentials: identity_chain
-            .complete(&identity, node.public_key(), 2)
-            .unwrap(),
-        key: node,
-    })
-    .await
-    .unwrap();
-    let held = a.held_changes().await.unwrap()[0].id;
-    let reauthored = {
-        let mut inner = a.inner.lock(crate::replica::Class::Background).await;
-        let writes = vec![rocky_core::RowWrite::changed(change(
-            f.public,
-            2,
-            None,
-            Some(f.app().name("Offline held")),
-        ))];
-        transaction!(inner, |inner| inner
-            .author_bundle_reauthoring(
-                [2; 32],
-                rocky_core::commitment("tip-test.reauthor", &held),
-                &writes,
-                now().unwrap(),
-                held
-            )
-            .await)
-        .unwrap()
-        .remove(0)
-    };
-    assert_ne!(reauthored.id().unwrap(), offline.id().unwrap());
-    for replica in [&b, &c] {
-        replica.receive(reauthored.clone()).await.unwrap();
-    }
-    let expected = a.snapshot(f.public).await.unwrap().rows;
-    assert_eq!(expected.len(), 1);
-    assert_eq!(b.snapshot(f.public).await.unwrap().rows, expected);
-    assert_eq!(c.snapshot(f.public).await.unwrap().rows, expected);
-    for replica in [&a, &b, &c] {
-        assert!(replica.held_changes().await.unwrap().is_empty());
     }
 }
 

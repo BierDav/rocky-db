@@ -91,4 +91,4 @@ private class Secrets(private val onCallerThread: () -> Boolean) : NativeSecretS
 
 /** The starter's iroh on loopback: no relay, lookup or discovery. */
 private const val LOOPBACK = """{"kind":"iroh","relay":"disabled","lookup":"disabled","topic":false,"local":false,"bind":"127.0.0.1:0"}"""
-private const val SCHEMA = """{"application":"binding","version":1,"format":6,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}]}"""
+private const val SCHEMA = """{"application":"binding","version":1,"format":6,"tables":[{"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}]}"""

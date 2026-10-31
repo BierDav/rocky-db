@@ -25,40 +25,24 @@ impl Domain {
         mesh: MeshId,
         domain: DomainId,
     ) -> Result<Self, Failure> {
-        Self::at(
-            schema,
-            publisher,
-            mesh,
-            domain,
-            schema.version,
-            &BTreeSet::new(),
-        )
+        Self::at(schema, publisher, mesh, domain, schema.version)
     }
-    /// The domain at schema generation `generation`, where `added` holds
-    /// the field ids transitions added to, or required of, tables that
-    /// existed before them; ids this schema no longer holds are ignored.
-    /// See `docs/runtime/generations.md`.
+    /// The domain at schema generation `generation`.
     pub fn at(
         schema: &Schema,
         publisher: [u8; 32],
         mesh: MeshId,
         domain: DomainId,
         generation: u32,
-        added: &BTreeSet<Commitment>,
     ) -> Result<Self, Failure> {
         let logical = logical(schema, publisher)?;
-        let added = rocky_core::fillable(&logical)
-            .intersection(added)
-            .copied()
-            .collect();
         let scope = Scope {
             mesh,
             app: logical.app_id(),
             domain,
         };
         // Reference-connected tables share the phase-12 reader scope. Table grants
-        // and encryption keys remain separate ResourceScopes. A reference to a
-        // table with an existence log may cross scopes (`docs/runtime/existence-logs.md`).
+        // and encryption keys remain separate ResourceScopes.
         let mut readers: BTreeMap<String, String> = logical
             .tables
             .iter()
@@ -67,11 +51,7 @@ impl Domain {
         loop {
             let mut changed = false;
             for table in &logical.tables {
-                for key in table.foreign_keys.iter().filter(|key| {
-                    logical
-                        .table(&key.table)
-                        .is_none_or(|parent| !parent.existence_log)
-                }) {
+                for key in &table.foreign_keys {
                     let left = readers
                         .get(&table.sql_name)
                         .ok_or("missing child reader scope")?
@@ -114,7 +94,7 @@ impl Domain {
             })
             .collect();
         Ok(Self {
-            app: TypedRows::new(logical, vec![domain])?.at_generation(generation, added)?,
+            app: TypedRows::new(logical, vec![domain])?.at_generation(generation)?,
             scope,
             tables,
             granted_like: schema.granted_like(),
@@ -363,7 +343,7 @@ pub(crate) fn logical(schema: &Schema, publisher: [u8; 32]) -> Result<LogicalSch
 pub(crate) fn registry_table() -> Result<rocky_core::TableDefinition, Failure> {
     Ok(serde_json::from_value(serde_json::json!({
         "name": REGISTRY,
-        "class": "mergeable",
+        "class": "replayed",
         "columns": [
             {"name": "node", "type": "text", "not_null": true},
             {"name": "entry", "type": "text", "not_null": true},
@@ -379,7 +359,7 @@ mod tests {
     use rocky_core::Affinity;
     #[test]
     fn typed_app_and_sdk_definitions_refuse_historical_formats() {
-        let json = r#"{"format":6,"application":"refusal","version":1,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"title","type":"text"}],"primary_key":["id"]}]}"#;
+        let json = r#"{"format":6,"application":"refusal","version":1,"tables":[{"name":"items","class":"replayed","columns":[{"name":"title","type":"text"}],"primary_key":["id"]}]}"#;
         // The portable builder supplies both required columns.
         let mut definition = Schema::parse(json).unwrap().definition([1; 32]).unwrap();
         let descriptor = definition.build().unwrap();
@@ -398,10 +378,13 @@ mod tests {
             assert!(error.contains("unsupported schema"), "{error}");
         }
         assert_eq!(descriptor.format, rocky_core::LOGICAL_SCHEMA_FORMAT);
-        for format in [0, 1, 2, 3, 4, 6, 7] {
+        for format in [0, 1, 2, 3, 4, 5, 7] {
             let mut old = descriptor.clone();
             old.format = format;
-            let error = crate::TypedApp::new(old, &[]).err().unwrap().to_string();
+            let error = rocky_core::TypedRows::new(old, vec![])
+                .err()
+                .unwrap()
+                .to_string();
             assert!(error.contains("unsupported schema"), "{error}");
         }
     }
@@ -410,7 +393,7 @@ mod tests {
     fn definition_tables_keep_keys_indexes_and_scalar_types() -> Result<(), Failure> {
         let schema = Schema::parse(
             r#"{"format":6,"application":"measurements","version":1,"tables":[{
-            "name":"samples","class":"mergeable",
+            "name":"samples","class":"replayed",
             "columns":[{"name":"sensor","type":"text","not_null":true},
                        {"name":"sequence","type":"integer","not_null":true},
                        {"name":"reading","type":"real"},{"name":"raw","type":"blob"}],
@@ -434,7 +417,7 @@ mod tests {
         assert_eq!(table.column("raw").ok_or("raw")?.affinity, Affinity::Blob);
         assert!(table.indexes[0].create_sql.contains("\"reading\" DESC"));
         assert_eq!(logical, &super::logical(&schema, [9; 32])?);
-        logical.supported_on(rocky_core::Profile::Trusted)?;
+        logical.supported_on(rocky_core::Profile::Secure)?;
         logical.supported_on(rocky_core::Profile::Secure)?;
         assert_eq!(schema.names(), ["samples"]);
         Ok(())
@@ -444,11 +427,11 @@ mod tests {
     fn identity_references_share_readers_but_keep_table_resources() -> Result<(), Failure> {
         let schema = Schema::parse(
             r#"{"format":6,"application":"references","version":1,"tables":[
-            {"name":"parents","class":"mergeable","columns":[{"name":"next","type":"integer"}],"primary_key":["id"],
+            {"name":"parents","class":"replayed","columns":[{"name":"next","type":"integer"}],"primary_key":["id"],
              "foreign_keys":[{"columns":["next"],"table":"children","on_delete":"set_null"}]},
-            {"name":"children","class":"mergeable","columns":[{"name":"parent","type":"integer"}],"primary_key":["id"],
+            {"name":"children","class":"replayed","columns":[{"name":"parent","type":"integer"}],"primary_key":["id"],
              "foreign_keys":[{"columns":["parent"],"table":"parents","on_delete":"cascade"}]},
-            {"name":"other","class":"mergeable","columns":[{"name":"title","type":"text"}],"primary_key":["id"]}
+            {"name":"other","class":"replayed","columns":[{"name":"title","type":"text"}],"primary_key":["id"]}
         ]}"#,
         )?;
         let domain = Domain::new(&schema, [9; 32], MeshId([1; 16]), DomainId([2; 16]))?;
@@ -475,43 +458,12 @@ mod tests {
     }
 
     #[test]
-    fn references_to_an_existence_log_keep_their_reader_scopes() -> Result<(), Failure> {
-        let schema = Schema::parse(
-            r#"{"format":6,"application":"logs","version":1,"tables":[
-            {"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text"}],"primary_key":["id"],"existence_log":true},
-            {"name":"items","class":"mergeable","columns":[{"name":"list","type":"integer","not_null":true}],"primary_key":["id"],
-             "foreign_keys":[{"columns":["list"],"table":"lists","on_delete":"cascade"}]}
-        ]}"#,
-        )?;
-        let domain = Domain::new(&schema, [9; 32], MeshId([1; 16]), DomainId([2; 16]))?;
-        let resources: BTreeMap<_, _> = domain.scopes().collect();
-        assert_eq!(
-            resources.get("items").ok_or("items")?.encryption,
-            rocky_core::commitment("rocky.sdk.readers.v1", b"items")
-        );
-        assert_eq!(
-            resources.get("lists").ok_or("lists")?.encryption,
-            rocky_core::commitment("rocky.sdk.readers.v1", b"lists")
-        );
-        let logical = domain.logical();
-        assert_eq!(
-            logical
-                .existence_tables()
-                .map(|table| table.sql_name.as_str())
-                .collect::<Vec<_>>(),
-            ["lists"]
-        );
-        logical.supported_on(rocky_core::Profile::Secure)?;
-        Ok(())
-    }
-
-    #[test]
     fn removed_command_definitions_are_refused() {
         let json = r#"{"format":6,"application":"market","version":1,"tables":[{"name":"stock","class":"command_controlled","columns":[{"name":"item","type":"text","not_null":true}],"primary_key":["item"]}]}"#;
         assert!(Schema::parse(json).is_err());
         let confirmed = json.replace("command_controlled", "confirmed_read_only");
         assert!(Schema::parse(&confirmed).is_err());
-        let ordinary = json.replace("command_controlled", "mergeable");
+        let ordinary = json.replace("command_controlled", "replayed");
         assert!(Schema::parse(&ordinary).is_ok());
         let commands = ordinary.replace(
             "\"version\":1",

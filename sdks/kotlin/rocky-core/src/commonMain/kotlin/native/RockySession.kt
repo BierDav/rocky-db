@@ -63,13 +63,7 @@ open class RockySession internal constructor(private val nativeSession: NativeDa
      */
     suspend fun <T> reauthor(id: String, handle: String = newMutationHandle(), block: suspend SqlWrite.() -> T): T = transaction(handle, id, block)
 
-    /**
-     * Runs `block` as a coordinated write: it reads this device's committed state, and the commit returns once every
-     * trusted device of the in-sync set stored it. Needs a coordinated log; see [CoordinatedSql] and `coordinated`.
-     */
-    suspend fun <T> coordinated(handle: String = newMutationHandle(), block: suspend CoordinatedSql.() -> T): CoordinatedCommit<T> = writing.withLock { client.coordinated(handleBytes(handle), block) }
-
-    /** This device's position on its domain's coordinated log, after deciding what it stores. */
+    /** Whether this device is a trusted node of its domain's coordinated logs, and the tip it follows. */
     suspend fun coordinatedStatus(): CoordinatedStatus = client.coordinatedStatus()
 
     private suspend fun <T> transaction(handle: String, reauthors: String?, block: suspend SqlWrite.() -> T): T = writing.withLock {
@@ -94,18 +88,6 @@ open class RockySession internal constructor(private val nativeSession: NativeDa
             // Fails harmlessly when the transaction already ended.
             withContext(NonCancellable) { runCatching { client.sql("ROLLBACK") } }
             throw error
-        }
-    }
-
-    /**
-     * Commits related SQL and a move as one bundle. [changes] records statements before any work starts;
-     * it may delete cascade children or edit other rows, but cannot edit a row carried by the move.
-     * Reusing [handle] with the same commands returns the original result without executing them again.
-     */
-    suspend fun moveRow(handle: String, table: String, id: Long, from: List<Any?>, to: List<Any?>, changes: SqlChanges.() -> Unit = {}): JsonObject {
-        val statements = SqlChanges().apply(changes).json()
-        return writing.withLock {
-            client.moveRow(handleBytes(handle), table, id.toString(), JsonArray(from.map(::cell)), JsonArray(to.map(::cell)), statements)
         }
     }
 

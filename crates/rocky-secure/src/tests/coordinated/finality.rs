@@ -24,7 +24,7 @@ async fn trusted(fixture: &Fixture, name: &str) -> (PrivateKey, Replica) {
 }
 
 #[tokio::test]
-async fn a_seal_its_log_committed_becomes_final_and_beats_a_later_owner_seal() {
+async fn a_seal_its_log_ended_becomes_final_and_beats_a_later_owner_seal() {
     let fixture = Fixture::new(1).await;
     let alice = &fixture.alice;
     super::seals::follow_main(&fixture).await;
@@ -48,7 +48,6 @@ async fn a_seal_its_log_committed_becomes_final_and_beats_a_later_owner_seal() {
     for node in [&tess, &tom] {
         join_main(&fixture, node).await;
     }
-    fixture.invoice(alice, "before").await;
     let committed = seal(&fixture.lineage, &alice.1, main.tip).await;
     let next = committed.successor().unwrap().unwrap();
     // An owner seal of the same tip with a lower digest, which the log
@@ -68,24 +67,10 @@ async fn a_seal_its_log_committed_becomes_final_and_beats_a_later_owner_seal() {
         TipStatement::Seal(committed.clone()),
         bookmark(&fixture.lineage, "main", Some(main.tip), Some(next)),
     ];
-    // Tess follows `main` outside its in-sync set: without peers she can
-    // neither catch up nor end its log, and nothing changes.
+    // Tess ends `main`'s log with the seal.
+    tess.1.publish_tip_statements(&statements).await.unwrap();
     let head = fixture.mesh.log.head(main).unwrap();
-    assert!(!head.member(tess.0.public_key()));
-    let error = tess
-        .1
-        .publish_tip_statements(&statements)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("behind:"), "{error}");
-    assert_eq!(fixture.mesh.log.head(main).unwrap(), head);
-    // Through them she catches up, joins and seals.
-    tess.1
-        .publish_tip_statements_through(&statements, &fixture.mesh.peers(&fixture.lineage, &tess.0))
-        .await
-        .unwrap();
-    assert_eq!(tess.1.coordinated_status(main).await.unwrap().position, 1);
-    assert_eq!(tom.1.coordinated_status(main).await.unwrap().position, 0);
+    assert_eq!(head.terminal.unwrap().digest, committed.id().unwrap());
     // A member learns the rival first: by digest it wins there.
     let key = PrivateKey::new();
     let carol = open(&fixture.lineage, &fixture.dir, "carol", &key).await;
@@ -138,8 +123,8 @@ async fn a_seal_its_log_committed_becomes_final_and_beats_a_later_owner_seal() {
         .unwrap();
     let graph = tom.1.tip_graph(fixture.lineage.domain).await.unwrap();
     assert_eq!(graph.seal(main.tip).unwrap(), Some(&committed));
-    // The writer holds every frame through the final seal: it compacts
-    // there at once, whatever count of seals it leaves uncompacted.
+    // A node holding every frame through the final seal compacts there at
+    // once, whatever count of seals it leaves uncompacted.
     share(&tom.1, &alice.1).await;
     let report = alice.1.compact(fixture.lineage.domain, 5).await.unwrap();
     assert_eq!(report.waiting, None);

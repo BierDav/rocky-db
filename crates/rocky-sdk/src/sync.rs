@@ -657,11 +657,6 @@ async fn rows_scope(
             }
         }
         if !exhausted {
-            for scope in replica.existence_scopes().await? {
-                if scopes.contains(&scope) {
-                    session.sync_existence(replica, scope).await?;
-                }
-            }
             return Ok(session);
         }
         session.close().await?;

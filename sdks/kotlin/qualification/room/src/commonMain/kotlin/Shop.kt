@@ -5,10 +5,10 @@ import kotlinx.coroutines.flow.Flow
 
 /**
  * The ordinary Room surface the driver is qualified on: entities, a relation and every DAO write kind. Each entity
- * carries Rocky's `id` and `row_kind`; with a natural key it also declares the identity index Rocky creates.
+ * carries Rocky's `id`; with a natural key it also declares the identity index Rocky creates.
  */
 @Entity(tableName = "lists", indices = [Index(value = ["id"], unique = true, name = "lists_identity")])
-data class ShopList(@PrimaryKey val key: String, val title: String, val id: Long = 0, @ColumnInfo(name = "row_kind") val rowKind: Long = 0)
+data class ShopList(@PrimaryKey val key: String, val title: String, val id: Long = 0)
 
 @Entity(
     tableName = "items",
@@ -23,7 +23,6 @@ data class ShopItem(
     val price: Double? = null,
     val photo: ByteArray? = null,
     val id: Long = 0,
-    @ColumnInfo(name = "row_kind") val rowKind: Long = 0,
 ) {
     override fun equals(other: Any?): Boolean = other is ShopItem &&
         key == other.key &&
@@ -33,8 +32,7 @@ data class ShopItem(
         quantity == other.quantity &&
         price == other.price &&
         photo.contentEquals(other.photo) &&
-        id == other.id &&
-        rowKind == other.rowKind
+        id == other.id
     override fun hashCode(): Int = key.hashCode()
 }
 

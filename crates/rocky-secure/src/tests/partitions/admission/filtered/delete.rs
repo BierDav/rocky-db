@@ -1,7 +1,7 @@
 //! Deleting a business key stays within its concrete partition after an additive switch.
 use super::*;
 use crate::sql::SqlOptions;
-use rocky_core::{Affinity, Collation, ColumnClass, LogicalColumn};
+use rocky_core::{Affinity, Collation, ColumnClass, LogicalColumn, RowApplication};
 
 async fn insert(
     replica: &EncryptedReplica<TypedRows>,
@@ -61,8 +61,25 @@ async fn b_rows(replica: &EncryptedReplica<TypedRows>, f: &Fixture) -> Vec<Vec<S
 async fn an_additive_sql_delete_covers_both_live_ids_and_preserves_the_other_partition() {
     let dir = TempDir::new().unwrap();
     let f = Fixture::build_with(true, PrivateKey::from_bytes(&[210; 32]));
-    let a = keyed(&f, &dir.path().join("a"), [211; 32], 1).await;
-    let b = keyed(&f, &dir.path().join("b"), [212; 32], 2).await;
+    let mut schema = f.schema.clone();
+    let table = &mut schema.tables[0];
+    table.columns.push(LogicalColumn {
+        sql_name: "rank".into(),
+        affinity: Affinity::Integer,
+        not_null: false,
+        default: None,
+        collation: Collation::Binary,
+        class: ColumnClass::Replicated,
+    });
+    table.create_sql = table
+        .create_sql
+        .replace(", PRIMARY KEY", ", \"rank\" INTEGER, PRIMARY KEY");
+    // The authors may write the column the switch adds, so their earlier
+    // transactions replay under the new schema too.
+    let mut grant = f.grant(None, &all());
+    grant.fields = rocky_core::FieldSelection::All;
+    let a = keyed(&f, &dir.path().join("a"), [211; 32], 1, grant.clone()).await;
+    let b = keyed(&f, &dir.path().join("b"), [212; 32], 2, grant).await;
     insert(&a, &f, "A", "first", 149).await;
     insert(&a, &f, "B", "unrelated partition", 150).await;
     let concurrent = insert(&b, &f, "A", "second", 151).await;
@@ -77,22 +94,9 @@ async fn an_additive_sql_delete_covers_both_live_ids_and_preserves_the_other_par
     {
         b.receive(frame).await.unwrap();
     }
-    let mut schema = f.schema.clone();
-    let table = &mut schema.tables[0];
-    table.columns.push(LogicalColumn {
-        sql_name: "rank".into(),
-        affinity: Affinity::Integer,
-        not_null: false,
-        default: None,
-        collation: Collation::Binary,
-        class: ColumnClass::Mergeable,
-    });
-    table.create_sql = table
-        .create_sql
-        .replace(", PRIMARY KEY", ", \"rank\" INTEGER, PRIMARY KEY");
     let app = TypedRows::new(schema.clone(), vec![f.domain.domain])
         .unwrap()
-        .at_generation(2, BTreeSet::new())
+        .at_generation(2)
         .unwrap();
     let source = a.followed_tip().await;
     let seal = SignedSeal::sign(
@@ -150,31 +154,11 @@ async fn an_additive_sql_delete_covers_both_live_ids_and_preserves_the_other_par
         .committed
         .unwrap()
         .frames;
-    let mut identities = BTreeSet::new();
-    let mut count = 0;
-    for frame in &deletion {
-        assert_eq!(frame.scope().unwrap(), f.scope("A"));
-        let operation = frame.operation_ref().unwrap();
-        let plaintext = crate::wire::decrypt(
-            &[1; 32],
-            &encode(&operation.header.extensions).unwrap(),
-            frame.body_bytes(),
-        )
-        .unwrap();
-        for write in crate::wire::RowPayload::decode_test(&plaintext, frame, &app)
-            .unwrap()
-            .into_writes()
-        {
-            count += 1;
-            assert!(
-                write.change.after.is_none()
-                    && write.change.before.is_some()
-                    && write.assigned.is_empty()
-            );
-            identities.insert(app.row_identity(&write.change).unwrap().unwrap());
-        }
-    }
-    assert_eq!((count, identities.len()), (2, 2));
+    // One intent frame, of partition A only, deletes both live ids.
+    let [frame] = deletion.as_slice() else {
+        panic!("{deletion:?}")
+    };
+    assert_eq!(frame.scope().unwrap(), f.scope("A"));
     for frame in deletion {
         b.receive(frame).await.unwrap();
     }

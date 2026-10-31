@@ -602,7 +602,6 @@ impl Handle {
             binding: admission.binding,
             proved: admission.proved.clone(),
             offered: admission.offered.clone(),
-            entry: None,
             tip_incoming: Vec::new(),
             #[cfg(test)]
             sent_counts: SentCounts::default(),

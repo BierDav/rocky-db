@@ -19,6 +19,14 @@ const KEPT: [(&str, &str); 3] = [
     ("secure_rebootstrap_stubs", "secure_pulled_stubs"),
     ("secure_rebootstrap_pages", "secure_pulled_pages"),
 ];
+/// `KEPT` for a scope; a replayed scope stages row images instead.
+fn kept(replayed: bool) -> [(&'static str, &'static str); 3] {
+    let mut kept = KEPT;
+    if replayed {
+        kept[0].0 = "secure_replayed_staged";
+    }
+    kept
+}
 
 impl<A: RowApplication> EncryptedReplica<A> {
     /// Asks the next sync sessions to pull `seal`'s state from peers that
@@ -212,7 +220,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
                         ]),
                     )
                     .await?;
-                for (staged, kept) in KEPT {
+                for (staged, kept) in kept(inner.replayed_scope(scope)) {
                     inner
                         .conn
                         .execute(
@@ -409,7 +417,7 @@ impl<A: RowApplication> Inner<A> {
         if self.staging(id).await?.is_some() {
             return Ok(PulledInstall::Deferred);
         }
-        for (staged, kept) in KEPT {
+        for (staged, kept) in kept(self.replayed_scope(scope)) {
             self.conn
                 .execute(
                     format!("INSERT INTO {staged} SELECT * FROM {kept} WHERE scope=?"),

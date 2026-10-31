@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "f4cb1cb141bc9ac14fae3feed1c18505",
+    "identityHash": "0b1045b8ca8891b8bb4cc2cac7d8542d",
     "entities": [
       {
         "tableName": "stock",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`item` TEXT NOT NULL, `remaining` INTEGER NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`item`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`item` TEXT NOT NULL, `remaining` INTEGER NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`item`))",
         "fields": [
           {
             "fieldPath": "item",
@@ -23,12 +23,6 @@
           {
             "fieldPath": "id",
             "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
             "affinity": "INTEGER",
             "notNull": true
           }
@@ -53,7 +47,7 @@
       },
       {
         "tableName": "holds",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `item` TEXT NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`key`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `item` TEXT NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`key`))",
         "fields": [
           {
             "fieldPath": "key",
@@ -70,12 +64,6 @@
           {
             "fieldPath": "id",
             "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
             "affinity": "INTEGER",
             "notNull": true
           }
@@ -101,7 +89,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'f4cb1cb141bc9ac14fae3feed1c18505')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '0b1045b8ca8891b8bb4cc2cac7d8542d')"
     ]
   }
 }

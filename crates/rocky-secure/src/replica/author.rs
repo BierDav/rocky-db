@@ -1,25 +1,5 @@
 use super::*;
 
-#[cfg(test)]
-struct PayloadOpeningTrace(Option<Hash>);
-#[cfg(test)]
-impl PayloadOpeningTrace {
-    fn start(frame: &EncryptedFrame, hash: Hash) -> Self {
-        crate::AUTHOR_PAYLOAD_TRACE.with(|trace| {
-            if let Some(trace) = trace.borrow_mut().as_mut() {
-                trace.push((frame.clone(), 0));
-            }
-        });
-        Self(crate::AUTHOR_PAYLOAD_FRAME.with(|active| active.replace(Some(hash))))
-    }
-}
-#[cfg(test)]
-impl Drop for PayloadOpeningTrace {
-    fn drop(&mut self) {
-        crate::AUTHOR_PAYLOAD_FRAME.with(|active| active.set(self.0));
-    }
-}
-
 impl<A: RowApplication> Inner<A> {
     pub(super) async fn author_transaction(
         &mut self,
@@ -216,41 +196,15 @@ impl<A: RowApplication> Inner<A> {
         let finalized = self.seal_finalized(scope).await?;
         let mut witnesses = BTreeMap::new();
         let mut previous: BTreeSet<Hash> = dependencies.iter().copied().collect();
-        // Rows a finalized seal dropped that the commit leaves untouched.
-        let mut absent = BTreeSet::new();
         for change in writes.iter().map(|write| &write.change) {
             let held = self
                 .row(scope, self.storage_row(change)?)
                 .await?
                 .and_then(|record| (!record.deleted).then_some(record.fields));
-            let equal = if held == change.before {
-                true
-            } else if let (Some(typed), Some(held), Some(before)) =
-                (&self.workspace.typed, &held, &change.before)
-            {
-                let table = typed
-                    .rows
-                    .table(&change.scope.table)
-                    .ok_or_else(|| denied("unknown typed table"))?;
-                typed
-                    .rows
-                    .values(table, held)
-                    .map_err(|error| denied(&error))?
-                    == typed
-                        .rows
-                        .values(table, before)
-                        .map_err(|error| denied(&error))?
-            } else {
-                false
-            };
-            if !equal && !(finalized && held.is_none() && change.before.is_some()) {
+            // A finalized seal may have dropped a row the commit leaves untouched.
+            if held != change.before && !(finalized && held.is_none() && change.before.is_some()) {
                 return Err(Error::Conflict);
             }
-            if finalized && held.is_none() && change.before.is_some() {
-                absent.insert(change.row);
-            }
-            // A local write passes every merged row its constraints compare with.
-            clock = clock.max(self.constraint_clock(change).await?);
             if let Some(row) = self.row(scope, self.storage_row(change)?).await? {
                 previous.insert(row.creation);
                 witnesses.insert(self.storage_row(change)?, *row.creation.as_bytes());
@@ -319,23 +273,9 @@ impl<A: RowApplication> Inner<A> {
                 );
             }
         }
-        let logged = |writes: &[RowWrite]| {
-            writes
-                .iter()
-                .filter(|write| {
-                    write.change.before.is_some() != write.change.after.is_some()
-                        && !absent.contains(&write.change.row)
-                })
-                .count()
-        };
-        let existence = match self.existence_table(scope) {
-            true => logged(writes),
-            false => 0,
-        };
         let frame = author(
             signing_key,
             Extensions {
-                existence: u32::try_from(existence).map_err(|_| denied("mutation quota"))?,
                 author: signer.map(|author| author.number),
                 author_sequence,
                 row_format: ROW_FORMAT,
@@ -364,8 +304,6 @@ impl<A: RowApplication> Inner<A> {
         )?;
         self.verify_frame(&frame, time)?;
         let operation = frame.operation_ref()?;
-        #[cfg(test)]
-        let payload_trace = PayloadOpeningTrace::start(&frame, operation.hash);
         let apply::Materialization {
             rows: materialized,
             admission,
@@ -388,32 +326,9 @@ impl<A: RowApplication> Inner<A> {
                 &scope,
             )
             .await?;
-        // Liveness evidence commits with the rows, before they project.
-        let effective: Vec<_> = writes
-            .iter()
-            .filter(|write| {
-                materialized
-                    .iter()
-                    .any(|(change, ..)| change.row == write.change.row)
-            })
-            .cloned()
-            .collect();
-        // The header counts the records signed below; a write the commit
-        // did not apply would leave it wrong.
-        if existence != 0 && logged(&effective) != existence {
-            return Err(denied("a logged creation or deletion did not apply"));
-        }
-        Box::pin(self.author_existence(
-            scope,
-            &effective,
-            frame.operation_ref()?.header.extensions.author_sequence,
-        ))
-        .await?;
         self.write_materialized(&frame, materialized, admission, Some(opened.as_ref()))
             .await?;
         drop(opened);
-        #[cfg(test)]
-        drop(payload_trace);
         self.conn
             .execute(
                 "INSERT INTO secure_outbox VALUES(?)",
@@ -424,21 +339,5 @@ impl<A: RowApplication> Inner<A> {
         self.conn.execute("INSERT INTO secure_node_tips VALUES(?,?,?) ON CONFLICT(scope,node) DO UPDATE SET tip=excluded.tip", [encode(&scope.domain)?, signing_key.public_key().as_bytes().to_vec(), encode(&self.workspace.tip)?]).await?;
         self.record_key(key).await?;
         Ok(frame)
-    }
-}
-
-#[cfg(test)]
-impl<A: RowApplication> EncryptedReplica<A> {
-    pub(crate) async fn author_payload_for_test(
-        &self,
-        writes: &[RowWrite],
-        body: &[u8],
-    ) -> Result<EncryptedFrame, Error> {
-        let mut inner = self.inner.lock(crate::replica::Class::Background).await;
-        transaction!(inner, |inner| {
-            inner
-                .author_frame(writes, &[], now()?, |_| Ok(body.to_vec()))
-                .await
-        })
     }
 }

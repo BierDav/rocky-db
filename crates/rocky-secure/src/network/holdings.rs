@@ -294,17 +294,6 @@ impl NativeSession {
                 vec![signed.statement.scope]
             }
             Message::Checkpoints(CheckpointMessage::ArchivePage { page }) => vec![page.scope],
-            Message::Existence(message) => match message {
-                ExistenceMessage::BaseOffer { scope, .. }
-                | ExistenceMessage::BaseStage { scope, .. }
-                | ExistenceMessage::BaseFinish { scope }
-                | ExistenceMessage::BasePull { scope, .. }
-                | ExistenceMessage::Frontier { scope }
-                | ExistenceMessage::Pull { scope, .. }
-                | ExistenceMessage::Push { scope, .. } => vec![*scope],
-                ExistenceMessage::BaseBegin { attachment } => vec![attachment.scope],
-                _ => Vec::new(),
-            },
             _ => Vec::new(),
         };
         for scope in scopes {

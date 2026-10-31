@@ -18,8 +18,6 @@ pub(crate) use pulled::SCHEMA as PULLED_SCHEMA;
 mod served;
 pub(crate) use served::SCHEMA as SERVED_SCHEMA;
 pub(super) use served::Served;
-#[cfg(test)]
-mod replay_test_support;
 mod transfer;
 use super::*;
 
@@ -34,9 +32,7 @@ use p2panda_core::Signature;
 pub use prune::{PruneBlock, PruneReport};
 pub use transfer::{CheckpointPage, PrunedPage, RebootstrapReport};
 #[cfg(test)]
-pub(crate) use transfer::{
-    forge_page, forge_page_bindings, forge_page_clocks, forge_page_legend, page_header_count,
-};
+pub(crate) use transfer::{forge_page, forge_page_clocks, forge_page_legend};
 
 pub(crate) const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS secure_compaction_live_creations(scope INTEGER NOT NULL,hash BLOB NOT NULL,PRIMARY KEY(scope,hash)) WITHOUT ROWID",
@@ -82,12 +78,6 @@ pub(super) const SHARE_BASE: &str = "UPDATE secure_checkpoint_base SET fields=NU
 
 // Walk applied positions before testing row membership, so LIMIT bounds the work.
 pub(crate) const ROW_REPLAY_SQL: &str = "SELECT a.position,o.header,o.body,o.status FROM secure_applied a LEFT JOIN secure_operations o ON o.hash=a.hash WHERE a.scope=?1 AND a.position>?2 AND a.position<=?3 AND EXISTS(SELECT 1 FROM secure_row_positions p JOIN secure_finalization_rows r ON r.scope=p.scope AND r.row=p.row WHERE p.position=a.position AND p.scope=a.scope) ORDER BY a.position LIMIT ?4";
-
-pub(crate) fn seal_drop_rows(missing: &str) -> String {
-    format!(
-        "SELECT r.row,r.fields FROM secure_rows r WHERE r.scope=(SELECT id FROM secure_scope_state WHERE scope=?1) AND r.scope=?4 AND r.row>?2 AND (r.live=0 OR EXISTS(SELECT 1 FROM secure_seal_candidates c WHERE c.scope=r.scope AND c.row=r.row) OR EXISTS(SELECT 1 FROM secure_scope_shapes s WHERE s.scope=r.scope AND s.shape=r.shape AND ({missing}))) ORDER BY r.row LIMIT ?3"
-    )
-}
 
 /// Applied operations replayed, or pruned, per bounded step.
 #[cfg(not(test))]
@@ -1580,12 +1570,6 @@ impl<A: RowApplication> Inner<A> {
                     return Err(denied("replayed row differs from its partition"));
                 }
 
-                if current.is_none()
-                    && write.change.before.is_some()
-                    && self.abandoned_dependency(&operation.header).await?
-                {
-                    continue;
-                }
                 if finalized
                     && ((write.change.before.is_some() && current.is_none())
                         || (write.change.before.is_none() && current.is_some()))
@@ -1848,7 +1832,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
             None => return Ok(None),
         };
         drop(result);
-        inner.refuse_abandoned(hash).await?;
         Ok(Some(hash))
     }
     #[cfg(test)]

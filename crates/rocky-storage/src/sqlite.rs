@@ -422,12 +422,9 @@ pub struct Connection(
     Mutex<rusqlite::Connection>,
     std::sync::OnceLock<Hooks>,
     std::sync::OnceLock<Session>,
-    /// The session gate, shared with `SUPPORT_MAINTENANCE`.
+    /// The session gate.
     std::sync::Arc<Mutex<crate::capture::Gate>>,
 );
-/// The SQL function the generated support-row triggers call: true while
-/// the runtime's own statements run, false under a session's armed gate.
-pub const SUPPORT_MAINTENANCE: &str = "rocky_support_maintenance";
 /// The name prefix of the runtime's history triggers, which a session's
 /// statements fire.
 pub const HISTORY_TRIGGERS: &str = "secure_kept_";
@@ -457,19 +454,11 @@ impl Connection {
         raw.set_prepared_statement_cache_capacity(512);
         // Busy files are retried by whole transactions with bounded backoff.
         raw.busy_timeout(std::time::Duration::ZERO)?;
-        let gate: std::sync::Arc<Mutex<crate::capture::Gate>> = Default::default();
-        let armed = gate.clone();
-        raw.create_scalar_function(
-            SUPPORT_MAINTENANCE,
-            0,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-            move |_| Ok(armed.lock().map(|gate| !gate.armed()).unwrap_or(false)),
-        )?;
         Ok(Self(
             Mutex::new(raw),
             std::sync::OnceLock::new(),
             std::sync::OnceLock::new(),
-            gate,
+            Default::default(),
         ))
     }
     /// The connection's row tracker. The first call installs the engine hook

@@ -4,7 +4,7 @@
 use super::*;
 use rocky_core::TableClass;
 use rocky_core::replay::{BaseMark, IntentStatement};
-use rocky_storage::partition_sql::{SplitError, split_intent_within, written_table};
+use rocky_storage::partition_sql::{IntentRefusal, SplitError, split_intent_within, written_table};
 
 /// One partition's copy of a statement the transaction ran.
 #[derive(Clone, Debug)]
@@ -51,18 +51,38 @@ impl<A: RowApplication> Inner<A> {
         };
         let rules = self.partition_rules(None, status).await?;
         let conn = self.conn.connection();
-        let copies = split_intent_within(sql, params, &schema.views, &rules, limit, |read| {
+        let split = split_intent_within(sql, params, &schema.views, &rules, limit, |read| {
             conn.rows(&read.sql, storage::bindings(read.params.clone()))?
                 .into_iter()
                 .map(|row| row.into_iter().map(storage::sql_value).collect())
                 .collect::<Result<Vec<Vec<_>>, Error>>()
-        })
-        .map_err(|error| match error {
-            SplitError::Refused(refusal) => Error::Sql(SqlError::Unsupported(format!(
-                "a replayed write was refused: {refusal}"
-            ))),
-            SplitError::Evaluate(error) => error,
-        })?;
+        });
+        let copies = match split {
+            Ok(copies) => copies,
+            Err(SplitError::Evaluate(error)) => return Err(error),
+            Err(SplitError::Refused(refusal)) => {
+                // A table that waits names what it waits for.
+                if let IntentRefusal::Unavailable {
+                    table,
+                    reason: crate::sql::Unavailable::Incomplete,
+                } = &refusal
+                    && let Some(projected) = typed.by_name(table)
+                {
+                    let mut blocked = self.scope_blockers(projected.scope).await?;
+                    for scope in self
+                        .partitions
+                        .keys()
+                        .filter(|scope| scope.table == projected.table.id)
+                    {
+                        blocked.extend(self.scope_blockers(*scope).await?);
+                    }
+                    blockers::refuse(blocked)?;
+                }
+                return Err(Error::Sql(SqlError::Unsupported(format!(
+                    "a replayed write was refused: {refusal}"
+                ))));
+            }
+        };
         let logical = schema
             .table(&name)
             .ok_or_else(|| Error::Corrupt("replayed write target".into()))?;
@@ -199,7 +219,6 @@ impl<A: RowApplication> Inner<A> {
         let frame = author(
             signing_key,
             Extensions {
-                existence: 0,
                 author: Some(signer.number),
                 author_sequence,
                 row_format: ROW_FORMAT,
@@ -266,12 +285,35 @@ impl<A: RowApplication> Inner<A> {
         blockers::refuse(blocked)
     }
 
-    /// Per author, the last applied frame of the scope's log.
+    /// Per author, the last applied frame of the scope's log that the
+    /// workspace sees: frames of other lines are no base for this one.
     async fn applied_heads(
         &self,
         scope: ResourceScope,
     ) -> Result<Vec<(Hash, p2panda_core::Header<Extensions>)>, Error> {
-        let rows = collect_rows(
+        let corrupt = || Error::Corrupt("applied head".into());
+        let decoded = |row: &[SqlValue]| -> Result<(Hash, p2panda_core::Header<Extensions>), Error> {
+            let [SqlValue::Blob(hash), SqlValue::Blob(header)] = row else {
+                return Err(corrupt());
+            };
+            Ok((
+                Hash::try_from(hash.as_slice()).map_err(|_| corrupt())?,
+                decode(header)?,
+            ))
+        };
+        let graph = self.graph_for(scope.domain)?;
+        let visible = |header: &p2panda_core::Header<Extensions>| -> Result<bool, Error> {
+            let extension = &header.extensions;
+            self.visible_frame(
+                graph,
+                extension.tip,
+                extension.author.ok_or_else(corrupt)?,
+                extension.author_sequence,
+                self.workspace.tip,
+            )
+        };
+        let mut heads = Vec::new();
+        for row in collect_rows(
             self.conn
                 .query(
                     "SELECT o.hash,o.header FROM secure_operations o WHERE o.scope=? AND o.status='applied' AND o.sequence=(SELECT MAX(sequence) FROM secure_operations WHERE scope=o.scope AND author=o.author AND status='applied')",
@@ -279,19 +321,44 @@ impl<A: RowApplication> Inner<A> {
                 )
                 .await?,
         )
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                let [SqlValue::Blob(hash), SqlValue::Blob(header)] = row.as_slice() else {
-                    return Err(Error::Corrupt("applied head".into()));
-                };
-                Ok((
-                    Hash::try_from(hash.as_slice())
-                        .map_err(|_| Error::Corrupt("applied head".into()))?,
-                    decode(header)?,
-                ))
-            })
-            .collect()
+        .await?
+        {
+            let (hash, header) = decoded(&row)?;
+            if visible(&header)? {
+                heads.push((hash, header));
+                continue;
+            }
+            // An author's later frames on another line: its newest frame
+            // here, if any.
+            let mut before = header.seq_num as i64;
+            'author: loop {
+                let older = collect_rows(
+                    self.conn
+                        .query(
+                            "SELECT hash,header FROM secure_operations WHERE scope=? AND author=? AND status='applied' AND sequence<? ORDER BY sequence DESC LIMIT 64",
+                            bindings(vec![
+                                SqlValue::Blob(encode(&scope)?),
+                                SqlValue::Blob(header.public_key.as_bytes().to_vec()),
+                                SqlValue::Integer(before),
+                            ]),
+                        )
+                        .await?,
+                )
+                .await?;
+                if older.is_empty() {
+                    break;
+                }
+                for row in &older {
+                    let (hash, header) = decoded(row)?;
+                    before = header.seq_num as i64;
+                    if visible(&header)? {
+                        heads.push((hash, header));
+                        break 'author;
+                    }
+                }
+            }
+        }
+        Ok(heads)
     }
 }
 

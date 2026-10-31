@@ -10,7 +10,6 @@ kind(test)
     | (package(rocky-secure) & test(=replica::lock::tests::slow_holds_report_the_request_site_and_class))
     | (package(rocky-secure) & test(/^replica::checkpoint::backend_vectors::/))
     | (package(rocky-secure) & test(/^tests::/))
-    | (package(rocky-secure) & test(/^replica::coordinated::abandoned::tests::/))
     | (package(rocky-secure) & test(/^network::(holdings|contacts)::tests::/))
     | (package(rocky-secure) & test(/^network::link::integration_tests::/))
     | (package(rocky-secure) & test(/^network::budgets::/))
@@ -26,8 +25,7 @@ kind(test)
 
 [e2e]
 filter = '''
-(package(rocky-secure) & test(=tests::coordinated::recovery::regressions::collects_every_entry_across_the_real_hash_window_before_recovery_is_signed))
-    | (package(rocky-secure) & test(/^tests::partitions::replayed::convergence::(every_schedule_of_five|seeded_schedule_sweep)/))
+(package(rocky-secure) & test(/^tests::partitions::replayed::convergence::(every_schedule_of_five|seeded_schedule_sweep)/))
     | (package(rocky-secure) & test(/^tests::replayed_constraints::convergence::/))
     | (binary_id(rocky-coordinator::coordinated_log) & test(=coordinated_log_survives_leader_change_and_deadline_without_double_commit))
     | (package(rocky-sdk) & test(/^node::delivery_tests::(a_crash_|a_mailbox_refuses_at_both_bounds)/))
@@ -103,9 +101,7 @@ filter = '''
     | (binary_id(rocky-secure) & (
           test(=tests::checkpoint::process_exit_inside_any_checkpoint_step_leaves_a_file_that_opens_and_audits)
         | test(=tests::checkpoint::retained_bytes_trigger_checkpoints_and_pruning_then_backpressure)
-        | test(=tests::generations::a_local_plan_survives_an_interruption_at_every_step)
         | test(=tests::group::wal_stays_bounded_under_sustained_authoring)
-        | test(=tests::partition_foreign_keys::row_moves::process::six_scenarios_across_device_processes)
         | test(=tests::roles::a_far_behind_replica_catches_up_while_both_sides_keep_writing)
         | test(=tests::roles::a_sync_larger_than_a_session_continues_on_the_next)
         | test(=tests::roles::interrupted_transfers_resume_and_a_replacement_full_node_converges)

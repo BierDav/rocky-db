@@ -55,4 +55,19 @@ interface ShoppingDao {
 
     @Query("DELETE FROM items WHERE list = :list AND id = :id")
     suspend fun delete(list: Long, id: Long): Int
+
+    @Query("SELECT * FROM items WHERE list = :list AND id = :id")
+    suspend fun get(list: Long, id: Long): ShoppingItem?
+
+    /**
+     * Deletes the item from [from], with its category links, and inserts it at the end of [to] under a new id, in
+     * one transaction; returns that id, or null when [from] no longer holds the item.
+     */
+    @Transaction suspend fun move(from: Long, id: Long, to: Long): Long? {
+        val item = get(from, id) ?: return null
+        delete(from, id)
+        val moved = item.copy(list = to, category = null, id = nextId(to), position = Positions.between(lastPosition(to), null))
+        insert(moved)
+        return moved.id
+    }
 }

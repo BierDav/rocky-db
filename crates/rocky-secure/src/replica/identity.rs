@@ -618,6 +618,9 @@ impl<A: RowApplication> Inner<A> {
                             ledger.merge(birth.mark)?;
                         }
                     }
+                    for mark in self.replayed_births(frame.id()?).await? {
+                        ledger.merge(mark)?;
+                    }
                 }
             }
             if records.len() < 256 {
@@ -888,6 +891,11 @@ impl<A: RowApplication> Inner<A> {
                     }
                     marks.merge(birth.mark)?;
                 }
+                // A replayed member's own births, as its replay recorded them.
+                for mark in self.replayed_births(frame.id()?).await? {
+                    own.merge(mark.clone())?;
+                    marks.merge(mark)?;
+                }
             }
             if records.len() < 256 {
                 break;
@@ -905,6 +913,24 @@ impl<A: RowApplication> Inner<A> {
                 })
                 .collect(),
         ))
+    }
+    async fn replayed_births(&self, hash: Hash) -> Result<Vec<checkpoint::IdentityMark>, Error> {
+        match collect_rows(
+            self.conn
+                .query(
+                    "SELECT births FROM secure_replayed WHERE hash=? AND births IS NOT NULL",
+                    [hash.as_bytes().to_vec()],
+                )
+                .await?,
+        )
+        .await?
+        .first()
+        .map(Vec::as_slice)
+        {
+            Some([SqlValue::Blob(births)]) => decode(births),
+            Some(_) => Err(Error::Corrupt("replayed births".into())),
+            None => Ok(Vec::new()),
+        }
     }
     /// The identity marks of scope `id`'s state through applied position
     /// `through`, as a kept seal's replay starts from: a verified signed
@@ -967,6 +993,9 @@ impl<A: RowApplication> Inner<A> {
                     if !birth.carried {
                         ledger.merge(birth.mark)?;
                     }
+                }
+                for mark in self.replayed_births(frame.id()?).await? {
+                    ledger.merge(mark)?;
                 }
             }
             if records.len() < 256 {

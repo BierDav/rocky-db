@@ -6,7 +6,6 @@ use crate::{
     schema::Schema,
     secrets::Vault,
 };
-use std::collections::BTreeSet;
 
 pub(crate) fn migrates(schema: &Schema, from: u32) -> bool {
     schema
@@ -24,7 +23,6 @@ impl Settings {
             self.mesh,
             self.domain,
             self.generation,
-            &BTreeSet::new(),
         )?;
         if declared.manifest().hash() == self.domain()?.manifest().hash() {
             Ok(crate::DeclaredSchema::Current)

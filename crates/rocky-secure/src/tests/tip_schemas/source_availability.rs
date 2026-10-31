@@ -331,17 +331,7 @@ async fn a_missing_held_source_catalog_refuses_then_retries_its_exact_definition
         lineage.definition(4).hash()
     );
     target.receive_held_frames(frames.clone()).await.unwrap();
-    assert_eq!(target.held_changes().await.unwrap().len(), 1);
-    let (page, _) = target
-        .held_frame_page(
-            target_key.public_key(),
-            &lineage.credentials(4, &target_key),
-            lineage.scope("items"),
-            None,
-            MAX_SECURE_FRAME,
-        )
-        .await
-        .unwrap();
-    assert_eq!(page[0].to_bytes().unwrap(), frames[0].to_bytes().unwrap());
+    // An intent is held whole, with no rows to re-author.
+    assert!(target.held_changes().await.unwrap().is_empty());
     target.audit(lineage.scope("items")).await.unwrap();
 }

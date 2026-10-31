@@ -219,7 +219,18 @@ impl<A: RowApplication> Inner<A> {
     /// Marks `hashes` offered in a durable transaction before they leave
     /// the device; a push that fails midway still counts as sent.
     pub(crate) async fn offer(&mut self, hashes: &[Hash]) -> Result<(), Error> {
-        self.refuse_staged(hashes).await?;
+        for hash in hashes {
+            let mut found = self
+                .conn
+                .query(
+                    "SELECT 1 FROM secure_publication_unsent WHERE hash=?",
+                    [hash.as_bytes().to_vec()],
+                )
+                .await?;
+            if found.next().await?.is_some() {
+                return Err(denied("a publication still being authored is never sent"));
+            }
+        }
         let mut unoffered = Vec::new();
         for hash in hashes {
             let mut found = self
@@ -376,45 +387,14 @@ impl<A: RowApplication> Inner<A> {
                         })
                 })
         };
-        // Only a bundle whose every frame is unoffered can be held whole;
-        // the coordinated log decides an uncommitted entry.
-        let staged = self.staged().await?;
-        let mut bundles = whole_bundles(&frames);
-        bundles.retain(|_, members| {
-            !members
-                .iter()
-                .any(|index| staged.contains(&frames[*index].hash))
-        });
+        // Only a bundle whose every frame is unoffered can be held whole.
+        let bundles = whole_bundles(&frames);
         let held: BTreeSet<Vec<u8>> = bundles
             .iter()
             .filter(|(_, members)| members.iter().any(|index| touches(*index)))
             .map(|(bundle, _)| bundle.clone())
             .collect();
         self.void_closure(&frames, &bundles, held, true).await
-    }
-    /// Voids this device's unoffered bundle `transaction` inside the
-    /// caller's transaction, as an aborted coordinated entry is; unoffered
-    /// bundles that saw its effects are held, and with `hold` the bundle
-    /// itself, as a coordinated write a tip's close ended is. Fails when a
-    /// frame of it was offered.
-    pub(super) async fn void_bundle(
-        &self,
-        transaction: Commitment,
-        hold: bool,
-    ) -> Result<(), Error> {
-        let frames = self.unoffered().await?;
-        let bundles = whole_bundles(&frames);
-        if !bundles.contains_key(transaction.as_slice()) {
-            return Err(Error::Corrupt("a voided bundle was offered".into()));
-        }
-        self.void_closure(
-            &frames,
-            &bundles,
-            BTreeSet::from([transaction.to_vec()]),
-            hold,
-        )
-        .await?;
-        Ok(())
     }
     /// Voids `seeds` and every unoffered bundle that depends on one: their
     /// frames are deleted, void records signed and their kept scopes

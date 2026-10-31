@@ -7,8 +7,6 @@ use rocky_core::replay::IntentStatement;
 /// Frames of one bundle. Each frame holds at most `ROWS_PER_FRAME` rows of
 /// one scope, which bounds a bundle's rows.
 pub const MAX_BUNDLE_FRAMES: usize = 64;
-// A carry record names one bundle's frames.
-const _: () = assert!(rocky_credentials::MAX_CARRY_FRAMES == MAX_BUNDLE_FRAMES);
 pub const ROWS_PER_FRAME: usize = 32;
 pub const MAX_BUNDLE_ROWS: usize = MAX_BUNDLE_FRAMES * ROWS_PER_FRAME;
 /// Encoded writes of one bundle.
@@ -137,7 +135,6 @@ impl<A: RowApplication> Inner<A> {
         writes: &[RowWrite],
         dependencies: &[Hash],
         time: u64,
-        entry: Option<u64>,
     ) -> Result<Vec<EncryptedFrame>, Error> {
         Box::pin(self.author_bundle_carried(
             (handle, input),
@@ -145,7 +142,6 @@ impl<A: RowApplication> Inner<A> {
             dependencies,
             time,
             &BTreeMap::new(),
-            entry,
         ))
         .await
     }
@@ -157,7 +153,6 @@ impl<A: RowApplication> Inner<A> {
         dependencies: &[Hash],
         time: u64,
         carried: &BTreeMap<(ResourceScope, Commitment), moves::Carried>,
-        entry: Option<u64>,
     ) -> Result<Vec<EncryptedFrame>, Error> {
         Box::pin(self.author_bundle_resolving(
             (handle, input),
@@ -165,45 +160,23 @@ impl<A: RowApplication> Inner<A> {
             dependencies,
             time,
             carried,
-            (entry, None),
         ))
         .await
     }
-    pub(crate) async fn author_bundle_reauthoring(
-        &mut self,
-        handle: Commitment,
-        input: Commitment,
-        writes: &[RowWrite],
-        time: u64,
-        held: Commitment,
-    ) -> Result<Vec<EncryptedFrame>, Error> {
-        Box::pin(self.author_bundle_resolving(
-            (handle, input),
-            (writes, BTreeMap::new()),
-            &[],
-            time,
-            &BTreeMap::new(),
-            (None, Some(held)),
-        ))
-        .await
-    }
-    /// A SQL transaction's bundle: row frames for mergeable tables and one
-    /// intent frame per partition its replayed writes reached.
+    /// A SQL transaction's bundle: one intent frame per partition its
+    /// replayed writes reached.
     pub(super) async fn author_sql_bundle(
         &mut self,
         (handle, input): (Commitment, Commitment),
-        writes: &[RowWrite],
         intents: Intents,
         time: u64,
-        entry: Option<u64>,
     ) -> Result<Vec<EncryptedFrame>, Error> {
         Box::pin(self.author_bundle_resolving(
             (handle, input),
-            (writes, intents),
+            (&[], intents),
             &[],
             time,
             &BTreeMap::new(),
-            (entry, None),
         ))
         .await
     }
@@ -214,7 +187,6 @@ impl<A: RowApplication> Inner<A> {
         dependencies: &[Hash],
         time: u64,
         carried: &BTreeMap<(ResourceScope, Commitment), moves::Carried>,
-        (entry, reauthors): (Option<u64>, Option<Commitment>),
     ) -> Result<Vec<EncryptedFrame>, Error> {
         let mut births = BTreeMap::<Commitment, Vec<rocky_core::RowIdentity>>::new();
         for write in writes.iter().filter(|write| {
@@ -355,12 +327,11 @@ impl<A: RowApplication> Inner<A> {
                 transaction,
                 index: index as u16,
                 members: members.clone(),
-                entry,
             };
             let writes = match frame {
                 Frame::Rows(writes) => writes,
                 Frame::Intent(statements, undo) => {
-                    if !dependencies.is_empty() || reauthors.is_some() {
+                    if !dependencies.is_empty() {
                         return Err(denied("an intent names no dependencies"));
                     }
                     let recorded = (
@@ -410,17 +381,13 @@ impl<A: RowApplication> Inner<A> {
                     if sequence != opening.sequence {
                         return Err(Error::Corrupt("bundle sequence plan".into()));
                     }
-                    RowPayload::reauthor_body(
-                        RowPayload::bundle(membership, writes.clone())?,
-                        reauthors,
-                    )
+                    RowPayload::bundle(membership, writes.clone())
                 },
             ))
             .await?;
             authored.push(frame);
         }
         self.record_bundle(transaction, &authored).await?;
-        self.verify_sql_projection(&writes).await?;
         self.put_handle(&handle, &input, authored[0].id()?.as_bytes())
             .await?;
         for (index, frame) in authored.iter().enumerate() {
@@ -579,32 +546,13 @@ impl<A: RowApplication> Inner<A> {
     ) -> Result<Outcome, Error> {
         let author = trigger.header.public_key;
         let scope = trigger.header.extensions.scope;
-        // A coordinated write's frames sign their position in their tip's
-        // log; its author's carry record moves a carried write's.
-        let coordinate = self.coordinate_of(
-            trigger.hash,
-            author,
-            scope.domain,
-            trigger.header.extensions.tip,
-            membership.entry,
-        )?;
-        // A write the owner's recovery abandoned is held, never applied.
-        if let Some((log, position)) = coordinate
-            && self
-                .recovery(log)?
-                .is_some_and(|recovery| recovery.abandons(position))
-        {
-            let frame = self
-                .frame(trigger.hash)
-                .await?
-                .ok_or_else(|| denied("missing pending operation"))?;
-            return self.hold_abandoned(&frame, time).await;
-        }
         let required = match self.required_members(membership, scope, time).await {
             Ok(required) => required,
             Err(error) => {
                 self.reject(trigger.hash).await?;
-                return Ok(Outcome::Rejected(error.to_string()));
+                {
+                    return Ok(Outcome::Rejected(error.to_string()));
+                }
             }
         };
         let own = Opening {
@@ -671,16 +619,6 @@ impl<A: RowApplication> Inner<A> {
                 .reject_members(&hashes, "a bundle mixes intents and rows")
                 .await;
         }
-        let resolution = members
-            .first()
-            .and_then(|(_, payload, _)| payload.reauthors());
-        for (_, payload, _) in &members {
-            if payload.reauthors() != resolution {
-                return self
-                    .reject_members(&hashes, "bundle members disagree on held resolution")
-                    .await;
-            }
-        }
         self.conn.execute("SAVEPOINT bundle", ()).await?;
         let result = async {
             Box::pin(self.replay_members(&members, membership, time)).await?;
@@ -711,13 +649,6 @@ impl<A: RowApplication> Inner<A> {
         match result {
             Ok(()) => {
                 self.conn.execute("RELEASE bundle", ()).await?;
-                if let Some((log, position)) = coordinate {
-                    let ids = members
-                        .iter()
-                        .map(|(frame, _, _)| frame.id())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    self.record_entry_frames(log, position, &ids).await?;
-                }
                 Ok(Outcome::Applied)
             }
             Err(error) => {
@@ -959,8 +890,7 @@ impl<A: RowApplication> Inner<A> {
             Some(membership)
                 if usize::from(membership.index) == index
                     && membership.transaction == expected.transaction
-                    && membership.members == expected.members
-                    && membership.entry == expected.entry =>
+                    && membership.members == expected.members =>
             {
                 Ok(payload)
             }
@@ -985,64 +915,6 @@ impl<A: RowApplication> Inner<A> {
 }
 
 type BundleMember = (EncryptedFrame, RowPayload, Vec<rocky_core::ResourceGrant>);
-
-#[cfg(test)]
-impl<A: RowApplication> EncryptedReplica<A> {
-    pub(crate) async fn apply_ready_bundle_for_test(
-        &self,
-        frames: &[EncryptedFrame],
-    ) -> Result<String, Error> {
-        let time = now()?;
-        let mut inner = self.inner.lock(crate::replica::Class::Background).await;
-        transaction!(inner, |inner| {
-            let operation = frames[0].operation_ref()?;
-            let payload = match inner.row_payload(&frames[0]) {
-                Ok(payload) => payload,
-                Err(error) if frames.len() == 1 => {
-                    return match inner.apply_frame(&frames[0], time).await? {
-                        Outcome::Rejected(reason) => Ok(reason),
-                        _ => Err(error),
-                    };
-                }
-                Err(error) => return Err(error),
-            };
-            let membership = payload.membership().expect("bundle membership");
-            let hashes = frames
-                .iter()
-                .map(EncryptedFrame::id)
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            let required = inner
-                .required_members(membership, operation.header.extensions.scope, time)
-                .await?;
-            assert_eq!(required.len(), frames.len());
-            for (index, opening) in required {
-                let Member::Pending(frame) = inner
-                    .member(
-                        opening.author.unwrap_or(operation.header.public_key),
-                        &opening,
-                    )
-                    .await?
-                else {
-                    panic!("required pending member");
-                };
-                assert!(hashes.contains(&frame.id()?));
-                // Actual signature/authority, membership and chain/dependency gates.
-                assert!(
-                    inner
-                        .open_member(&frame, index, membership, &hashes, time)
-                        .await?
-                        .is_ok()
-                );
-            }
-            Ok(
-                match inner.apply_bundle(operation, membership, time).await? {
-                    Outcome::Rejected(reason) => reason,
-                    _ => panic!("expected bundle rejection"),
-                },
-            )
-        })
-    }
-}
 
 #[cfg(test)]
 mod tests {

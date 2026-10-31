@@ -169,6 +169,15 @@ fn policy(required: &[&PrivateKey], behind: &[&PrivateKey]) -> RetentionPolicy {
     }
 }
 
+async fn finalized_compacted<A: rocky_core::RowApplication>(
+    replica: &EncryptedReplica<A>,
+) -> Vec<Vec<SqlValue>> {
+    let inner = replica.inner.lock(crate::replica::Class::Background).await;
+    rows(&inner.conn, "SELECT compacted FROM secure_finalized")
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn a_base_at_a_seal_binds_the_scope_and_survives_a_failed_compaction() {
     let f = Fixture::new();
@@ -210,7 +219,16 @@ async fn a_base_at_a_seal_binds_the_scope_and_survives_a_failed_compaction() {
     replica.audit(f.public).await.unwrap();
     assert_eq!(all_rows(&f, &replica).await, expected);
     assert!(replica.checkpoint(f.public).await.is_err());
+    // The seal is marked compacted with its last scope: still pending.
+    assert_eq!(
+        finalized_compacted(&replica).await,
+        [vec![SqlValue::Integer(0)]]
+    );
     replica.compact(f.public.domain, 0).await.unwrap();
+    assert_eq!(
+        finalized_compacted(&replica).await,
+        [vec![SqlValue::Integer(1)]]
+    );
     let signed = replica.checkpoint(f.public).await.unwrap();
     let statement = &signed.statement;
     assert_eq!(signed.signer(), node.public_key());

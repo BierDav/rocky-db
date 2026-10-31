@@ -27,7 +27,7 @@ use voters::{service, starter};
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
-const SCHEMA: &str = r#"{"application":"counter","version":1,"format":6,"tables":[{"name":"counts","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"value","type":"integer","not_null":true}],"primary_key":["key"]}]}"#;
+const SCHEMA: &str = r#"{"application":"counter","version":1,"format":6,"tables":[{"name":"counts","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"value","type":"integer","not_null":true}],"primary_key":["key"]}]}"#;
 
 async fn call(
     session: &rocky_sdk::Session,
@@ -76,12 +76,7 @@ async fn a_registered_service_domain_commits_ordinary_rows_and_closes() -> Resul
     let registered = call(&session, &scope, register.clone()).await?;
     assert_eq!(registered["tenant"], tenant.public_key().to_hex());
     assert_eq!(call(&session, &scope, register).await?, registered);
-    call(
-        &session,
-        &scope,
-        json!({"type": "sql", "sql": "BEGIN", "coordinated": true}),
-    )
-    .await?;
+    call(&session, &scope, json!({"type": "sql", "sql": "BEGIN"})).await?;
     let id = call(
         &session,
         &scope,
@@ -99,10 +94,10 @@ async fn a_registered_service_domain_commits_ordinary_rows_and_closes() -> Resul
     let committed = call(
         &session,
         &scope,
-        json!({"type":"sql", "sql":"COMMIT", "coordinated":true, "handle":vec![2u8;32]}),
+        json!({"type":"sql", "sql":"COMMIT", "handle":vec![2u8;32]}),
     )
     .await?;
-    assert_eq!(committed["committed"]["position"], "1");
+    assert!(!committed["committed"].is_null());
     let usage = call(
         &session,
         &scope,
@@ -116,13 +111,6 @@ async fn a_registered_service_domain_commits_ordinary_rows_and_closes() -> Resul
         json!({"type":"coordination_close", "tenant":tenant.to_hex(), "id":vec![3u8;32]}),
     )
     .await?;
-    let refused = call(
-        &session,
-        &scope,
-        json!({"type":"sql", "sql":"BEGIN", "coordinated":true}),
-    )
-    .await;
-    assert!(refused.is_err());
     session.close().await;
     if let Some(network) = opened.network {
         network.close().await;

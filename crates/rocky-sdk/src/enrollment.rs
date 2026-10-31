@@ -824,7 +824,6 @@ impl Settings {
             self.mesh,
             self.domain,
             self.generation,
-            &BTreeSet::new(),
         )
     }
 
@@ -3927,10 +3926,8 @@ pub(crate) fn whole_partitions(
         .iter()
         .filter_map(|grant| {
             let table = logical.tables.iter().find(|table| {
-                matches!(
-                    table.class,
-                    rocky_core::TableClass::Mergeable | rocky_core::TableClass::Replayed
-                ) && logical.table_id(table) == grant.scope.table
+                table.class == rocky_core::TableClass::Replayed
+                    && logical.table_id(table) == grant.scope.table
             })?;
             if table.partition_by.is_empty() {
                 return None;

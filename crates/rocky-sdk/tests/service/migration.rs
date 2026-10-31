@@ -1,6 +1,6 @@
 use super::{fixture::*, inspection::*, *};
 
-const MIGRATING: &str = r#"{"application":"counter","version":2,"format":6,"tables":[{"name":"counts","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"value","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""}],"primary_key":["key"]}],"migrations":[{"version":2,"statements":["UPDATE counts SET position=key"]}]}"#;
+const MIGRATING: &str = r#"{"application":"counter","version":2,"format":6,"tables":[{"name":"counts","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"value","type":"integer","not_null":true},{"name":"position","type":"text","not_null":true,"default":""}],"primary_key":["key"]}],"migrations":[{"version":2,"statements":["UPDATE counts SET position=key"]}]}"#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_voters_release_a_private_migration_without_reopening_the_publisher()
@@ -8,12 +8,12 @@ async fn real_voters_release_a_private_migration_without_reopening_the_publisher
     let root = tempfile::tempdir()?;
     let (bundle, _admin) = service(root.path()).await?;
     let (a, t) = household(root.path(), &bundle).await?;
-    t.write("included", 41, true).await?;
+    t.write("included", 41).await?;
     a.sync().await?;
     let latest = a.tips("seal", json!({})).await?["tip"].clone();
     final_on_both(&a, &t, &latest).await?;
     a.close().await?;
-    t.write("before close but unknown", 42, true).await?;
+    t.write("before close but unknown", 42).await?;
     let a_dir = root.path().join("a");
     let a = Peer::start(&a_dir, MIGRATING, Some(&bundle), None, false).await?;
     a.session.set_networking_enabled(false).await?;
@@ -41,7 +41,7 @@ async fn real_voters_release_a_private_migration_without_reopening_the_publisher
     let staged_bytes = rocky_sdk::credentials::encode(&staged)?;
     assert_ne!(close["final"], true);
     // This write is genuinely after A signed the close, on T's source tip.
-    t.write("after close", 43, false).await?;
+    t.write("after close", 43).await?;
     t.close().await?;
     a.session.set_networking_enabled(true).await?;
     let pending = a.sync().await?;

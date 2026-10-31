@@ -1,9 +1,7 @@
 //! Guarded multi-scope audits use the production single-scope checks.
 use super::*;
-use crate::storage::{bindings, rows};
-mod failures;
+use crate::storage::rows;
 mod fixture;
-mod global;
 pub(in crate::tests) use fixture::snapshot;
 use fixture::*;
 
@@ -60,66 +58,4 @@ async fn reports_match_single_audits_with_bases_suffixes_and_no_base() {
         assert_eq!(singles(&reopened, &scopes).await, expected);
         assert_eq!(reopened.audit_scopes(&scopes).await.unwrap(), expected);
     }
-}
-
-#[tokio::test]
-async fn keyless_unknown_slots_and_invalid_inputs_are_honest() {
-    let f = AuditFixture::new(false).await;
-    let items = f.lineage.scope("items");
-    let tags = f.lineage.scope("tags");
-    let unknown = ResourceScope {
-        table: [199; 32],
-        ..items
-    };
-    f.replica
-        .inner
-        .lock(crate::replica::Class::Background)
-        .await
-        .config
-        .keys
-        .retain(|key| key.scope != tags);
-    let before = snapshot(&f.replica).await;
-    let scopes = [tags, unknown, items];
-    let expected = singles(&f.replica, &scopes).await;
-    assert_eq!(
-        (
-            expected[0].1.operations,
-            expected[0].1.rows,
-            expected[0].1.checkpoint,
-            expected[0].1.replayed
-        ),
-        (2, 0, None, 0)
-    );
-    assert_eq!(
-        (
-            expected[1].1.operations,
-            expected[1].1.rows,
-            expected[1].1.checkpoint,
-            expected[1].1.replayed
-        ),
-        (0, 0, None, 0)
-    );
-    assert_eq!(f.replica.audit_scopes(&scopes).await.unwrap(), expected);
-    let passes = f
-        .replica
-        .inner
-        .lock(crate::replica::Class::Background)
-        .await
-        .audit_global_passes;
-    for invalid in [vec![], vec![items, items]] {
-        assert!(matches!(
-            f.replica.audit_scopes(&invalid).await,
-            Err(Error::Rejected(_))
-        ));
-    }
-    assert_eq!(
-        f.replica
-            .inner
-            .lock(crate::replica::Class::Background)
-            .await
-            .audit_global_passes,
-        passes
-    );
-    assert_eq!(snapshot(&f.replica).await, before);
-    assert_clean(&f.replica).await;
 }

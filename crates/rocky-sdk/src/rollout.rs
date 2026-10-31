@@ -2,7 +2,7 @@
 use crate::{Failure, enrollment::Settings, schema::Schema};
 use data_encoding::HEXLOWER;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path};
+use std::path::Path;
 
 /// A removed table or `table.field`, and the number of live stored local rows
 /// affected (including NULL fields). Counts never describe other devices.
@@ -48,14 +48,14 @@ pub(crate) async fn confirm(
     if !settings.issuer() || settings.application(schema)? != crate::DeclaredSchema::Ahead {
         return Ok(());
     }
-    let removed = rocky_core::classify(
-        settings.domain()?.logical(),
-        &crate::domain::logical(schema, *settings.publisher.as_bytes())?,
-    )
-    .map_err(|refusal| {
+    let (current, target) = (
+        settings.domain()?.logical().clone(),
+        crate::domain::logical(schema, *settings.publisher.as_bytes())?,
+    );
+    rocky_core::classify(&current, &target).map_err(|refusal| {
         format!("the application schema cannot replace the installed one: {refusal}")
-    })?
-    .removed();
+    })?;
+    let removed = rocky_core::removed(&current, &target);
     // Grants issued before would silently change meaning. An entry goes
     // with its table, or with the table it followed.
     let kept = |name: &str| schema.tables.iter().any(|table| table.name == name);
@@ -75,17 +75,12 @@ pub(crate) async fn confirm(
     if removed.is_empty() {
         return Ok(());
     }
-    let stored = rocky_secure::local_row_counts(&path.with_file_name("rocky.sqlite")).await?;
-    let domain = settings.domain()?;
-    let counts: BTreeMap<_, _> = domain
-        .scopes()
-        .map(|(name, scope)| {
-            (
-                name.to_string(),
-                stored.get(&scope.table).copied().unwrap_or_default(),
-            )
-        })
+    let names: Vec<&str> = current
+        .typed()
+        .map(|table| table.sql_name.as_str())
         .collect();
+    let counts =
+        rocky_secure::local_row_counts(&path.with_file_name("rocky.sqlite"), &names).await?;
     let mut report = RolloutImpact {
         domain: HEXLOWER.encode(&settings.domain.0),
         installed_manifest: HEXLOWER.encode(&settings.domain()?.manifest().hash()),

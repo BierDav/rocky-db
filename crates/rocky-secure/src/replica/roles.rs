@@ -744,8 +744,7 @@ impl<A: RowApplication> Inner<A> {
         }
         let blob = encode(&scope)?;
         let mut used = 0;
-        // A log stops at a frame of an uncommitted coordinated entry or of
-        // a publication still being authored.
+        // A log stops at a frame of a publication still being authored.
         let staged = self.unsent().await?;
         for log in &own.logs {
             let mut start = request.held(log.author);

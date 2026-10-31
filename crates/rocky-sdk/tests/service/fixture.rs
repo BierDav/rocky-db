@@ -66,21 +66,15 @@ impl Peer {
             .ok_or("invitation")?
             .to_owned())
     }
-    pub async fn write(&self, key: &str, handle: u32, coordinated: bool) -> Result<Value, Failure> {
-        self.call(json!({"type":"sql","sql":"BEGIN","coordinated":coordinated}))
-            .await?;
-        let result = self.insert_and_commit(key, handle, coordinated).await;
+    pub async fn write(&self, key: &str, handle: u32) -> Result<Value, Failure> {
+        self.call(json!({"type":"sql","sql":"BEGIN"})).await?;
+        let result = self.insert_and_commit(key, handle).await;
         if result.is_err() {
             let _ = self.call(json!({"type":"sql","sql":"ROLLBACK"})).await;
         }
         result
     }
-    async fn insert_and_commit(
-        &self,
-        key: &str,
-        handle: u32,
-        coordinated: bool,
-    ) -> Result<Value, Failure> {
+    async fn insert_and_commit(&self, key: &str, handle: u32) -> Result<Value, Failure> {
         let id = self
             .call(json!({"type":"next_id","table":"counts"}))
             .await?["id"]
@@ -90,11 +84,9 @@ impl Peer {
             "values":[{"type":"text","value":key},{"type":"integer","value":id}]}),
         )
         .await?;
-        self.call(
-            json!({"type":"sql","sql":"COMMIT","coordinated":coordinated,
-            "handle":rocky_core::commitment("rocky.sdk.service.test", &handle.to_be_bytes())}),
-        )
-        .await
+        self.call(json!({"type":"sql","sql":"COMMIT",
+            "handle":rocky_core::commitment("rocky.sdk.service.test", &handle.to_be_bytes())}))
+            .await
     }
     pub async fn keys(&self) -> Result<Value, Failure> {
         Ok(self.call(json!({"type":"read","query":{"sql":"SELECT key FROM counts ORDER BY key","values":[],"max_rows":1024}})).await?["rows"].clone())

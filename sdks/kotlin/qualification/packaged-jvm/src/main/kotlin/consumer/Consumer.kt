@@ -76,7 +76,7 @@ private suspend fun groupedLists(root: File) {
             integer("category", nullable = true)
             primaryKey("list", "key")
             partitionBy("list", group = "list")
-            unique("list", "title", onConflict = Conflict.LatestWins)
+            unique("list", "title")
             reference("list", "lists", onDelete = Delete.Cascade)
             reference(listOf("list", "category"), "categories", onDelete = Delete.SetNull)
         }
@@ -213,29 +213,6 @@ fun main(args: Array<String>) = runBlocking {
     check(reopened.credentials.status().isIssuer)
     reopened.close()
     credentialPrimitives(File(root, "primitives"))
-    val moveSchema = schema("packagedmoves") {
-        table("rows") {
-            text("list")
-            text("title")
-            primaryKey("list", "id")
-            partitionBy("list")
-        }
-    }
-    val moving = RockyDatabase.local(File(root, "moves"), moveSchema)
-    try {
-        for (partition in listOf("A", "B")) moving.partitions.create("rows", JsonArray(listOf(text(partition))))
-        var id = 0L
-        moving.write {
-            id = nextId("rows", "A")
-            execute("INSERT INTO rows(list,title,id) VALUES(?,?,?)", "A", "kept", id)
-        }
-        moving.moveRow(handle(90), "rows", id, listOf("A"), listOf("B"))
-        moving.moveRow(handle(90), "rows", id, listOf("A"), listOf("B"))
-        val moved = Row.decode(moving.read(moveSchema.table("rows").query())).single()
-        check(moved.text("list") == "B" && moved.integer("id") == id)
-    } finally {
-        moving.close()
-    }
     groupedLists(File(root, "lists"))
-    println("Packaged consumer passed: grouped partitioned constraints, idempotent row moves, credential primitives, delegated credentials, local sessions, authority/progress Flow, reconciliation, owned/borrowed networks, fresh restore and generation reopen")
+    println("Packaged consumer passed: grouped partitioned constraints, credential primitives, delegated credentials, local sessions, authority/progress Flow, reconciliation, owned/borrowed networks, fresh restore and generation reopen")
 }

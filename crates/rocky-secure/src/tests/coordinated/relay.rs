@@ -33,35 +33,19 @@ async fn close(fixture: &Fixture) -> SignedSeal {
 }
 
 #[tokio::test]
-async fn a_behind_relay_catches_up_and_certifies_only_the_exact_private_close() {
+async fn a_relay_certifies_only_the_exact_private_close() {
     let fixture = Fixture::new(1).await;
     seals::follow_main(&fixture).await;
     let relay = trusted(&fixture, "relay").await;
     let close = close(&fixture).await;
     let bytes = close.to_bytes().unwrap();
     let graph_before = relay.1.tip_graph(fixture.lineage.domain).await.unwrap();
-    // The signed frontier remains fixed while ordinary source entries advance.
-    fixture.invoice(&fixture.alice, "meanwhile").await;
     let log = tip_log(&fixture.lineage);
-    let before = fixture.mesh.log.head(log).unwrap();
-    assert!(!before.member(relay.0.public_key()));
-    let no_peers = NoPeers;
-    assert!(matches!(
-        relay.1.relay_staged_close(&bytes, &no_peers).await.unwrap(),
-        StagedCloseStatus::Pending
-    ));
-    assert_eq!(fixture.mesh.log.head(log).unwrap(), before);
-    let proof = match relay
-        .1
-        .relay_staged_close(&bytes, &fixture.mesh.peers(&fixture.lineage, &relay.0))
-        .await
-        .unwrap()
-    {
+    let proof = match relay.1.relay_staged_close(&bytes).await.unwrap() {
         StagedCloseStatus::Finality(proof) => proof,
         other => panic!("{other:?}"),
     };
     assert_eq!(proof.seal, close.id().unwrap());
-    assert_eq!(relay.1.coordinated_status(log).await.unwrap().position, 1);
     assert_eq!(
         relay.1.tip_graph(fixture.lineage.domain).await.unwrap(),
         graph_before
@@ -92,8 +76,12 @@ async fn an_unknown_rival_terminal_never_certifies_the_private_candidate() {
     seals::follow_main(&fixture).await;
     let relay = trusted(&fixture, "relay").await;
     let candidate = close(&fixture).await;
-    fixture.invoice(&fixture.alice, "later").await;
-    let rival = close(&fixture).await;
+    let mut statement = candidate.statement.clone();
+    statement.frontier.push(rocky_credentials::AuthorMark {
+        author: rocky_credentials::MAX_AUTHOR,
+        sequence: 1,
+    });
+    let rival = SignedSeal::sign(statement, fixture.lineage.publisher()).unwrap();
     assert_ne!(rival.id().unwrap(), candidate.id().unwrap());
     let log = tip_log(&fixture.lineage);
     fixture
@@ -110,11 +98,7 @@ async fn an_unknown_rival_terminal_never_certifies_the_private_candidate() {
         .unwrap();
     let bytes = candidate.to_bytes().unwrap();
     assert!(matches!(
-        relay
-            .1
-            .relay_staged_close(&bytes, &fixture.mesh.peers(&fixture.lineage, &relay.0))
-            .await
-            .unwrap(),
+        relay.1.relay_staged_close(&bytes).await.unwrap(),
         StagedCloseStatus::Pending
     ));
     assert!(matches!(
@@ -138,7 +122,7 @@ async fn relays_refuse_continuations_and_recovery_candidates() {
     assert!(
         relay
             .1
-            .relay_staged_close(&continuation.to_bytes().unwrap(), &NoPeers)
+            .relay_staged_close(&continuation.to_bytes().unwrap())
             .await
             .is_err()
     );
@@ -149,16 +133,10 @@ async fn relays_refuse_continuations_and_recovery_candidates() {
 async fn a_committed_relay_resumes_exact_bytes_after_reopen_without_admitting_the_close() {
     let fixture = Fixture::new(2).await;
     seals::follow_main(&fixture).await;
-    fixture.invoice(&fixture.alice, "before").await;
     let close = close(&fixture).await;
     let bytes = close.to_bytes().unwrap();
     assert!(matches!(
-        fixture
-            .alice
-            .1
-            .relay_staged_close(&bytes, &NoPeers)
-            .await
-            .unwrap(),
+        fixture.alice.1.relay_staged_close(&bytes).await.unwrap(),
         StagedCloseStatus::Pending
     ));
     let head = fixture.mesh.log.head(tip_log(&fixture.lineage)).unwrap();
@@ -179,7 +157,7 @@ async fn a_committed_relay_resumes_exact_bytes_after_reopen_without_admitting_th
         records,
         vec![vec![SqlValue::Blob(bytes.clone()), SqlValue::Integer(1)]]
     );
-    let fixture = fixture.restart(true).await;
+    let fixture = fixture.restart_alice().await;
     seals::compose(&fixture, &fixture.alice);
     assert!(matches!(
         fixture.alice.1.staged_close_finality(&bytes).await.unwrap(),
@@ -189,13 +167,7 @@ async fn a_committed_relay_resumes_exact_bytes_after_reopen_without_admitting_th
         fixture.bob.1.staged_close_finality(&bytes).await.unwrap(),
         StagedCloseStatus::Finality(_)
     ));
-    let proof = match fixture
-        .alice
-        .1
-        .relay_staged_close(&bytes, &NoPeers)
-        .await
-        .unwrap()
-    {
+    let proof = match fixture.alice.1.relay_staged_close(&bytes).await.unwrap() {
         StagedCloseStatus::Finality(proof) => proof,
         other => panic!("{other:?}"),
     };
@@ -235,15 +207,10 @@ async fn a_pending_relay_uses_the_raised_signed_minimum_and_distinct_acknowledge
     let fixture = Fixture::new(2).await;
     seals::follow_main(&fixture).await;
     let relay = trusted(&fixture, "minimum-relay").await;
-    fixture.invoice(&fixture.alice, "before").await;
     let close = close(&fixture).await;
     let bytes = close.to_bytes().unwrap();
     assert!(matches!(
-        relay
-            .1
-            .relay_staged_close(&bytes, &fixture.mesh.peers(&fixture.lineage, &relay.0))
-            .await
-            .unwrap(),
+        relay.1.relay_staged_close(&bytes).await.unwrap(),
         StagedCloseStatus::Pending
     ));
     let raised = TipStatement::GenesisLine(
@@ -282,14 +249,4 @@ async fn a_pending_relay_uses_the_raised_signed_minimum_and_distinct_acknowledge
             .seals
             .is_empty()
     );
-}
-
-struct NoPeers;
-impl EntryPeers for NoPeers {
-    fn store<'a>(&'a self, _: PublicKey, _: &'a CoordinatedEntry) -> PeerFuture<'a, ()> {
-        Box::pin(async { Err(Error::Rejected("unreachable".into())) })
-    }
-    fn committed(&self, _: TipLog, _: u64) -> PeerFuture<'_, Vec<CommittedEntry>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
 }

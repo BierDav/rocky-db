@@ -14,12 +14,7 @@ class RoomConstraintsTest {
         val root = generateSequence(File(System.getProperty("user.dir"))) { it.parentFile }
             .first { File(it, "rust-toolchain.toml").isFile }
         val exported = File(root, "sdks/kotlin/qualification/schema/schemas/rocky.qualification.ConstraintDatabase/1.json").readText()
-        val schema = schemaFromRoom("constraints", exported) {
-            table("children") {
-                onConflict("index_children_code", Conflict.LatestWins)
-                onConflict("index_children_label", Conflict.SetNull)
-            }
-        }
+        val schema = schemaFromRoom("constraints", exported)
         val directory = Files.createTempDirectory("rocky-room-constraints").toFile()
         try {
             val rocky = RockyDatabase.local(directory, schema)

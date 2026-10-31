@@ -10,7 +10,7 @@
 //!
 //! # async fn application() -> Result<(), Failure> {
 //! let schema = Schema::builder("notes", 1)
-//!     .table(Table::mergeable("notes")
+//!     .table(Table::replayed("notes")
 //!         .column(Column::new("body", Affinity::Text).required()))
 //!     .build()?;
 //! let configuration = Configuration::new("notes-data", &schema)?;
@@ -77,7 +77,6 @@ mod test_directory;
 mod tip_schemas;
 mod tips;
 pub mod transport;
-mod typed;
 
 pub use backup::{Entry as BackupEntry, Inventory as BackupInventory};
 pub use configuration::Configuration;
@@ -95,8 +94,8 @@ pub use reactor::{ReactorMeasurements, ReactorSnapshot, SqlCallTiming};
 pub use rocky_coordinator::{certified::TrustBundle, service::NetworkCoordinator};
 pub use rocky_core::replay::{DropReason, TransactionOutcome};
 pub use rocky_core::{
-    Affinity, Collation, ColumnDefinition, ConflictPolicy, DeleteAction, ForeignKeyDefinition,
-    IndexColumn, IndexDefinition, LogicalView, TableClass, TableDefinition, UpdatePolicy,
+    Affinity, Collation, ColumnDefinition, DeleteAction, ForeignKeyDefinition, IndexColumn,
+    IndexDefinition, LogicalView, TableClass, TableDefinition,
 };
 pub use rocky_core::{NodeId, PrincipalId, Scope, SqlValue, TransactionToken};
 /// Signed credentials, grant profiles and the key provider contract.
@@ -112,7 +111,6 @@ pub use session::Invitation;
 pub use sql::{DecodeError, FromSqlValue, IntoSqlValue, Row, Rows, Transaction};
 pub use status::*;
 pub use tips::*;
-pub use typed::{Access, Located, MAX_OBSERVED, TypedApp, TypedError, TypedRow};
 pub type Failure = Box<dyn std::error::Error + Send + Sync>;
 /// Rocky's handlers for an application-owned iroh endpoint, and the iroh
 /// version they attach to.

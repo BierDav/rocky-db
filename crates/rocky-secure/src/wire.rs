@@ -41,13 +41,11 @@ pub(crate) struct Extensions {
     pub births: Vec<serde_bytes::ByteArray<32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<rocky_core::PartitionTuple>,
-    /// Existence records the commit signed in this scope's log: a seal's
-    /// holders know from frames alone when they hold every record.
-    pub existence: u32,
 }
 
-/// Source-schema ordinals and frame-bound birth statements.
-pub(crate) const ROW_FORMAT: u8 = 14;
+/// Source-schema ordinals and frame-bound birth statements, without
+/// existence counts.
+pub(crate) const ROW_FORMAT: u8 = 15;
 /// The refusal of a frame whose credential chain the receiver lacks.
 pub(crate) const INCOMPLETE_FRAME: &str = "incomplete frame: its credential chain is unknown";
 
@@ -365,9 +363,6 @@ pub(crate) struct Membership {
     pub index: u16,
     #[serde(with = "member_bytes")]
     pub members: Vec<Vec<u8>>,
-    /// The coordinated log position of a coordinated write's bundle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entry: Option<u64>,
 }
 // Ciphertexts are byte strings, not arrays of encoded integer values.
 mod member_bytes {
@@ -400,7 +395,6 @@ struct BundleBody {
     proofs: BTreeMap<Commitment, crate::replica::moves::CreationProof>,
     carried: BTreeMap<Commitment, crate::replica::moves::Carried>,
     membership: Option<Membership>,
-    reauthors: Option<Commitment>,
     writes: Vec<RowWrite>,
     /// A replayed table's part of the bundle, instead of `writes`.
     intent: Option<rocky_core::replay::Intent>,
@@ -422,7 +416,6 @@ pub(crate) struct RowPayload {
     proofs: BTreeMap<Commitment, crate::replica::moves::CreationProof>,
     carried: BTreeMap<Commitment, crate::replica::moves::Carried>,
     membership: Option<Membership>,
-    reauthors: Option<Commitment>,
     writes: Vec<RowWrite>,
     intent: Option<rocky_core::replay::Intent>,
     outcome: Option<rocky_core::replay::OutcomeRecord>,
@@ -439,19 +432,6 @@ impl RowPayload {
         let mut payload = Self::decode_source(bytes, &definition, frame.scope()?)?;
         payload.derive_births(frame, definition.hash(), application)?;
         Ok(payload)
-    }
-    #[cfg(test)]
-    pub(crate) fn staging_body_for_test(&self) -> Result<Vec<u8>, Error> {
-        encode(&BundleBody {
-            version: 5,
-            proofs: self.proofs.clone(),
-            carried: self.carried.clone(),
-            membership: self.membership.clone(),
-            reauthors: self.reauthors,
-            writes: self.writes.clone(),
-            intent: None,
-            outcome: None,
-        })
     }
     #[cfg(test)]
     pub(crate) fn rebound_births_for_test(
@@ -550,7 +530,6 @@ impl RowPayload {
             proofs: BTreeMap::new(),
             carried: BTreeMap::new(),
             membership: None,
-            reauthors: None,
             writes: changes.iter().cloned().map(RowWrite::changed).collect(),
             intent: None,
             outcome: None,
@@ -565,7 +544,6 @@ impl RowPayload {
             proofs: BTreeMap::new(),
             carried: BTreeMap::new(),
             membership: Some(membership),
-            reauthors: None,
             writes: Vec::new(),
             intent: Some(intent),
             outcome: None,
@@ -579,7 +557,6 @@ impl RowPayload {
             proofs: BTreeMap::new(),
             carried: BTreeMap::new(),
             membership: None,
-            reauthors: None,
             writes: Vec::new(),
             intent: None,
             outcome: Some(record),
@@ -591,22 +568,10 @@ impl RowPayload {
             proofs: BTreeMap::new(),
             carried: BTreeMap::new(),
             membership: Some(membership),
-            reauthors: None,
             writes,
             intent: None,
             outcome: None,
         })
-    }
-    pub(crate) fn reauthor_body(
-        bytes: Vec<u8>,
-        held: Option<Commitment>,
-    ) -> Result<Vec<u8>, Error> {
-        let mut body: BundleBody = decode(&bytes)?;
-        body.reauthors = held;
-        encode(&body)
-    }
-    pub(crate) fn reauthors(&self) -> Option<Commitment> {
-        self.reauthors
     }
     pub(crate) fn witness(
         body: Vec<u8>,

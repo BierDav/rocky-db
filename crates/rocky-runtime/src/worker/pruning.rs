@@ -266,18 +266,6 @@ where
                 )
                 .await?;
             more |= removed == PRUNE_BATCH as u64;
-            // A transaction token is a handle of the same age: its record
-            // goes once the last sequence it covers is forgotten.
-            if self.app.sql_writes().is_some() {
-                let removed = self
-                    .conn()
-                    .execute(
-                        "DELETE FROM rocky_sql_transactions WHERE token IN (SELECT token FROM rocky_sql_transactions WHERE first<=?1+1 AND first+count-1<=?1 ORDER BY first LIMIT ?2)",
-                        crate::sqlite::params![forgotten as i64, batch],
-                    )
-                    .await?;
-                more |= removed == PRUNE_BATCH as u64;
-            }
         }
         Ok((released, more))
     }

@@ -275,15 +275,14 @@ impl NativeSession {
             return Ok(self
                 .import_within(replica, signed, CHECKPOINT_PAGE)
                 .await?
-                .is_some()
-                && (!need.logged || self.pull_existence_base(replica, scope, None).await?));
+                .is_some());
         }
         match need.replay {
             FrameReplay::Local => replica.replay_at_seals(scope, false).await?,
             FrameReplay::Peers if shared && self.retains_history(replica, scope).await? => {
                 replica.replay_at_seals(scope, true).await?
             }
-            FrameReplay::Peers | FrameReplay::Unavailable => {}
+            FrameReplay::Peers => {}
         }
         Ok(true)
     }
@@ -296,7 +295,7 @@ impl NativeSession {
         replica: &EncryptedReplica<A>,
         scope: ResourceScope,
     ) -> Result<bool, Error> {
-        let (listed, logged) = replica.listed_replacements(scope).await?;
+        let listed = replica.listed_replacements(scope).await?;
         if listed.is_empty() || !self.try_scoped_holding(replica, &[scope], false).await? {
             return Ok(true);
         }
@@ -309,8 +308,7 @@ impl NativeSession {
         Ok(self
             .import_within(replica, signed, CHECKPOINT_PAGE)
             .await?
-            .is_some()
-            && (!logged || self.pull_existence_base(replica, scope, None).await?))
+            .is_some())
     }
     /// Whether the peer pruned no frame of `scope`.
     async fn retains_history<A: RowApplication>(

@@ -65,9 +65,7 @@ impl<A: RowApplication> Inner<A> {
         let path = self.path_seals(domain)?;
         let scopes = self.readiness_scopes(domain).await?;
         let held_scopes = self.custody_scopes(now()?)?;
-        let (held, last) = self
-            .held_positions(domain, &scopes, &held_scopes, &BTreeSet::new())
-            .await?;
+        let (held, last) = self.held_positions(domain, &scopes, &held_scopes).await?;
         let mut checks = Vec::new();
         for (index, seal) in path.iter().enumerate() {
             let id = seal.id().map_err(credential)?;
@@ -564,21 +562,6 @@ impl<A: RowApplication> Inner<A> {
                 .await?;
         }
         Ok(())
-    }
-    /// Why a seal's positions of `domain` are missing: a peer showed that
-    /// only a partition's custody can place one, or they are not here yet.
-    pub(super) fn missing_placement(&self, domain: Scope) -> CoordinatedError {
-        if self
-            .custody_required
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .any(|(scope, _, _)| *scope == domain)
-        {
-            CoordinatedError::CustodyRequired
-        } else {
-            CoordinatedError::Behind
-        }
     }
 }
 

@@ -11,8 +11,6 @@ license-file.workspace = true
 [features]
 qualification = ["rocky-core/qualification", "rocky-secure/qualification", "rocky-iroh?/qualification"]
 default = ["iroh"]
-# Test-only capture of committed SQL transaction shapes (`scripts/intent-shapes`).
-intent-shapes = ["rocky-secure/intent-shapes"]
 # The iroh transport: handlers for an application's endpoint and the starter's
 # own, and the client of a coordination service reached over it.
 iroh = ["dep:rocky-iroh", "dep:rocky-coordinator"]

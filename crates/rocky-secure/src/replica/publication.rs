@@ -39,62 +39,6 @@ pub(super) fn bundle_handle(publication: &Commitment, position: u64) -> Commitme
     )
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Rows of one publication bundle, lowered by tests on their thread.
-    pub(crate) static BUNDLE_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_BUNDLE_ROWS) };
-}
-fn bundle_rows() -> usize {
-    #[cfg(test)]
-    {
-        BUNDLE_ROWS.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        MAX_BUNDLE_ROWS
-    }
-}
-
-/// Splits ordered writes into consecutive bundles within the row, frame
-/// and byte bounds of one bundle.
-fn chunks(writes: Vec<RowWrite>) -> Result<Vec<Vec<RowWrite>>, Error> {
-    // The encoded writes and an empty dependency list stay below the bound.
-    const SLACK: usize = 64;
-    let mut chunks = Vec::new();
-    let mut chunk: Vec<RowWrite> = Vec::new();
-    let mut rows = BTreeMap::<ResourceScope, usize>::new();
-    let (mut frames, mut bytes) = (0, SLACK);
-    for write in writes {
-        let size = encode(&write)?.len();
-        if size + SLACK > MAX_BUNDLE_BYTES {
-            return Err(Error::Quota {
-                resource: "bundle bytes",
-                limit: MAX_BUNDLE_BYTES,
-            });
-        }
-        let opens = rows.get(&write.change.scope).copied().unwrap_or(0) % ROWS_PER_FRAME == 0;
-        if !chunk.is_empty()
-            && (chunk.len() == bundle_rows()
-                || (opens && frames == MAX_BUNDLE_FRAMES)
-                || bytes + size > MAX_BUNDLE_BYTES)
-        {
-            chunks.push(std::mem::take(&mut chunk));
-            rows.clear();
-            (frames, bytes) = (0, SLACK);
-        }
-        if rows.get(&write.change.scope).copied().unwrap_or(0) % ROWS_PER_FRAME == 0 {
-            frames += 1;
-        }
-        *rows.entry(write.change.scope).or_default() += 1;
-        bytes += size;
-        chunk.push(write);
-    }
-    if !chunk.is_empty() {
-        chunks.push(chunk);
-    }
-    Ok(chunks)
-}
-
 impl<A: RowApplication> Inner<A> {
     async fn publication_record(
         &self,
@@ -159,80 +103,20 @@ impl<A: RowApplication> Inner<A> {
         }
         Ok(frames)
     }
-    /// Parents first: writes with an image by the depth of their table's
-    /// references, new identities ascending, then deletions children first.
-    fn publication_order(&self, writes: Vec<RowWrite>) -> Result<Vec<RowWrite>, Error> {
-        let typed = self
-            .workspace
-            .typed
-            .as_ref()
-            .ok_or_else(|| Error::Incompatible("no typed tables are installed".into()))?;
-        let schema = typed.rows.schema();
-        let mut depths = BTreeMap::<String, usize>::new();
-        // A reference chain is at most as long as the table list.
-        for _ in 0..schema.tables.len() {
-            for table in &schema.tables {
-                let depth = table
-                    .foreign_keys
-                    .iter()
-                    .filter(|key| !key.table.eq_ignore_ascii_case(&table.sql_name))
-                    .map(|key| {
-                        depths
-                            .get(&key.table.to_ascii_lowercase())
-                            .map_or(1, |d| d + 1)
-                    })
-                    .max()
-                    .unwrap_or(0);
-                depths.insert(table.sql_name.to_ascii_lowercase(), depth);
-            }
-        }
-        let mut keyed = writes
-            .into_iter()
-            .map(|write| {
-                let depth = typed
-                    .by_scope(write.change.scope)
-                    .and_then(|table| depths.get(&table.table.sql_name.to_ascii_lowercase()))
-                    .copied()
-                    .unwrap_or(0);
-                let birth = match write.change.before {
-                    None => self
-                        .app
-                        .row_identity(&write.change)
-                        .map_err(|message| denied(&message))?
-                        .map(|identity| identity.integer()),
-                    Some(_) => None,
-                };
-                let key = match write.change.after {
-                    Some(_) => (0, depth as i64, birth.unwrap_or(0)),
-                    None => (1, -(depth as i64), 0),
-                };
-                Ok((key, write))
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        keyed.sort_by_key(|(key, _)| *key);
-        Ok(keyed.into_iter().map(|(_, write)| write).collect())
-    }
-    /// Authors `writes` as the consecutive bundles of `publication` inside
-    /// the caller's open engine transaction and records it there, every
-    /// write stamped with this commit's time. A recorded publication
+    /// Records `publication`, whose transaction changed no replayed row,
+    /// inside the caller's open engine transaction. A recorded publication
     /// returns its frames again; the caller rolls back.
     pub(super) async fn stage_publication(
         &mut self,
         publication: Commitment,
-        writes: Vec<RowWrite>,
     ) -> Result<(Vec<EncryptedFrame>, bool), Error> {
         if let Some((bundles, _)) = self.publication_record(&publication).await? {
             return Ok((self.publication_frames(&publication, bundles).await?, true));
         }
-        let chunks = chunks(self.publication_order(writes)?)?;
         let migration = self.migration_stage(publication).await?;
-        self.publishing = migration.is_some();
-        let authored = self.author_publication(&publication, &chunks).await;
-        self.publishing = false;
-        let frames = authored?;
-        self.record_publication(publication, chunks.len() as u64, &frames, migration)
+        self.record_publication(publication, 0, &[], migration)
             .await?;
-        Ok((frames, false))
+        Ok((Vec::new(), false))
     }
     /// Records the authored `bundles` of `publication`, its migration
     /// intent for a migration stage, and commits its schema stage.
@@ -264,30 +148,6 @@ impl<A: RowApplication> Inner<A> {
             self.build_migration_intent(&stage, frames).await?;
         }
         self.commit_schema_stage(publication).await
-    }
-    async fn author_publication(
-        &mut self,
-        publication: &Commitment,
-        chunks: &[Vec<RowWrite>],
-    ) -> Result<Vec<EncryptedFrame>, Error> {
-        let time = now()?;
-        let mut frames = Vec::new();
-        for (position, chunk) in chunks.iter().enumerate() {
-            let encoded = super::bundle::input_bytes(chunk, &[], &BTreeMap::new())?;
-            if encoded.len() > MAX_BUNDLE_BYTES {
-                return Err(Error::Quota {
-                    resource: "bundle bytes",
-                    limit: MAX_BUNDLE_BYTES,
-                });
-            }
-            let input = rocky_core::commitment("rocky.secure-bundle-input.v1", &encoded);
-            let handle = bundle_handle(publication, position as u64);
-            frames.extend(
-                self.author_bundle(handle, input, chunk, &[], time, None)
-                    .await?,
-            );
-        }
-        Ok(frames)
     }
     /// Whether some peer reported holding every member of the bundle.
     async fn bundle_published(&self, handle: &Commitment) -> Result<bool, Error> {
@@ -453,50 +313,5 @@ impl<A: RowApplication> EncryptedReplica<A> {
             }
             publications.extend(current.take().map(|(publication, _)| publication));
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn write(scope: u8, row: u8) -> RowWrite {
-        let scope = ResourceScope {
-            domain: rocky_core::Scope {
-                mesh: rocky_core::MeshId([1; 16]),
-                app: rocky_core::AppId([1; 16]),
-                domain: rocky_core::DomainId([1; 16]),
-            },
-            encryption: [scope; 32],
-            table: [scope; 32],
-        };
-        RowWrite::changed(RowChange {
-            scope,
-            row: [row; 32],
-            before: None,
-            after: Some(BTreeMap::from([([0; 32], vec![row])])),
-        })
-    }
-
-    #[test]
-    fn chunks_stay_within_rows_and_frames() {
-        // One scope: 2,048 rows fill one bundle exactly.
-        let one: Vec<_> = (0..=255u8)
-            .cycle()
-            .take(MAX_BUNDLE_ROWS + 1)
-            .map(|row| write(1, row))
-            .collect();
-        let split = chunks(one).unwrap();
-        assert_eq!(
-            split.iter().map(Vec::len).collect::<Vec<_>>(),
-            [MAX_BUNDLE_ROWS, 1]
-        );
-        // 65 scopes of one row each need 65 frames.
-        let many: Vec<_> = (0..65u8).map(|scope| write(scope, 0)).collect();
-        let split = chunks(many).unwrap();
-        assert_eq!(
-            split.iter().map(Vec::len).collect::<Vec<_>>(),
-            [MAX_BUNDLE_FRAMES, 1]
-        );
     }
 }

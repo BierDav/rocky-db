@@ -92,6 +92,11 @@ impl<A: RowApplication> Inner<A> {
             if !self.can_read_key(scope, &local) || !self.holds(scope).await? {
                 return Err(denied("held change requires a readable held scope"));
             }
+            // An intent is held whole: it has no rows for the application
+            // to re-author.
+            if payload.intent().is_some() {
+                continue;
+            }
             let writes = payload.clone().into_writes();
             if writes.is_empty() || writes.len() > ROWS_PER_FRAME {
                 return Err(denied("held row change quota"));
@@ -214,7 +219,7 @@ impl<A: RowApplication> Inner<A> {
             None => false,
             _ => return Err(Error::Corrupt("held resolution authority".into())),
         };
-        if !resolved && !migration {
+        if !resolved && !migration && !stored.rows.is_empty() {
             self.conn
                 .execute(
                     "INSERT OR REPLACE INTO secure_held VALUES(?,?)",
@@ -312,7 +317,6 @@ impl<A: RowApplication> Inner<A> {
                 graph.genesis_lines.len(),
                 graph.finalities.len(),
                 graph.checkpoints.len(),
-                graph.carries.len(),
                 &graph.revoked,
             ))?,
         );
@@ -492,11 +496,7 @@ impl<A: RowApplication> Inner<A> {
                     .opening_key(extension.scope, extension.generation)
                     .is_some()
             {
-                if self.abandoned_write(&frame)? {
-                    self.hold_abandoned(&frame, time).await?;
-                } else {
-                    self.hold_closed_frame(&frame, time).await?;
-                }
+                self.hold_closed_frame(&frame, time).await?;
             }
 
             return Ok(true);
@@ -859,7 +859,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
         for status in self.receive_all(frames).await {
             match status? {
                 ReceiveStatus::Held
-                | ReceiveStatus::Abandoned
                 | ReceiveStatus::Duplicate
                 | ReceiveStatus::PendingDependencies => {}
                 _ => return Err(denied("held transfer was not held")),

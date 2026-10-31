@@ -3,17 +3,16 @@ use super::*;
 
 /// Input records per acquisition; provisional until phone calibration.
 const STORAGE_RECORDS: usize = if cfg!(test) { 1 } else { 32 };
-const TABLES: [&str; 4] = [
+const TABLES: [&str; 3] = [
     "secure_migration_publications",
     "secure_migration_frames",
     "secure_migration_nodes",
-    "secure_existence_log",
 ];
 
 struct Source {
     writes: Arc<crate::sqlite::Writes>,
-    tables: [String; 4],
-    versions: [u64; 4],
+    tables: [String; 3],
+    versions: [u64; 3],
 }
 impl Source {
     fn check(&self) -> Result<(), Error> {
@@ -112,7 +111,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
             bytes: 0,
             support_bytes: 0,
         };
-        let mut ranges = BTreeMap::<(Vec<u8>, i64), Vec<i64>>::new();
         let mut after = Vec::new();
         loop {
             let page = self.storage_page(&source,
@@ -124,7 +122,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
             for row in page {
                 let [
                     SqlValue::Blob(publication),
-                    SqlValue::Blob(statement),
+                    SqlValue::Blob(_),
                     frames,
                     bytes,
                     support,
@@ -135,20 +133,9 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 add(&mut totals.frames, number(frames)?)?;
                 add(&mut totals.bytes, number(bytes)?)?;
                 add(&mut totals.support_bytes, number(support)?)?;
-                let statement: MigrationPublicationStatement = decode(statement)?;
-                if let Some(last) = statement.frames.checked_sub(1) {
-                    ranges
-                        .entry((statement.writer.to_vec(), i64::from(statement.author)))
-                        .or_default()
-                        .push(i64::try_from(last).unwrap_or(i64::MAX));
-                }
                 after = publication.clone();
             }
         }
-        for bounds in ranges.values_mut() {
-            bounds.sort_unstable();
-        }
-
         after.clear();
         loop {
             let page = self.storage_page(&source,
@@ -193,46 +180,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
             }
         }
 
-        if ranges.is_empty() {
-            return Ok(totals);
-        }
-        cursor = vec![
-            SqlValue::Blob(Vec::new()),
-            SqlValue::Blob(Vec::new()),
-            SqlValue::Integer(-1),
-        ];
-        loop {
-            let page = self.storage_page(&source,
-                "SELECT scope,signer,sequence,author,position,length(record)+length(scope)+length(signer)+length(hash)+32 FROM secure_existence_log WHERE (scope,signer,sequence)>(?,?,?) ORDER BY scope,signer,sequence LIMIT ?",
-                cursor.clone()).await?;
-            // Even an empty final page validates every table before returning.
-            if page.is_empty() {
-                return Ok(totals);
-            }
-            for row in page {
-                let [
-                    SqlValue::Blob(_),
-                    SqlValue::Blob(signer),
-                    SqlValue::Integer(_),
-                    SqlValue::Integer(author),
-                    SqlValue::Integer(position),
-                    support,
-                ] = row.as_slice()
-                else {
-                    return Err(Error::Corrupt("migration support account".into()));
-                };
-                if *position >= 0
-                    && let Some(bounds) = ranges.get(&(signer.clone(), *author))
-                {
-                    // Preserve the charge per publication, including overlapping extents.
-                    let copies = bounds.len() - bounds.partition_point(|last| last < position);
-                    let bytes = number(support)?
-                        .checked_mul(copies as u64)
-                        .ok_or_else(|| denied("migration support overflow"))?;
-                    add(&mut totals.support_bytes, bytes)?;
-                }
-                cursor = row[..3].to_vec();
-            }
-        }
+        // The empty final page validated every table.
+        Ok(totals)
     }
 }

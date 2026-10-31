@@ -84,11 +84,6 @@ pub trait StoredApplication: Application + ProjectionSchema + Sized + Send + 'st
         self.descriptor().definition
     }
     type Row: Clone + Send + PartialEq + 'static;
-    /// Translates rows captured from SQL transactions into operations. None:
-    /// the application accepts precise mutations only.
-    fn sql_writes(&self) -> Option<&dyn crate::SqlWrites<Self>> {
-        None
-    }
     /// The descriptor the installed tables must match. The runtime verifies
     /// the physical tables against it, persists it and exposes it.
     fn logical_schema(&self) -> Option<&crate::LogicalSchema> {

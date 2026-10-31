@@ -50,7 +50,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 let frames = inner.frames_written.load(Ordering::Relaxed) - work.0;
                 let rows = inner.rows_written.load(Ordering::Relaxed) - work.1;
                 let requests = inner.applied_frames - work.2;
-                inner.row_work(group::APPLICATION_ROWS, rows);
+                inner.row_work(group::APPLICATION_ROWS);
                 inner.units("applied_frame", frames);
                 inner.units("applied_request", requests);
                 inner.units("applied_row", rows);
@@ -104,23 +104,7 @@ impl<A: RowApplication> Inner<A> {
         Ok(payload)
     }
     pub(super) fn row_payload(&self, frame: &EncryptedFrame) -> Result<RowPayload, Error> {
-        #[cfg(test)]
-        let operation = frame.operation_ref()?;
-        #[cfg(test)]
-        if crate::AUTHOR_PAYLOAD_FRAME.with(std::cell::Cell::get) == Some(operation.hash) {
-            crate::AUTHOR_PAYLOAD_TRACE.with(|trace| {
-                if let Some(trace) = trace.borrow_mut().as_mut()
-                    && let Some((_, count)) = trace
-                        .iter_mut()
-                        .rev()
-                        .find(|(seen, _)| seen.id().ok() == Some(operation.hash))
-                {
-                    *count += 1;
-                }
-            });
-        }
-        let payload = self.decode_row_payload(frame, &self.open_payload(frame)?)?;
-        Ok(payload)
+        self.decode_row_payload(frame, &self.open_payload(frame)?)
     }
 
     /// One bounded transaction of `EncryptedReplica::settle`; true when
@@ -140,13 +124,21 @@ impl<A: RowApplication> Inner<A> {
         );
         let result = tracing::Instrument::instrument(
             async {
-                if self.pending_pass.commit != self.commit || self.pending_pass.epoch != self.context_epoch.load(Ordering::Relaxed) {
+                if self.pending_pass.commit != self.commit
+                    || self.pending_pass.epoch != self.context_epoch.load(Ordering::Relaxed)
+                {
                     self.pending_pass.phase = PendingPhase::Reset;
                 }
                 let finishing = matches!(self.pending_pass.phase, PendingPhase::Finish)
-                    && self.pending_pass.examined.is_empty() && self.pending_pass.skipped.is_empty();
-                let moved = finishing && !rows(&self.conn, "SELECT 1 FROM secure_move_rows LIMIT 1").await?.is_empty();
-                let writable = matches!(self.pending_pass.phase, PendingPhase::Apply) && !self.pending_pass.heads.is_empty() || moved;
+                    && self.pending_pass.examined.is_empty()
+                    && self.pending_pass.skipped.is_empty();
+                let moved = finishing
+                    && !rows(&self.conn, "SELECT 1 FROM secure_move_rows LIMIT 1")
+                        .await?
+                        .is_empty();
+                let writable = matches!(self.pending_pass.phase, PendingPhase::Apply)
+                    && !self.pending_pass.heads.is_empty()
+                    || moved;
                 if !writable {
                     return self.apply_pending(time, group::SETTLE_REQUESTS).await;
                 }
@@ -161,13 +153,13 @@ impl<A: RowApplication> Inner<A> {
                     if inner.applied_frames != frames && !crate::apply_allowed() {
                         return Err(Error::InjectedFailure);
                     }
-                    #[cfg(test)]
-                    if matches!(inner.group_fault, Some(group::GroupFault::FailApplicationBeforeCommit)) {
-                        return Err(Error::InjectedFailure);
-                    }
                     result
                 })?;
-                self.follow_pass.commit = if failure.is_none() { self.commit } else { u64::MAX };
+                self.follow_pass.commit = if failure.is_none() {
+                    self.commit
+                } else {
+                    u64::MAX
+                };
                 self.follow_pass.epoch = self.context_epoch.load(Ordering::Relaxed);
                 self.pending_pass.commit = self.commit;
                 self.pending_pass.epoch = self.context_epoch.load(Ordering::Relaxed);
@@ -466,12 +458,11 @@ impl<A: RowApplication> Inner<A> {
             && let Err(error) = self.verify_frame_authority(frame, time)
         {
             self.reject(operation.hash).await?;
-            return Ok(Outcome::Rejected(error.to_string()));
+            {
+                return Ok(Outcome::Rejected(error.to_string()));
+            }
         }
         if reach == tips::FrameReach::Held {
-            if self.abandoned_write(frame)? {
-                return self.hold_abandoned(frame, time).await;
-            }
             return self.hold_closed_frame(frame, time).await;
         }
         // Every frame of a revoked author is refused, also one whose
@@ -513,14 +504,18 @@ impl<A: RowApplication> Inner<A> {
             Ok(false) => return Ok(Outcome::Waiting(WaitReason::Dependencies)),
             Err(error) => {
                 self.reject(operation.hash).await?;
-                return Ok(Outcome::Rejected(error.to_string()));
+                {
+                    return Ok(Outcome::Rejected(error.to_string()));
+                }
             }
         }
         let grants = match self.verify_frame(frame, time) {
             Ok(grants) => grants,
             Err(error) => {
                 self.reject(operation.hash).await?;
-                return Ok(Outcome::Rejected(error.to_string()));
+                {
+                    return Ok(Outcome::Rejected(error.to_string()));
+                }
             }
         };
         if let Ok(payload) = &payload
@@ -731,7 +726,7 @@ impl<A: RowApplication> Inner<A> {
             }
             if !bundle.contains(id) {
                 match self.status(*id).await? {
-                    ReceiveStatus::Applied | ReceiveStatus::Abandoned => {}
+                    ReceiveStatus::Applied => {}
                     ReceiveStatus::Held if self.visible_held_in_workspace(predecessor)? => {}
                     _ => return Ok(false),
                 }

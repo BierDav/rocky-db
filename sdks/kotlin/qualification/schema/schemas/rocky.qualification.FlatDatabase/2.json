@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 2,
-    "identityHash": "12c87b39ae5ad3264e22d7ff813a6a23",
+    "identityHash": "1ff2509d9c919f625bee091b29e4a73c",
     "entities": [
       {
         "tableName": "shopping_items",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `title` TEXT NOT NULL, `completed` INTEGER NOT NULL, `searchTitle` TEXT NOT NULL DEFAULT '', `row_kind` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `title` TEXT NOT NULL, `completed` INTEGER NOT NULL, `searchTitle` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -32,12 +32,6 @@
             "affinity": "TEXT",
             "notNull": true,
             "defaultValue": "''"
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
-            "affinity": "INTEGER",
-            "notNull": true
           }
         ],
         "primaryKey": {
@@ -62,7 +56,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '12c87b39ae5ad3264e22d7ff813a6a23')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '1ff2509d9c919f625bee091b29e4a73c')"
     ]
   }
 }

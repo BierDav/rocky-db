@@ -13,9 +13,9 @@ import java.io.File
 import java.nio.file.Files
 import kotlin.test.*
 
-/** Two trusted devices compete at one committed head; every reader sees one decision. */
+/** A trusted device decides; every reader sees the decision, and members only ask. */
 class ApprovalsTest {
-    @Test fun concurrentDecisionsConvergeAndMembersOnlyAsk() = runBlocking<Unit> {
+    @Test fun aDecisionReachesEveryDeviceAndMembersOnlyAsk() = runBlocking<Unit> {
         val root = Files.createTempDirectory("rocky-approvals").toFile()
         val databases = mutableListOf<RockyDatabase>()
         val rooms = mutableListOf<ShoppingDatabase>()
@@ -48,16 +48,14 @@ class ApprovalsTest {
             withTimeout(30_000) { b.observeStatus().first { status -> status.network.peers.any { it.node == aKey && it.link.state == LinkState.Open } } }
             val asked = withTimeout(30_000) { approvals[0].requests().first { it.isNotEmpty() } }.single()
             withTimeout(30_000) { approvals[1].requests().first { it.isNotEmpty() } }
-            val attempts = awaitAll(async { approvals[0].decide(asked.key, true) }, async { approvals[1].decide(asked.key, false) })
-            assertEquals(1, attempts.count { it == null })
+            assertNull(approvals[0].decide(asked.key, true))
             val decisions = approvals.map { view ->
                 withTimeout(30_000) { view.requests().first { it.singleOrNull()?.approved != null } }.single().approved
             }
-            assertEquals(1, decisions.distinct().size)
-            assertEquals(attempts[0] == null, decisions[0])
+            assertEquals(listOf(true, true, true), decisions)
+            // A device that holds the decision does not decide again.
+            assertEquals("Another device already approved it", approvals[1].decide(asked.key, false))
             assertFails { approvals[2].decide(asked.key, true) }
-            assertEquals(1L, a.coordinatedStatus().position)
-            assertEquals(1L, b.coordinatedStatus().position)
         } finally {
             observers.forEach { it.cancelAndJoin() }
             rooms.asReversed().forEach { it.close() }

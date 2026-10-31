@@ -18,7 +18,7 @@ async fn buffered(
 
 #[tokio::test]
 async fn failed_flush_keeps_sql_maintenance_queued_until_retry() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let replica = t
         .open(
@@ -43,7 +43,7 @@ async fn failed_flush_keeps_sql_maintenance_queued_until_retry() {
 
 #[tokio::test]
 async fn commit_during_flush_keeps_current_state_out_of_maintenance() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let replica = t
         .open(
@@ -83,7 +83,7 @@ async fn commit_during_flush_keeps_current_state_out_of_maintenance() {
 
 #[tokio::test]
 async fn flushed_commit_defers_maintenance_until_driver_runs() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let replica = t
         .open(
@@ -104,7 +104,7 @@ async fn flushed_commit_defers_maintenance_until_driver_runs() {
 
 #[tokio::test]
 async fn failed_flushed_commit_retains_maintenance_for_driver_retry() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let replica = t
         .open(
@@ -135,7 +135,7 @@ async fn failed_flushed_commit_retains_maintenance_for_driver_retry() {
 #[cfg(feature = "qualification")]
 #[tokio::test]
 async fn sql_status_checks_use_interactive_acquisitions() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let replica = t
         .open(
@@ -172,7 +172,7 @@ async fn sql_status_checks_use_interactive_acquisitions() {
 
 #[tokio::test]
 async fn orphaned_pulled_payload_cleanup_is_bounded_and_resumes_after_reopen() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orphaned-pull.db");
     let node = PrivateKey::new();

@@ -17,7 +17,18 @@ interface RuntimePort {
     suspend fun <T> write(handle: String = newMutationHandle(), block: suspend SqlWrite.() -> T): T
 }
 
-/** Statements of one open transaction. Values are `null`, `Boolean`, `Int`, `Long`, `Double`, `String` or `ByteArray`. */
+/**
+ * Statements of one open transaction. Values are `null`, `Boolean`, `Int`, `Long`, `Double`, `String` or `ByteArray`.
+ *
+ * The transaction replicates as an intent: its statements with their bound values, which every replica replays in
+ * one canonical order. A value read and computed in application code is frozen when bound (read-modify-write), so
+ * write `SET n = n + ?` when the result must follow concurrent writes. Replay refuses clock and random functions:
+ * bind timestamps, such as `updated_at`, as values. A replica drops the whole transaction when its replay fails a
+ * unique index, reference, `CHECK` or [Assertion] (`constraint`), a grant (`admission`), the current schema
+ * (`schema`) or the engine (`engine`); the local commit stays visible until then, and
+ * [RockyDatabase.transactionOutcome] reports it. Ids of new rows come from [nextId]; a row never changes its
+ * partition columns, so a move deletes it and inserts it, with a new id, in the target partition.
+ */
 interface SqlWrite {
     /** A Rocky-issued `id` for a new row of `table`, signed under this device's author. */
     suspend fun nextId(table: String): Long
@@ -171,15 +182,3 @@ data class Device(
 /** Unique operation identity, not a credential. Persist it with the queued action. */
 fun newMutationHandle(): String = kotlin.random.Random.Default.nextBytes(32)
     .joinToString("") { (it.toInt() and 255).toString(16).padStart(2, '0') }
-
-/** SQL commands recorded for an atomic operation; building them performs no database or network work. */
-class SqlChanges internal constructor() {
-    private val statements = mutableListOf<kotlinx.serialization.json.JsonObject>()
-    fun execute(sql: String, vararg values: Any?) {
-        statements += kotlinx.serialization.json.buildJsonObject {
-            put("sql", kotlinx.serialization.json.JsonPrimitive(sql))
-            put("values", kotlinx.serialization.json.JsonArray(values.map(::cell)))
-        }
-    }
-    internal fun json() = kotlinx.serialization.json.JsonArray(statements)
-}

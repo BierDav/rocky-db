@@ -86,7 +86,6 @@ impl Node {
                         .ok_or_else(|| refused("keep must be a non-negative number"))?,
                 };
                 let report = self.replica.compact(scope, keep).await?;
-                self.sign_existence_bases(scope).await?;
                 self.list_checkpoints(scope).await?;
                 self.replica.drop_unrequired_schemas().await?;
                 self.observations.touch();
@@ -520,29 +519,6 @@ impl Node {
         }
     }
 
-    /// The owner signs as itself, a trusted identity through its trusted
-    /// grant and an issuer through its issuer links.
-    /// Signs this device's own existence folds when it may sign tip
-    /// statements, so devices holding part of the data can fetch them.
-    pub(super) async fn sign_existence_bases(&self, scope: Scope) -> Result<(), Failure> {
-        let unsigned = self.replica.unsigned_existence_bases(scope).await?;
-        if unsigned.is_empty() {
-            return Ok(());
-        }
-        let Ok(signer) = self.tip_signer(scope).await else {
-            return Ok(());
-        };
-        for statement in unsigned {
-            let signed = rocky_credentials::SignedExistenceBase::endorse(
-                statement,
-                &*signer.identity,
-                &signer.links,
-            )?;
-            self.replica.install_signed_existence_base(signed).await?;
-        }
-        Ok(())
-    }
-
     /// Lists this device's checkpoints at seals in the graph when it may
     /// sign tip statements, so devices whose compacted seal lost can
     /// rebootstrap from them.
@@ -566,13 +542,13 @@ impl Node {
                 )))
             })
             .collect::<Result<Vec<_>, Failure>>()?;
-        self.replica
-            .publish_tip_statements_through(&records, &super::coordinated::LinkPeers(self))
-            .await?;
+        self.replica.publish_tip_statements(&records).await?;
         self.wake_sync();
         Ok(())
     }
 
+    /// The owner signs as itself, a trusted identity through its trusted
+    /// grant and an issuer through its issuer links.
     pub(super) async fn tip_signer(&self, scope: Scope) -> Result<Signer, Failure> {
         let settings = self.settings.lock().await.clone();
         let identity = settings.identity(&self.vault)?;
@@ -616,10 +592,7 @@ impl Node {
         // The replica's codes stay: `sealed`, `coordinator_unavailable`.
         let before = self.replica.followed_tip().await;
         self.prepare_terminal_credentials().await?;
-        let published = self
-            .replica
-            .publish_tip_statements_through(&statements, &super::coordinated::LinkPeers(self))
-            .await;
+        let published = self.replica.publish_tip_statements(&statements).await;
         self.wake_sync();
         published?;
         self.finalize_seals().await;
@@ -746,14 +719,12 @@ impl Node {
         }
         self.seal_followed(scope, false).await?;
         self.replica.compact(scope, 0).await?;
-        self.sign_existence_bases(scope).await?;
         self.list_checkpoints(scope).await
     }
 
-    /// The owner recovers the followed tip when no in-sync node of its log
-    /// can append: after collecting what reachable devices hold, it seals
-    /// the tip with `continue`, abandoning the committed entries nobody
-    /// holds. Bookmarks on the tip follow the seal.
+    /// The owner recovers the followed tip when no ordinary seal can end its
+    /// log: it seals the tip with `continue`, replacing the log's exact
+    /// head. Bookmarks on the tip follow the seal.
     async fn recover_followed(&self, scope: Scope) -> Result<(), Failure> {
         let settings = self.settings.lock().await.clone();
         if !settings.owner() {
@@ -776,13 +747,8 @@ impl Node {
         }
         let recovery = self
             .replica
-            .recovery_proposal(
-                log,
-                coordinator.as_ref(),
-                &super::coordinated::LinkPeers(self),
-            )
-            .await
-            .map_err(super::coordinated::coordinated)?;
+            .recovery_proposal(log, coordinator.as_ref())
+            .await?;
         let frontier = self
             .replica
             .seal_frontier(scope, false)
@@ -848,7 +814,7 @@ impl Node {
     }
 
     /// On a trusted node with a composed log, ends the logs of journaled
-    /// seals through its live links, acknowledges the terminal entries of
+    /// seals, acknowledges the terminal entries of
     /// its line and publishes the finality records they reach. A failure
     /// leaves the seals to the next call.
     pub(super) async fn finalize_seals(&self) {
@@ -860,11 +826,7 @@ impl Node {
                 );
             }
             let before = self.replica.followed_tip().await;
-            match self
-                .replica
-                .settle_tip_statements(&super::coordinated::LinkPeers(self))
-                .await
-            {
+            match self.replica.settle_tip_statements().await {
                 Ok(0) => {}
                 Ok(_) => {
                     self.followed_tip_changed(before).await;
@@ -917,7 +879,6 @@ impl Node {
         if status.compacted != Some(seal) || self.replica.needs_base_at(scope, seal).await? {
             self.replica.compact(scope, 0).await?;
         }
-        self.sign_existence_bases(scope).await?;
         self.list_checkpoints(scope).await?;
         Ok(())
     }

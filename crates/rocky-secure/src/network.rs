@@ -26,8 +26,6 @@ mod contacts;
 pub mod link;
 pub use contacts::{ContactFuture, ContactHandler, ContactHint, ContactRequest, ContactResponse};
 mod delivery;
-mod entries;
-mod existence;
 mod frontiers;
 mod held;
 use held::HeldMessage;
@@ -42,8 +40,6 @@ use checkpoints::CheckpointMessage;
 use contacts::ContactMessage;
 use delivery::DeliveryMessage;
 pub use delivery::{DELIVERY_PAGE, Delivered, Deliveries, DeliveryFuture, Held, Outgoing};
-use entries::EntryMessage;
-use existence::ExistenceMessage;
 pub use frontiers::FrontierExchange;
 use frontiers::FrontierMessage;
 use holdings::HoldingMessage;
@@ -181,14 +177,12 @@ enum Message {
     Rows(RowMessage),
     Checkpoints(CheckpointMessage),
     Frontiers(FrontierMessage),
-    Existence(ExistenceMessage),
     Revocations(RevocationMessage),
     Holdings(HoldingMessage),
     Contacts(ContactMessage),
     Delivery(DeliveryMessage),
     Chains(ChainMessage),
     LinkState(Vec<(ResourceScope, Commitment)>),
-    Entries(EntryMessage),
     HeldChanges(HeldMessage),
     Tips(TipMessage),
     Placements(PlacementMessage),
@@ -202,14 +196,12 @@ impl Message {
             Self::Rows(_) => "rows",
             Self::Checkpoints(_) => "checkpoints",
             Self::Frontiers(_) => "frontiers",
-            Self::Existence(_) => "existence",
             Self::Revocations(_) => "revocations",
             Self::Holdings(_) => "holdings",
             Self::Contacts(_) => "contacts",
             Self::Delivery(_) => "delivery",
             Self::Chains(_) => "chains",
             Self::LinkState(_) => "link state",
-            Self::Entries(_) => "entries",
             Self::HeldChanges(_) => "held changes",
             Self::Tips(_) => "tips",
             Self::Placements(_) => "placements",
@@ -238,13 +230,11 @@ families!(
     Rows(RowMessage),
     Checkpoints(CheckpointMessage),
     Frontiers(FrontierMessage),
-    Existence(ExistenceMessage),
     Revocations(RevocationMessage),
     Holdings(HoldingMessage),
     Contacts(ContactMessage),
     Delivery(DeliveryMessage),
     Chains(ChainMessage),
-    Entries(EntryMessage),
     HeldChanges(HeldMessage),
     Tips(TipMessage),
     Placements(PlacementMessage),
@@ -288,8 +278,6 @@ pub struct NativeSession {
     binding: Commitment,
     proved: std::collections::BTreeSet<ResourceScope>,
     offered: std::collections::BTreeSet<ResourceScope>,
-    /// A coordinated entry the peer is sending page by page.
-    entry: Option<entries::Receiving>,
     tip_incoming: Vec<crate::TipStatement>,
     contact_requests: usize,
     contact_handed: usize,
@@ -479,7 +467,6 @@ impl NativeSession {
             binding: rocky_core::commitment("rocky.holding-session.v1", &binding),
             proved: Default::default(),
             offered: Default::default(),
-            entry: None,
             tip_incoming: Vec::new(),
             #[cfg(test)]
             sent_counts: SentCounts::default(),
@@ -805,7 +792,6 @@ impl NativeSession {
         let result = match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.entry = None;
                 self.tip_incoming.clear();
                 self.send(Message::Refused {
                     reason: RequestRefusal::of(&error),
@@ -827,8 +813,6 @@ impl NativeSession {
             Message::Rows(message) => self.answer_rows(replica, message).await,
             Message::Checkpoints(message) => self.answer_checkpoints(replica, message).await,
             Message::Frontiers(message) => self.answer_frontiers(replica, message).await,
-            Message::Existence(message) => self.answer_existence(replica, message).await,
-            Message::Entries(message) => self.answer_entries(replica, message).await,
             Message::HeldChanges(message) => self.answer_held(replica, message).await,
             Message::Tips(message) => self.answer_tips(replica, message).await,
             Message::Placements(message) => self.answer_placements(replica, message).await,

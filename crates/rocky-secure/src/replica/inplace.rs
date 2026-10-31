@@ -29,14 +29,7 @@ fn column_sql(column: &LogicalColumn) -> String {
 }
 
 pub(super) fn qualifies(before: &LogicalSchema, after: &LogicalSchema) -> bool {
-    if before.update_policy != after.update_policy || before.views != after.views {
-        return false;
-    }
-    // Constraint resolution keeps candidate copies and a dependency graph;
-    // changing a constrained table, or adding one, rebuilds.
-    if after.tables.iter().any(|new| {
-        after.constrained(new) && before.table(&new.sql_name).is_none_or(|old| old != new)
-    }) {
+    if before.views != after.views {
         return false;
     }
     before.tables.iter().all(|old| {
@@ -48,7 +41,6 @@ pub(super) fn qualifies(before: &LogicalSchema, after: &LogicalSchema) -> bool {
             || old.partition_by != new.partition_by
             || old.partition_group != new.partition_group
             || old.foreign_keys != new.foreign_keys
-            || old.existence_log != new.existence_log
             || old.granted_like != new.granted_like
             || old.auto_generate != new.auto_generate
             || old.indexes.iter().any(|index| !new.indexes.contains(index))
@@ -70,7 +62,7 @@ pub(super) fn qualifies(before: &LogicalSchema, after: &LogicalSchema) -> bool {
             .iter()
             .filter(|column| old.column(&column.sql_name).is_none())
             .all(|column| {
-                column.class == ColumnClass::Mergeable
+                column.class == ColumnClass::Replicated
                     && (!column.not_null
                         || rocky_core::default_value(column)
                             .is_some_and(|value| value != SqlValue::Null))

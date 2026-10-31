@@ -4,10 +4,6 @@ mod shapes;
 pub(in crate::replica) use shapes::SCHEMA as SHAPE_SCHEMA;
 
 pub(super) const SCHEMA: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS secure_seal_candidates(scope INTEGER NOT NULL,row BLOB NOT NULL,PRIMARY KEY(scope,row)) WITHOUT ROWID",
-    "CREATE TRIGGER IF NOT EXISTS secure_seal_candidates_insert AFTER INSERT ON secure_rows BEGIN INSERT INTO secure_seal_candidates SELECT NEW.scope,NEW.row WHERE NOT EXISTS(SELECT 1 FROM secure_seal_candidates WHERE scope=NEW.scope AND row=NEW.row); END",
-    "CREATE TRIGGER IF NOT EXISTS secure_seal_candidates_update AFTER UPDATE OF fields ON secure_rows BEGIN INSERT INTO secure_seal_candidates SELECT NEW.scope,NEW.row WHERE NOT EXISTS(SELECT 1 FROM secure_seal_candidates WHERE scope=NEW.scope AND row=NEW.row); END",
-    "CREATE TRIGGER IF NOT EXISTS secure_seal_candidates_delete AFTER DELETE ON secure_rows BEGIN DELETE FROM secure_seal_candidates WHERE scope=OLD.scope AND row=OLD.row; END",
     "CREATE VIEW IF NOT EXISTS secure_row_records AS SELECT s.scope,r.row,r.fields FROM secure_rows r JOIN secure_scope_state s ON s.id=r.scope",
     "CREATE TRIGGER IF NOT EXISTS secure_records_insert INSTEAD OF INSERT ON secure_row_records BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM secure_scope_state WHERE scope=NEW.scope) THEN RAISE(ABORT,'unknown stored row scope') END; INSERT INTO secure_rows VALUES((SELECT id FROM secure_scope_state WHERE scope=NEW.scope),NEW.row,NEW.fields) ON CONFLICT(scope,row) DO UPDATE SET fields=excluded.fields; END",
     "CREATE TRIGGER IF NOT EXISTS secure_records_update INSTEAD OF UPDATE ON secure_row_records BEGIN UPDATE secure_rows SET fields=NEW.fields WHERE scope=(SELECT id FROM secure_scope_state WHERE scope=OLD.scope) AND row=OLD.row; END",

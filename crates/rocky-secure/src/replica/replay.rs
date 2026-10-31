@@ -10,15 +10,19 @@ use rocky_core::TableClass;
 use rocky_core::replay::{DropReason, Intent, TransactionOutcome};
 use rocky_storage::partition_sql::{TablePartitions, split_intent};
 
+mod base;
 mod constraints;
 pub(crate) mod outcomes;
+mod rebuild;
+pub(super) use base::{SCHEMA as BASE_SCHEMA, add_row, base_sets};
 pub(super) use constraints::{
     Written, cascades, check_member_order, checked, linked, note, written,
 };
 
 pub(super) const SCHEMA: &[&str] = &[
-    // `violated` names the constraint or assertion a `constraint` drop broke.
-    "CREATE TABLE IF NOT EXISTS secure_replayed(scope INTEGER NOT NULL,era INTEGER NOT NULL,clock INTEGER NOT NULL,author INTEGER NOT NULL,sequence INTEGER NOT NULL,hash BLOB NOT NULL UNIQUE,txn BLOB NOT NULL,member INTEGER NOT NULL,members INTEGER NOT NULL,dropped TEXT,sealed INTEGER NOT NULL,undo BLOB,violated TEXT,PRIMARY KEY(scope,era,clock,author,sequence)) WITHOUT ROWID",
+    // `violated` names the constraint or assertion a `constraint` drop broke;
+    // `births` the identities an applied member created, for checkpoints.
+    "CREATE TABLE IF NOT EXISTS secure_replayed(scope INTEGER NOT NULL,era INTEGER NOT NULL,clock INTEGER NOT NULL,author INTEGER NOT NULL,sequence INTEGER NOT NULL,hash BLOB NOT NULL UNIQUE,txn BLOB NOT NULL,member INTEGER NOT NULL,members INTEGER NOT NULL,dropped TEXT,sealed INTEGER NOT NULL,undo BLOB,violated TEXT,births BLOB,PRIMARY KEY(scope,era,clock,author,sequence)) WITHOUT ROWID",
     "CREATE INDEX IF NOT EXISTS secure_replayed_txn ON secure_replayed(txn)",
 ];
 
@@ -351,8 +355,10 @@ impl<A: RowApplication> Inner<A> {
             .iter()
             .filter(|name| !name.eq_ignore_ascii_case(&logical.sql_name))
         {
+            // A linked table this projection does not install has no rows
+            // here to order.
             let (Some(projected), Some(other)) = (typed.by_name(name), schema.table(name)) else {
-                return Err(corrupt());
+                continue;
             };
             if other.partition_by.is_empty() {
                 scopes.push(projected.scope);
@@ -462,6 +468,17 @@ impl<A: RowApplication> Inner<A> {
             #[cfg(any(test, feature = "qualification"))]
             self.crash_at(|point| point == CrashPoint::Rewind)?;
         }
+        // Their births are made again when they redo.
+        let scopes: BTreeSet<i64> = rewound.keys().map(|(_, scope)| *scope).collect();
+        for id in scopes {
+            let based = self
+                .checkpoint_record(id, true)
+                .await?
+                .and_then(|record| record.signed)
+                .map(|signed| signed.statement.identities)
+                .unwrap_or_default();
+            self.reset_replay_ledger(id, &based).await?;
+        }
         let mut redo: Vec<Redo> = Vec::new();
         for ((order, _), (hash, transaction, member, _)) in rewound {
             match redo.iter_mut().find(|redo| redo.transaction == transaction) {
@@ -552,76 +569,113 @@ impl<A: RowApplication> Inner<A> {
         Ok(())
     }
 
-    /// Rebuilds replayed table `table` of a schema switch from its live
-    /// rows, which are its only copy: columns both schemas name keep their
-    /// values, new ones take their defaults. Inside the switch transaction.
+    /// Rebuilds the replayed `tables` of a schema switch from their live
+    /// rows, which are their only copy: columns both schemas name keep their
+    /// values unless a tip on the switch's `path` lacks them, new ones take
+    /// their defaults. Inside the switch transaction. Every old table is
+    /// renamed before any new one exists: SQLite rewrites references to a
+    /// renamed table, so the old tables only name each other.
     pub(super) async fn rebuild_replayed(
         &self,
         installed: &rocky_core::LogicalSchema,
-        table: &rocky_core::LogicalTable,
+        schema: &rocky_core::LogicalSchema,
+        tables: &[&rocky_core::LogicalTable],
+        path: Option<&super::schemas::PathFields>,
     ) -> Result<(), Error> {
-        let name = &table.sql_name;
-        self.conn
-            .execute(
-                format!(
-                    "DROP TABLE IF EXISTS {}",
-                    typed::quoted(&typed::physical(name, true))
+        let old = |name: &str| typed::quoted(&format!("secure_rebuild_{name}"));
+        let mut copies = Vec::new();
+        for table in tables {
+            let name = &table.sql_name;
+            // A table of the installed schema this projection never created
+            // starts empty.
+            let created = !rows(
+                &self.conn,
+                &format!(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='{}'",
+                    name.replace('\'', "''")
                 ),
-                (),
             )
-            .await?;
-        let before = installed.table(name);
-        let kept: Vec<String> = before
-            .iter()
-            .flat_map(|before| &before.columns)
-            .filter(|column| {
-                table.column(&column.sql_name).is_some_and(|kept| {
-                    !matches!(kept.class, rocky_core::ColumnClass::Derived { .. })
+            .await?
+            .is_empty();
+            let Some(before) = installed.table(name).filter(|_| created) else {
+                continue;
+            };
+            let on_path = |column: &rocky_core::LogicalColumn| {
+                path.is_none_or(|path| {
+                    path.tables.contains(&schema.table_id(table))
+                        && path.fields.contains(&schema.field_id(table, column))
                 })
-            })
-            .map(|column| typed::quoted(&column.sql_name))
-            .collect();
-        let old = format!("secure_rebuild_{name}");
-        if before.is_some() {
-            // References from other tables keep naming the table itself.
-            self.conn
-                .execute("PRAGMA legacy_alter_table=ON", ())
-                .await?;
+            };
+            let kept: Vec<String> = before
+                .columns
+                .iter()
+                .filter(|column| {
+                    table.column(&column.sql_name).is_some_and(|kept| {
+                        !matches!(kept.class, rocky_core::ColumnClass::Derived { .. })
+                            && on_path(kept)
+                    })
+                })
+                .map(|column| typed::quoted(&column.sql_name))
+                .collect();
             self.conn
                 .execute(
-                    format!(
-                        "ALTER TABLE {} RENAME TO {}",
-                        typed::quoted(name),
-                        typed::quoted(&old)
-                    ),
+                    format!("ALTER TABLE {} RENAME TO {}", typed::quoted(name), old(name)),
                     (),
                 )
                 .await?;
+            copies.push((*table, before, kept));
         }
-        self.conn.execute(table.create_sql.clone(), ()).await?;
-        if before.is_some() {
+        for table in tables {
+            self.conn.execute(table.create_sql.clone(), ()).await?;
+        }
+        self.conn
+            .execute("PRAGMA defer_foreign_keys=ON", ())
+            .await?;
+        for (table, _, kept) in &copies {
+            if !kept.is_empty() {
+                self.conn
+                    .execute(
+                        format!(
+                            "INSERT INTO {}({columns}) SELECT {columns} FROM {}",
+                            typed::quoted(&table.sql_name),
+                            old(&table.sql_name),
+                            columns = kept.join(",")
+                        ),
+                        (),
+                    )
+                    .await?;
+            }
+        }
+        // Children first, so that no old row is left referencing a dropped
+        // parent.
+        let mut left: Vec<_> = copies.iter().map(|(_, before, _)| *before).collect();
+        while !left.is_empty() {
+            let leaf = left
+                .iter()
+                .position(|table| {
+                    !left.iter().any(|child| {
+                        child.sql_name != table.sql_name
+                            && child
+                                .foreign_keys
+                                .iter()
+                                .any(|key| key.table.eq_ignore_ascii_case(&table.sql_name))
+                    })
+                })
+                .unwrap_or(0);
+            let table = left.remove(leaf);
             self.conn
-                .execute(
-                    format!(
-                        "INSERT INTO {}({columns}) SELECT {columns} FROM {}",
-                        typed::quoted(name),
-                        typed::quoted(&old),
-                        columns = kept.join(",")
-                    ),
-                    (),
-                )
-                .await?;
-            self.conn
-                .execute(format!("DROP TABLE {}", typed::quoted(&old)), ())
-                .await?;
-            self.conn
-                .execute("PRAGMA legacy_alter_table=OFF", ())
+                .execute(format!("DROP TABLE {}", old(&table.sql_name)), ())
                 .await?;
         }
-        for index in &table.indexes {
-            self.conn.execute(index.create_sql.clone(), ()).await?;
+        self.conn
+            .execute("PRAGMA defer_foreign_keys=OFF", ())
+            .await?;
+        for table in tables {
+            for index in &table.indexes {
+                self.conn.execute(index.create_sql.clone(), ()).await?;
+            }
+            self.touch(&table.sql_name);
         }
-        self.touch(name);
         Ok(())
     }
 
@@ -664,7 +718,16 @@ impl<A: RowApplication> Inner<A> {
                 .collect();
             changed.insert(table.sql_name.to_ascii_lowercase(), sources);
         }
-        if changed.is_empty() {
+        // A removed table's rows are gone: a rewind restores none of them.
+        let removed: BTreeSet<String> = before
+            .tables
+            .iter()
+            .filter(|table| {
+                table.class == TableClass::Replayed && after.table(&table.sql_name).is_none()
+            })
+            .map(|table| table.sql_name.to_ascii_lowercase())
+            .collect();
+        if changed.is_empty() && removed.is_empty() {
             return Ok(());
         }
         let corrupt = || Error::Corrupt("undo record".into());
@@ -682,7 +745,9 @@ impl<A: RowApplication> Inner<A> {
                 return Err(corrupt());
             };
             let mut undo = undo_of(undo)?;
-            let mut touched = false;
+            let kept = undo.len();
+            undo.retain(|entry| !removed.contains(&entry.table.to_ascii_lowercase()));
+            let mut touched = undo.len() != kept;
             for entry in &mut undo {
                 let Some(sources) = changed.get(&entry.table.to_ascii_lowercase()) else {
                     continue;
@@ -725,24 +790,51 @@ impl<A: RowApplication> Inner<A> {
         })
     }
 
-    /// Whether every transaction replayed in the scope stored as `id`
-    /// stays on the workspace's path, so its rows are the path's state. A
-    /// replayed scope keeps no row records to rebuild from.
+    /// Whether the scope stored as `id` replayed exactly the transactions
+    /// of the workspace's path after its base, so its rows are the path's
+    /// state. A replayed scope keeps no row records to rebuild from.
     pub(super) async fn replayed_on_path(&self, id: i64) -> Result<bool, Error> {
+        let dbg = self.checkpoint_record(id, true).await?;
+        eprintln!("DBG on_path {id} record={:?} path={:?}", dbg.as_ref().map(|r| (r.position, r.signed.as_ref().map(|s| s.statement.seal))), self.workspace.typed.as_ref().map(|t| self.path_seals(t.domain).map(|p| p.iter().map(|k| k.id().ok()).collect::<Vec<_>>())));
+        let floor = match self.checkpoint_record(id, true).await? {
+            None => 0,
+            Some(record) => {
+                // A base at a seal the path leaves holds another line's rows.
+                if let Some(seal) = record.signed.as_ref().and_then(|signed| signed.statement.seal)
+                    && let Some(typed) = &self.workspace.typed
+                    && !self
+                        .path_seals(typed.domain)?
+                        .iter()
+                        .any(|known| known.id().ok() == Some(seal))
+                {
+                    return Ok(false);
+                }
+                record.position
+            }
+        };
         for record in collect_rows(
             self.conn
-                .query("SELECT hash FROM secure_replayed WHERE scope=?", [id])
+                .query(
+                    "SELECT a.hash,r.hash IS NOT NULL FROM secure_applied a LEFT JOIN secure_replayed r ON r.hash=a.hash WHERE a.scope=? AND (r.hash IS NOT NULL OR a.position>?)",
+                    [id, floor],
+                )
                 .await?,
         )
         .await?
         {
-            let [SqlValue::Blob(hash)] = record.as_slice() else {
+            let [SqlValue::Blob(hash), SqlValue::Integer(replayed)] = record.as_slice() else {
                 return Err(Error::Corrupt("replayed transaction".into()));
             };
-            let Some(frame) = self.frame(super::checkpoint::hash_of(hash)?).await? else {
-                return Ok(false);
+            let frame = self.frame(super::checkpoint::hash_of(hash)?).await?;
+            let visible = match &frame {
+                Some(frame) => {
+                    self.visible_in_workspace(&frame.operation()?)?
+                        && self.row_payload(frame)?.intent().is_some()
+                }
+                None => false,
             };
-            if !self.visible_in_workspace(&frame.operation()?)? {
+            eprintln!("DBG member {id} {:?} visible={visible} replayed={replayed}", &hash[..4]);
+            if visible != (*replayed != 0) {
                 return Ok(false);
             }
         }
@@ -753,12 +845,19 @@ impl<A: RowApplication> Inner<A> {
     /// applied after each `(scope, through)` cut: they rewind, with what
     /// follows them, and redo in the new era, after every transaction the
     /// seal covers. Their identity and stamp stay; outcomes may change.
+    /// A kept seal is marked once the live tables hold exactly its state,
+    /// so its history records what the transactions behind it replace.
     pub(super) async fn order_behind_seal(
         &self,
         cuts: &[(i64, i64)],
         era: i64,
         time: u64,
+        kept: Option<(Commitment, &[history::KeptBound])>,
     ) -> Result<(), Error> {
+        let mark = async || match kept {
+            Some((seal, bounds)) => self.mark_seal(seal, bounds).await,
+            None => Ok(()),
+        };
         let corrupt = || Error::Corrupt("replayed member".into());
         let mut starts = Vec::new();
         let mut moved = BTreeSet::new();
@@ -783,7 +882,7 @@ impl<A: RowApplication> Inner<A> {
             }
         }
         if starts.is_empty() {
-            return Ok(());
+            return mark().await;
         }
         let mut redo = self.rewind(starts).await?;
         for redo in &mut redo {
@@ -792,7 +891,11 @@ impl<A: RowApplication> Inner<A> {
             }
         }
         redo.sort_by(|a, b| a.order.cmp(&b.order));
-        self.redo(redo, time).await
+        let behind = redo.partition_point(|redo| redo.order.0 < era);
+        let later = redo.split_off(behind);
+        self.redo(redo, time).await?;
+        mark().await?;
+        self.redo(later, time).await
     }
 
     /// A seal finalized `scope` through `through`: the transactions it
@@ -895,6 +998,7 @@ impl<A: RowApplication> Inner<A> {
             .await?;
             // A created identity stays reserved, whatever later rewinds do.
             let scope = frame.scope()?;
+            self.record_births(frame, births).await?;
             for birth in births {
                 self.put_identity_mark(scope, birth, identity::Raise::Own)
                     .await?;
@@ -971,6 +1075,16 @@ impl<A: RowApplication> Inner<A> {
 
     /// Replays rewound transactions again, in canonical order.
     async fn redo(&self, redo: Vec<Redo>, time: u64) -> Result<(), Error> {
+        self.redo_recorded(redo, time, None).await
+    }
+    /// `redo`; a member `recorded` names keeps the admission it was
+    /// recorded with, under the authority it was admitted with.
+    async fn redo_recorded(
+        &self,
+        redo: Vec<Redo>,
+        time: u64,
+        recorded: Option<&BTreeMap<Hash, bool>>,
+    ) -> Result<(), Error> {
         for (index, redo) in redo.into_iter().enumerate() {
             #[cfg(any(test, feature = "qualification"))]
             if index > 0 {
@@ -994,8 +1108,12 @@ impl<A: RowApplication> Inner<A> {
                     return Err(Error::Rejected(KEY_WAITS.into()));
                 }
                 let payload = self.row_payload(&frame)?;
-                // Admission is never carried across a grant change.
-                let grants = self.verify_frame(&frame, time).ok();
+                // A rewind never carries admission across a grant change.
+                let grants = match recorded.and_then(|recorded| recorded.get(&hash)) {
+                    Some(true) => self.historical_frame_authority(&frame).ok(),
+                    Some(false) => None,
+                    None => self.verify_frame(&frame, time).ok(),
+                };
                 opened.push((frame, payload, grants, member));
             }
             let mut intents = Vec::with_capacity(opened.len());
@@ -1056,7 +1174,7 @@ impl<A: RowApplication> Inner<A> {
         }
         self.conn
             .execute(
-                format!("INSERT INTO secure_replayed VALUES(?,COALESCE(?,{OPEN_ERA}),?,?,?,?,?,?,?,?,0,?,?)"),
+                format!("INSERT INTO secure_replayed VALUES(?,COALESCE(?,{OPEN_ERA}),?,?,?,?,?,?,?,?,0,?,?,NULL)"),
                 bindings(vec![
                     SqlValue::Integer(id),
                     era.map_or(SqlValue::Null, SqlValue::Integer),
@@ -1081,6 +1199,28 @@ impl<A: RowApplication> Inner<A> {
         Ok(())
     }
 
+    /// Notes the identities a recorded member created and raises the
+    /// scope's replay ledger with them.
+    pub(super) async fn record_births(
+        &self,
+        frame: &EncryptedFrame,
+        births: &[checkpoint::IdentityMark],
+    ) -> Result<(), Error> {
+        if births.is_empty() {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE secure_replayed SET births=? WHERE hash=?",
+                [encode(&births)?, frame.id()?.as_bytes().to_vec()],
+            )
+            .await?;
+        let scope = frame.scope()?;
+        for birth in births {
+            self.fold_ledger(scope, birth).await?;
+        }
+        Ok(())
+    }
     /// Runs one member's statements on its partition inside the caller's
     /// savepoint and admits their effects against the author's grants.
     /// Returns what it changed, or why the transaction drops; the caller
@@ -1099,10 +1239,11 @@ impl<A: RowApplication> Inner<A> {
             .as_ref()
             .ok_or_else(|| denied("no typed tables"))?;
         let schema = typed.rows.schema();
-        let table = typed
-            .rows
-            .table(&scope.table)
-            .ok_or_else(|| denied("an intent names an unknown table"))?;
+        // A table the installed schema removed no longer compiles; another
+        // tip may hold it again.
+        let Some(table) = typed.rows.table(&scope.table) else {
+            return Ok(Err(DropReason::Schema.into()));
+        };
         let logical = schema
             .table(&table.sql_name)
             .filter(|logical| logical.class == TableClass::Replayed)
@@ -1120,7 +1261,6 @@ impl<A: RowApplication> Inner<A> {
                 complete: held.is_empty(),
                 held,
                 waiting: Vec::new(),
-                support: false,
             },
         )]);
         let mut copies = Vec::with_capacity(intent.statements.len());
@@ -1140,6 +1280,7 @@ impl<A: RowApplication> Inner<A> {
         // transaction: they are captured, admitted and undone with it. The
         // parents of what changes are read for its foreign keys.
         let reached = cascades(schema, &logical.sql_name);
+        let off_path = self.off_path(header, schema, logical);
         let mut scopes = BTreeSet::from([scope]);
         scopes.extend(
             checked(schema, &reached)
@@ -1227,12 +1368,19 @@ impl<A: RowApplication> Inner<A> {
             else {
                 return Ok(Err(DropReason::Engine.into()));
             };
+            if own && !off_path.is_empty() {
+                keep_off_path(conn, captured, &touched, &off_path)?;
+            }
             let Some((change, image)) = replayed_change(conn, typed, captured, &touched)? else {
                 continue;
             };
             // A delete action follows from the parent's change, which the
             // author's grants admitted, as it is derived for mergeable rows.
-            if own && (change.scope != scope || !change.permitted_by(grants)) {
+            let mut named = change.clone();
+            if let Some(after) = named.after.as_mut().filter(|_| named.before.is_none()) {
+                after.retain(|field, _| !off_path.iter().any(|(_, id, _)| id == field));
+            }
+            if own && (change.scope != scope || !named.permitted_by(grants)) {
                 return Ok(Err(DropReason::Admission.into()));
             }
             match self.replayed_birth(&change, header.extensions.author) {
@@ -1258,6 +1406,38 @@ impl<A: RowApplication> Inner<A> {
         }))
     }
 
+    /// The current fields of `logical` missing at some tip between the
+    /// frame's and the workspace's, by column position, with their
+    /// defaults: the frame cannot have written them.
+    fn off_path(
+        &self,
+        header: &p2panda_core::Header<Extensions>,
+        schema: &rocky_core::LogicalSchema,
+        logical: &rocky_core::LogicalTable,
+    ) -> Vec<(usize, Commitment, SqlValue)> {
+        let extension = &header.extensions;
+        let Ok(path) = self.path_fields(extension.scope.domain, extension.tip) else {
+            return Vec::new();
+        };
+        let declared: BTreeSet<_> = self
+            .definition
+            .fields
+            .iter()
+            .map(|field| field.id)
+            .collect();
+        logical
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, column)| {
+                let id = schema.field_id(logical, column);
+                (declared.contains(&id) && !path.fields.contains(&id)).then(|| {
+                    let default = rocky_core::default_value(column).unwrap_or(SqlValue::Null);
+                    (index, id, default)
+                })
+            })
+            .collect()
+    }
     /// The identity a replayed change creates. Only its author's own
     /// number may create one, as `next_id` allocates them.
     pub(super) fn replayed_birth(
@@ -1278,8 +1458,62 @@ impl<A: RowApplication> Inner<A> {
         if Some(identity.author()) != author {
             return Err(denied("a replayed insert names another author's identity"));
         }
+        // The scope's history created this identity before, retired or not.
+        if !self
+            .conn
+            .connection()
+            .rows(
+                "SELECT 1 FROM secure_identity_ledger WHERE scope=? AND author=? AND sequence>=?",
+                storage::bindings(vec![
+                    SqlValue::Blob(encode(&change.scope)?),
+                    SqlValue::Integer(i64::from(identity.author())),
+                    SqlValue::Integer(i64::from(identity.sequence())),
+                ]),
+            )?
+            .is_empty()
+        {
+            return Err(denied("a replayed insert reuses an identity"));
+        }
         Ok(Some(identity))
     }
+}
+
+/// Sets a touched row's fields that are off the frame's path back to
+/// their value before it, or their default in a row it inserted.
+fn keep_off_path(
+    conn: &sqlite::Connection,
+    captured: &rocky_storage::capture::Table,
+    touched: &rocky_storage::capture::Touched,
+    off_path: &[(usize, Commitment, SqlValue)],
+) -> Result<(), Error> {
+    let corrupt = || Error::Corrupt("replayed row image".into());
+    let Some(values) = conn
+        .rows(&captured.select, storage::bindings(touched.key.clone()))?
+        .into_iter()
+        .next()
+    else {
+        return Ok(());
+    };
+    let mut image = captured.image(&values).map_err(|_| corrupt())?;
+    let mut changed = false;
+    for (index, _, default) in off_path {
+        let kept = touched
+            .before
+            .as_ref()
+            .map_or(Some(default), |before| before.get(*index))
+            .ok_or_else(corrupt)?;
+        let value = image.get_mut(*index).ok_or_else(corrupt)?;
+        if value != kept {
+            *value = kept.clone();
+            changed = true;
+        }
+    }
+    if changed {
+        let mut values = captured.stored(&image);
+        values.extend(touched.key.iter().cloned());
+        conn.rows(&captured.update_image(), storage::bindings(values))?;
+    }
+    Ok(())
 }
 
 /// The change a replayed table's captured row went through, as grants see

@@ -1,20 +1,6 @@
 //! Writes to replayed tables commit as intent frames.
 use super::*;
 
-/// `salaries` replicates as intents; `items` stays mergeable.
-fn replayed() -> Typed {
-    let mut schema = Typed::new(UpdatePolicy::Changed).schema;
-    let publisher = PrivateKey::new();
-    schema.publisher = *publisher.public_key().as_bytes();
-    let salaries = schema
-        .tables
-        .iter_mut()
-        .find(|table| table.sql_name == "salaries")
-        .unwrap();
-    salaries.class = TableClass::Replayed;
-    Typed::with_schema(publisher, schema)
-}
-
 fn opened(
     t: &Typed,
     frame: &EncryptedFrame,
@@ -31,8 +17,8 @@ fn opened(
 }
 
 #[tokio::test]
-async fn replayed_writes_commit_as_intents_and_never_beside_mergeable_rows() {
-    let t = replayed();
+async fn replayed_writes_commit_as_intents() {
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let node = PrivateKey::new();
@@ -40,23 +26,6 @@ async fn replayed_writes_commit_as_intents_and_never_beside_mergeable_rows() {
         .open(&dir.path().join("a.db"), &node, t.full(), &both)
         .await;
     let session = sql(&alice, &both).await;
-    // Mergeable rows could not drop with intents: they commit apart.
-    session.run("BEGIN", vec![]).await.unwrap();
-    insert(&session, "INSERT INTO salaries VALUES('bob',1)", vec![])
-        .await
-        .unwrap();
-    insert(&session, "INSERT INTO items VALUES('a','apples',0)", vec![])
-        .await
-        .unwrap();
-    assert!(matches!(
-        session.commit([9; 32]).await,
-        Err(Error::Rejected(_))
-    ));
-    assert!(
-        select(&session, "SELECT key FROM salaries")
-            .await
-            .is_empty()
-    );
     session.run("BEGIN IMMEDIATE", vec![]).await.unwrap();
     insert(&session, "INSERT INTO salaries VALUES('ann',10)", vec![])
         .await
@@ -93,14 +62,9 @@ async fn replayed_writes_commit_as_intents_and_never_beside_mergeable_rows() {
     let mut intents = Vec::new();
     for frame in &frames {
         let (writes, carried) = opened(&t, frame);
-        match frame.scope().unwrap() {
-            scope if scope == t.items => assert!(carried.is_none() && writes.len() == 1),
-            scope if scope == t.salaries => {
-                assert!(writes.is_empty());
-                intents.push(carried.unwrap());
-            }
-            scope => panic!("unexpected scope {scope:?}"),
-        }
+        assert_eq!(frame.scope().unwrap(), t.salaries);
+        assert!(writes.is_empty());
+        intents.push(carried.unwrap());
     }
     let [intent] = intents.as_slice() else {
         panic!("one intent frame");
@@ -159,7 +123,7 @@ async fn replayed_writes_commit_as_intents_and_never_beside_mergeable_rows() {
 
 #[tokio::test]
 async fn nondeterministic_replayed_writes_are_refused_before_they_run() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -195,7 +159,7 @@ async fn nondeterministic_replayed_writes_are_refused_before_they_run() {
 
 #[tokio::test]
 async fn a_single_row_intent_authors_within_its_statement_budget() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -208,9 +172,6 @@ async fn a_single_row_intent_authors_within_its_statement_budget() {
         .await;
     let session = sql(&alice, &both).await;
     insert(&session, "INSERT INTO salaries VALUES('ann',10)", vec![])
-        .await
-        .unwrap();
-    insert(&session, "INSERT INTO items VALUES('a','apples',0)", vec![])
         .await
         .unwrap();
     let count = |sql: &'static str| {
@@ -235,11 +196,8 @@ async fn a_single_row_intent_authors_within_its_statement_budget() {
             (total, commit - begin + 1)
         }
     };
-    let mergeable = count("UPDATE items SET done=1 WHERE key='a'").await;
     let replayed = count("UPDATE salaries SET amount=amount+1 WHERE key='ann'").await;
-    println!(
-        "P4 author_statements total/transaction mergeable={mergeable:?} replayed={replayed:?}"
-    );
+    println!("P4 author_statements total/transaction replayed={replayed:?}");
     assert!(replayed.1 <= 43, "{replayed:?} statements");
 }
 
@@ -296,7 +254,7 @@ async fn outcomes(replica: &EncryptedReplica<TypedRows>) -> Vec<Option<String>> 
 
 #[tokio::test]
 async fn concurrent_increments_replay_in_order_and_both_apply() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let open = |name: &'static str| {
@@ -386,7 +344,7 @@ async fn create(
 
 #[tokio::test]
 async fn an_earlier_arrival_rewinds_and_redo_reevaluates_later_outcomes() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let open = |name: &'static str| {
@@ -429,7 +387,7 @@ async fn an_earlier_arrival_rewinds_and_redo_reevaluates_later_outcomes() {
 
 #[tokio::test]
 async fn a_seal_ends_rewinds_and_makes_drops_final() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let open = |name: &'static str| {
@@ -497,7 +455,7 @@ fn replay_stamp(frame: &EncryptedFrame) -> (u64, u32, u64) {
 
 #[tokio::test]
 async fn a_failing_replay_drops_its_transaction_and_the_log_continues() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -568,7 +526,7 @@ async fn a_failing_replay_drops_its_transaction_and_the_log_continues() {
 
 #[tokio::test]
 async fn replayed_effects_outside_the_authors_grants_drop_as_admission() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -629,7 +587,7 @@ async fn replayed_effects_outside_the_authors_grants_drop_as_admission() {
 
 #[tokio::test]
 async fn a_single_row_intent_receives_within_its_statement_budget() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -658,21 +616,6 @@ async fn a_single_row_intent_receives_within_its_statement_budget() {
         .try_into()
         .unwrap();
     bob.receive(created).await.unwrap();
-    insert(&session, "INSERT INTO items VALUES('a','apples',0)", vec![])
-        .await
-        .unwrap();
-    for frame in transfer(&alice, &bob, t.items).await.frames {
-        bob.receive(frame).await.unwrap();
-    }
-    let [edit] = session
-        .run("UPDATE items SET done=1 WHERE key='a'", vec![])
-        .await
-        .unwrap()
-        .committed
-        .unwrap()
-        .frames
-        .try_into()
-        .unwrap();
     // The whole call, and the received frame's own application in it.
     let count = |frame: EncryptedFrame| {
         let bob = &bob;
@@ -693,11 +636,8 @@ async fn a_single_row_intent_receives_within_its_statement_budget() {
             )
         }
     };
-    let mergeable = count(edit).await;
     let replayed = count(raise(&session, 1).await).await;
-    println!(
-        "P4 receive_statements total/application mergeable={mergeable:?} replayed={replayed:?}"
-    );
+    println!("P4 receive_statements total/application replayed={replayed:?}");
     assert!(replayed.1 <= 45, "{replayed:?} statements");
 }
 
@@ -707,7 +647,7 @@ async fn a_single_row_intent_receives_within_its_statement_budget() {
 #[tokio::test]
 async fn a_thirty_two_row_intent_receives_within_its_statements_per_row() {
     const ROWS: usize = 32;
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -805,7 +745,7 @@ async fn a_thirty_two_row_intent_receives_within_its_statements_per_row() {
 
 #[tokio::test]
 async fn a_rewind_across_the_open_tip_redoes_every_transaction() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let open = |name: &'static str| {
@@ -854,7 +794,7 @@ async fn a_rewind_across_the_open_tip_redoes_every_transaction() {
 
 #[tokio::test]
 async fn replayed_inserts_take_their_authors_own_identities() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let (a, b) = (PrivateKey::new(), PrivateKey::new());
@@ -923,7 +863,7 @@ async fn replayed_inserts_take_their_authors_own_identities() {
 
 #[tokio::test]
 async fn an_update_to_equal_values_needs_no_right() {
-    let t = replayed();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t

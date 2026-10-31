@@ -2,7 +2,6 @@
 use crate::{Failure, domain::Domain, enrollment::Settings, schema::Schema};
 use rocky_core::{Commitment, TipId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 
 pub(crate) const PROTOCOL: &[u8] = b"rocky.sdk.tip-schema.v1\n";
 const FORMAT: u32 = 1;
@@ -98,7 +97,6 @@ impl Record {
             settings.mesh,
             settings.domain,
             self.generation,
-            &BTreeSet::new(),
         )?;
         if domain.manifest().hash() != expected {
             return Err("tip schema commitment mismatch".into());
@@ -141,9 +139,6 @@ impl Bootstrap {
         }
         for checkpoint in &self.graph.checkpoints {
             checkpoint.verify(settings.publisher, &self.graph)?;
-        }
-        for carry in &self.graph.carries {
-            self.graph.verify_carry(carry, settings.publisher, None)?;
         }
         let mut graph = self.graph.clone();
         graph.exclude_revoked(&settings.revocations)?;

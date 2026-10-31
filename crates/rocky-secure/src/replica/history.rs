@@ -6,10 +6,9 @@
 use super::typed::{Typed, quoted};
 use super::*;
 use rocky_core::Scope;
-use std::sync::atomic::AtomicUsize;
 
 mod rewind;
-pub(super) use rewind::{KEPT_ROWS, KeptBound};
+pub(super) use rewind::{KeptBound, Rewind};
 
 pub(super) const SCHEMA: &[&str] = &[
     // The live tables' change counter. A change made at `version` records
@@ -83,7 +82,6 @@ pub(super) struct History {
     key: Vec<String>,
     /// What each unique index compares.
     uniques: Vec<Unique>,
-    row_kind: bool,
 }
 /// One unique index: its quoted columns, then its expressions and predicate
 /// as rules over logical column names.
@@ -151,7 +149,6 @@ impl History {
                             predicate: index.predicate.clone(),
                         })
                         .collect(),
-                    row_kind: logical.column("row_kind").is_some(),
                 })
             })
             .collect()
@@ -297,27 +294,49 @@ impl History {
             h = self.history,
         )
     }
+    /// Whether `version` is the version at `mark` of the key `image` names.
+    fn at_mark(&self, version: &str, image: &str, mark: i64) -> String {
+        format!(
+            "{version}.rocky_version=(SELECT MIN(p.rocky_version) FROM main.{h} AS p WHERE {} AND p.rocky_version>{mark})",
+            Self::same(&self.key, "p", image),
+            h = self.history,
+        )
+    }
+    /// Deletes the live rows that changed since `mark` and differ from
+    /// their version then.
+    fn rewind_deletes(&self, mark: i64) -> String {
+        format!(
+            "DELETE FROM main.{live} WHERE EXISTS(SELECT 1 FROM main.{h} AS r WHERE {} AND {} AND (r.rocky_absent=1 OR {}))",
+            Self::same(&self.key, "r", &self.live),
+            self.at_mark("r", &self.live, mark),
+            self.differs("r", &self.live),
+            live = self.live,
+            h = self.history,
+        )
+    }
+    /// Inserts the versions at `mark` of the keys no live row holds.
+    fn rewind_inserts(&self, mark: i64) -> String {
+        format!(
+            "INSERT INTO main.{live}({}) SELECT {} FROM main.{h} AS r WHERE r.rocky_absent=0 AND {} AND NOT EXISTS(SELECT 1 FROM main.{live} AS l WHERE {})",
+            self.columns(),
+            Self::list(&self.columns, "r"),
+            self.at_mark("r", "r", mark),
+            Self::same(&self.key, "l", "r"),
+            live = self.live,
+            h = self.history,
+        )
+    }
     /// The table's SQL name.
     pub(super) fn name(&self) -> String {
         unquoted(&self.live)
     }
-    /// This table's rows at `mark`, showing `columns`. Support rows are
-    /// filtered.
+    /// This table's rows at `mark`, showing `columns`.
     fn select(&self, mark: i64, columns: &[String]) -> String {
-        let support = |image: &str| {
-            if self.row_kind {
-                format!("{image}.\"row_kind\"=0 AND ")
-            } else {
-                String::new()
-            }
-        };
         format!(
-            "SELECT {} FROM main.{live} AS l WHERE {}NOT EXISTS(SELECT 1 FROM main.{h} AS p WHERE {} AND p.rocky_version>{mark}) UNION ALL SELECT {} FROM main.{h} AS r WHERE {}r.rocky_absent=0 AND r.rocky_version=(SELECT MIN(p.rocky_version) FROM main.{h} AS p WHERE {} AND p.rocky_version>{mark})",
+            "SELECT {} FROM main.{live} AS l WHERE NOT EXISTS(SELECT 1 FROM main.{h} AS p WHERE {} AND p.rocky_version>{mark}) UNION ALL SELECT {} FROM main.{h} AS r WHERE r.rocky_absent=0 AND r.rocky_version=(SELECT MIN(p.rocky_version) FROM main.{h} AS p WHERE {} AND p.rocky_version>{mark})",
             Self::list(columns, "l"),
-            support("l"),
             Self::same(&self.key, "p", "l"),
             Self::list(columns, "r"),
-            support("r"),
             Self::same(&self.key, "p", "r"),
             live = self.live,
             h = self.history,
@@ -325,13 +344,9 @@ impl History {
     }
 }
 
-/// Bulk rebuilds of live tables in progress: they pause the triggers and
-/// record their difference at the end.
+/// Whether a schema switch rebuilds the live tables.
 #[derive(Default)]
 pub(crate) struct Bulk {
-    depth: AtomicUsize,
-    /// Live tables copied before the outermost rebuild began.
-    copied: std::sync::Mutex<BTreeSet<String>>,
     /// A schema switch records its own difference: a rebuild inside it
     /// records nothing, since the new tables' history is not installed yet.
     switching: std::sync::atomic::AtomicBool,
@@ -453,97 +468,6 @@ impl<A: RowApplication> Inner<A> {
         Ok(!rows(&self.conn, "SELECT 1 FROM secure_kept_marks LIMIT 1")
             .await?
             .is_empty())
-    }
-    /// Before a bulk rebuild of `tables`, by SQL name: copies them and
-    /// pauses the triggers, when a seal is kept.
-    pub(super) async fn begin_bulk(&self, tables: &[String]) -> Result<bool, Error> {
-        if self.workspace.bulk.switching.load(Ordering::SeqCst) || !self.kept().await? {
-            return Ok(false);
-        }
-        let outer = self.workspace.bulk.depth.fetch_add(1, Ordering::SeqCst) == 0;
-        let result = async {
-            if outer {
-                self.conn
-                    .execute("INSERT INTO secure_kept_clock(id,version,paused) VALUES(1,1,1) ON CONFLICT(id) DO UPDATE SET paused=1", ())
-                    .await?;
-            }
-            for history in self.histories() {
-                let name = history.live.clone();
-                if !tables
-                    .iter()
-                    .any(|table| quoted(table).eq_ignore_ascii_case(&name))
-                {
-                    continue;
-                }
-                let fresh = self
-                    .workspace
-                    .bulk
-                    .copied
-                    .lock()
-                    .map_err(|_| Error::Corrupt("bulk history".into()))?
-                    .insert(name.to_ascii_lowercase());
-                if !fresh {
-                    continue;
-                }
-                self.copy_before(&history).await?;
-            }
-            Ok(())
-        }
-        .await;
-        if result.is_err() {
-            self.end_bulk(false).await?;
-        }
-        result.map(|_| true)
-    }
-    /// Runs `work`, a bulk rebuild of `tables`, recording what it changes
-    /// in history at the end rather than row by row.
-    pub(super) async fn in_bulk<T>(
-        &self,
-        tables: &[String],
-        work: impl std::future::Future<Output = Result<T, Error>>,
-    ) -> Result<T, Error> {
-        let active = self.begin_bulk(tables).await?;
-        let result = work.await;
-        if active {
-            match &result {
-                Ok(_) => self.end_bulk(true).await?,
-                Err(_) => {
-                    // The failed rebuild's transaction rolls the copies back.
-                    let _ = self.end_bulk(false).await;
-                }
-            }
-        }
-        result
-    }
-    /// After a bulk rebuild: the outermost records what differs from the
-    /// copies, unless the rebuild failed, and resumes the triggers.
-    pub(super) async fn end_bulk(&self, record: bool) -> Result<(), Error> {
-        if self.workspace.bulk.depth.fetch_sub(1, Ordering::SeqCst) != 1 {
-            return Ok(());
-        }
-        let copied = std::mem::take(
-            &mut *self
-                .workspace
-                .bulk
-                .copied
-                .lock()
-                .map_err(|_| Error::Corrupt("bulk history".into()))?,
-        );
-        for history in self.histories() {
-            if !copied.contains(&history.live.to_ascii_lowercase()) {
-                continue;
-            }
-            if record {
-                self.record_difference(&history, &history.columns).await?;
-            }
-            self.conn
-                .execute(format!("DROP TABLE IF EXISTS temp.{}", history.before), ())
-                .await?;
-        }
-        self.conn
-            .execute("UPDATE secure_kept_clock SET paused=0 WHERE id=1", ())
-            .await?;
-        Ok(())
     }
     pub(super) async fn kept_config(&self) -> Result<KeptSeals, Error> {
         let records = rows(
@@ -692,6 +616,74 @@ impl<A: RowApplication> Inner<A> {
         }
         Ok(())
     }
+    /// Inside the caller's transaction, returns every replayed table to
+    /// its rows at kept `seal`, marked `mark`, writing only rows changed
+    /// since; a table a switch froze since refills from its copy. Deletes
+    /// go first, until a cascade leaves nothing to delete, so every insert
+    /// meets the rows the mark saw.
+    pub(super) async fn rewind_live(&self, (seal, mark): (Commitment, i64)) -> Result<(), Error> {
+        let Some(typed) = self.workspace.typed.as_deref() else {
+            return Ok(());
+        };
+        let frozen: BTreeMap<String, KeptTable> = self
+            .kept_tables(seal)
+            .await?
+            .into_iter()
+            .filter(|table| table.frozen.is_some())
+            .map(|table| (table.table.to_ascii_lowercase(), table))
+            .collect();
+        let histories: Vec<History> = History::of(typed)
+            .into_iter()
+            .filter(|history| {
+                typed
+                    .rows
+                    .schema()
+                    .table(&history.name())
+                    .is_some_and(|logical| logical.class == rocky_core::TableClass::Replayed)
+            })
+            .collect();
+        for history in &histories {
+            self.touch(&history.name());
+        }
+        self.conn
+            .execute("PRAGMA defer_foreign_keys=ON", ())
+            .await?;
+        let copy = |history: &History| frozen.get(&history.name().to_ascii_lowercase());
+        loop {
+            let mut deleted = 0;
+            for history in &histories {
+                let sql = match copy(history) {
+                    Some(_) => format!("DELETE FROM main.{}", history.live),
+                    None => history.rewind_deletes(mark),
+                };
+                deleted += self.conn.execute(sql, ()).await?;
+            }
+            if deleted == 0 {
+                break;
+            }
+        }
+        for history in &histories {
+            let sql = match copy(history).and_then(|table| table.frozen.as_ref().map(|name| (table, name))) {
+                Some((table, name)) => {
+                    let columns: Vec<String> = table
+                        .columns
+                        .iter()
+                        .map(|column| quoted(column))
+                        .filter(|column| history.columns.contains(column))
+                        .collect();
+                    format!(
+                        "INSERT INTO main.{}({columns}) SELECT {columns} FROM main.{}",
+                        history.live,
+                        quoted(name),
+                        columns = columns.join(",")
+                    )
+                }
+                None => history.rewind_inserts(mark),
+            };
+            self.conn.execute(sql, ()).await?;
+        }
+        Ok(())
+    }
     /// Deletes the versions of live tables and stored rows that no kept
     /// seal needs.
     async fn prune_history(&self) -> Result<(), Error> {
@@ -744,6 +736,32 @@ impl<A: RowApplication> Inner<A> {
             _ => Err(Error::Corrupt("kept table".into())),
         })
         .collect()
+    }
+    /// Selects every row table `name` showed at kept `seal`, marked
+    /// `mark`, its columns in declared order; none when the seal kept it
+    /// under other columns.
+    pub(super) async fn kept_scan(
+        &self,
+        (seal, mark): (Commitment, i64),
+        name: &str,
+        columns: &[String],
+    ) -> Result<Option<String>, Error> {
+        let histories = self.histories();
+        Ok(self
+            .kept_tables(seal)
+            .await?
+            .into_iter()
+            .find(|table| table.table.eq_ignore_ascii_case(name))
+            .filter(|table| {
+                table.columns.len() == columns.len()
+                    && table
+                        .columns
+                        .iter()
+                        .zip(columns)
+                        .all(|(kept, column)| kept.eq_ignore_ascii_case(column))
+            })
+            .and_then(|table| Self::kept_select(&histories, mark, &table))
+            .map(|(select, _)| select))
     }
     /// The rows `table` showed at the kept seal marked `mark`, and the
     /// tables that holds them.

@@ -402,9 +402,6 @@ pub struct TipGraph {
     pub genesis_lines: Vec<SignedGenesisLine>,
     pub finalities: Vec<SealFinality>,
     pub checkpoints: Vec<SignedCheckpointRecord>,
-    /// Where carried coordinated writes committed. Never revoked: a record
-    /// grants nothing, it places frames already admitted.
-    pub carries: Vec<crate::SignedCarry>,
     /// Seals, moves and checkpoint records a revocation ended the signer of, and finality
     /// records it left below their line's minimum: kept, inspectable, and
     /// left out of resolution. See [`Self::exclude_revoked`].
@@ -427,7 +424,6 @@ impl TipGraph {
             genesis_lines: Vec::new(),
             finalities: Vec::new(),
             checkpoints: Vec::new(),
-            carries: Vec::new(),
             revoked: BTreeSet::new(),
         }
     }

@@ -8,7 +8,7 @@ use rocky_core::replay::IntentStatement;
 
 pub(in crate::replica) const SCHEMA: &[&str] = &[
     // One partition's members in publication order: each scope's statements
-    // and the undo of the issuer's execution there.
+    // and the undo and births of the issuer's execution there.
     "CREATE TABLE IF NOT EXISTS secure_publication_intents(publication BLOB NOT NULL,position INTEGER NOT NULL,members BLOB NOT NULL,PRIMARY KEY(publication,position)) WITHOUT ROWID",
     // The leading positions authored, of `total`.
     "CREATE TABLE IF NOT EXISTS secure_publication_cursors(publication BLOB PRIMARY KEY,next INTEGER NOT NULL,total INTEGER NOT NULL) WITHOUT ROWID",
@@ -22,11 +22,12 @@ pub(in crate::replica) const SCHEMA: &[&str] = &[
 pub const PUBLICATION_CHUNK_BUNDLES: u64 = 8;
 
 /// A partition's copy of the program in one scope, with the encoded undo
-/// of the issuer's execution there.
+/// and the births of the issuer's execution there.
 type Member = (
     ResourceScope,
     Vec<IntentStatement>,
     Option<serde_bytes::ByteBuf>,
+    Vec<checkpoint::IdentityMark>,
 );
 
 /// Bundles and WAL pages of each authoring transaction, recorded while
@@ -65,6 +66,7 @@ impl<A: RowApplication> Inner<A> {
         &self,
         publication: Commitment,
         intents: super::bundle::Intents,
+        births: &BTreeMap<ResourceScope, Vec<checkpoint::IdentityMark>>,
     ) -> Result<bool, Error> {
         if self.migration_stage(publication).await?.is_none() {
             return Err(denied("replayed writes commit only as a plain transaction"));
@@ -82,10 +84,11 @@ impl<A: RowApplication> Inner<A> {
                 SqlValue::Blob(bytes) => Some(serde_bytes::ByteBuf::from(bytes)),
                 _ => None,
             };
+            let born = births.get(&scope).cloned().unwrap_or_default();
             partitions
                 .entry(partition)
                 .or_default()
-                .push((scope, statements, undo));
+                .push((scope, statements, undo, born));
         }
         let total = partitions.len();
         for (position, members) in partitions.into_values().enumerate() {
@@ -170,7 +173,11 @@ impl<A: RowApplication> Inner<A> {
             let members: Vec<Member> = decode_bounded(members, usize::MAX)?;
             let statements = members
                 .iter()
-                .map(|(scope, statements, _)| (*scope, statements.clone()))
+                .map(|(scope, statements, ..)| (*scope, statements.clone()))
+                .collect();
+            let births: BTreeMap<_, _> = members
+                .iter()
+                .map(|(scope, .., births)| (*scope, births.clone()))
                 .collect();
             let encoded = super::bundle::input_bytes(&[], &[], &statements)?;
             if encoded.len() > MAX_BUNDLE_BYTES {
@@ -187,7 +194,7 @@ impl<A: RowApplication> Inner<A> {
                 None => {
                     let intents = members
                         .into_iter()
-                        .map(|(scope, statements, undo)| {
+                        .map(|(scope, statements, undo, _)| {
                             let undo = match undo {
                                 Some(bytes) => super::replay::undo_of(&bytes)?,
                                 None => Vec::new(),
@@ -196,11 +203,15 @@ impl<A: RowApplication> Inner<A> {
                         })
                         .collect::<Result<_, Error>>()?;
                     self.publishing = true;
-                    let authored = self
-                        .author_sql_bundle((handle, input), &[], intents, time, None)
-                        .await;
+                    let authored = self.author_sql_bundle((handle, input), intents, time).await;
                     self.publishing = false;
-                    authored?
+                    let frames = authored?;
+                    for frame in &frames {
+                        if let Some(births) = births.get(&frame.scope()?) {
+                            self.record_births(frame, births).await?;
+                        }
+                    }
+                    frames
                 }
             };
             for frame in &frames {
@@ -278,10 +289,9 @@ impl<A: RowApplication> Inner<A> {
         }
         Ok(())
     }
-    /// Frames that must not leave: uncommitted coordinated entries and
-    /// publications still being authored.
+    /// Frames that must not leave: publications still being authored.
     pub(crate) async fn unsent(&self) -> Result<HashSet<Hash>, Error> {
-        let mut unsent = self.staged().await?;
+        let mut unsent = HashSet::new();
         for record in rows(&self.conn, "SELECT hash FROM secure_publication_unsent").await? {
             let [SqlValue::Blob(hash)] = record.as_slice() else {
                 return Err(Error::Corrupt("unsent publication frame".into()));

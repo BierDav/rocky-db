@@ -70,7 +70,7 @@ private fun SchemaBuilder.items() {
         text("position", default = "")
         primaryKey("list", "key")
         partitionBy("list", group = "list")
-        unique("list", "title", onConflict = Conflict.LatestWins)
+        unique("list", "title")
         index("index_items_list_category", "list", "category")
         index("index_items_list_position", "list", "position")
         reference("list", "lists", onDelete = Delete.Cascade)

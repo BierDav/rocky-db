@@ -5,56 +5,6 @@ use rocky_core::replay::{DropReason, TransactionOutcome};
 
 mod convergence;
 
-async fn sql_on(
-    f: &Fixture,
-    replica: &EncryptedReplica<TypedRows>,
-    names: &[&str],
-) -> crate::SecureSql<TypedRows> {
-    replica
-        .session(names.iter().map(|name| f.scope(name)).collect())
-        .await
-        .unwrap()
-        .sql(Default::default())
-        .await
-        .unwrap()
-}
-
-/// Inserts `(list, key, amount)` rows in one transaction.
-async fn insert(
-    f: &Fixture,
-    replica: &EncryptedReplica<TypedRows>,
-    names: &[&str],
-    rows: &[(&str, &str, i64)],
-    handle: u8,
-) -> Vec<EncryptedFrame> {
-    let sql = sql_on(f, replica, names).await;
-    sql.run("BEGIN", vec![]).await.unwrap();
-    for (list, key, amount) in rows {
-        let id = sql
-            .next_id_partition("items", &[SqlValue::Text((*list).into())])
-            .await
-            .unwrap()
-            .integer();
-        sql.run(
-            "INSERT INTO items(list,key,amount,id,row_kind) VALUES(?,?,?,?,0)",
-            vec![
-                SqlValue::Text((*list).into()),
-                SqlValue::Text((*key).into()),
-                SqlValue::Integer(*amount),
-                SqlValue::Integer(id),
-            ],
-        )
-        .await
-        .unwrap();
-    }
-    sql.commit([handle; 32])
-        .await
-        .unwrap()
-        .committed
-        .unwrap()
-        .frames
-}
-
 async fn keys(
     f: &Fixture,
     replica: &EncryptedReplica<TypedRows>,

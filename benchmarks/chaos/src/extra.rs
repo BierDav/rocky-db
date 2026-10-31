@@ -449,7 +449,6 @@ pub async fn request_fuzz() -> Result<(), Failure> {
     const TYPES: &[&str] = &[
         "sql",
         "next_id",
-        "move_row",
         "read",
         "subscribe",
         "next",

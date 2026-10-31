@@ -5,20 +5,17 @@ import kotlinx.coroutines.flow.map
 import rocky.RockyDatabase
 import rocky.Row
 import rocky.SchemaBuilder
-import rocky.TableClass
 
 /**
  * Tables only trusted devices read: device names and kinds, each trusted device's open pairing code, and the
  * household's coordination tenant. Members hold no grant on them. Room declares none of them, and the application never queries them on members.
  */
 val trustedTables: SchemaBuilder.() -> Unit = {
-    // Registrations replay as written: concurrent ones of one node keep the first.
     table("devices") {
         text("node")
         text("name")
         text("kind")
         primaryKey("node")
-        tableClass = TableClass.Replayed
     }
     table("invitations") {
         text("issuer")

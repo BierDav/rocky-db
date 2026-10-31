@@ -1,6 +1,5 @@
 //! A durable switch changes the audit transform, never whether history is audited.
 use super::*;
-use crate::replica::migrate::PlanStage;
 
 /// `version`'s configuration under the domain root of generation 3.
 fn rooted(lineage: &Lineage, version: u32, key: &PrivateKey) -> crate::SecureConfig {
@@ -25,7 +24,7 @@ async fn interrupt(
     .await
     .unwrap();
     let statements = lineage.publish(&a, 4).await.unwrap();
-    a.inject_plan_fault(PlanStage::Switch, 0).await;
+    a.fail_next_plan_switch().await;
     assert!(matches!(
         lineage
             .follow(&a, lineage.config(4, key), 4, &statements)
@@ -33,93 +32,6 @@ async fn interrupt(
         Err(Error::InjectedFailure)
     ));
     (a, statements)
-}
-
-#[tokio::test]
-async fn a_staged_switch_audits_stripped_rows_and_removed_tables_on_source_reopen() {
-    for (removed, based) in [(false, false), (true, false), (false, true), (true, true)] {
-        let lineage = Lineage::new();
-        let dir = TempDir::new().unwrap();
-        let key = PrivateKey::new();
-        let a = open(&lineage, &dir, "a", &key).await;
-        follow_main(&lineage, &a).await;
-        insert(&a, "one", "signed title").await;
-        identity_insert(
-            &session(&a).await,
-            "INSERT INTO tags(key,label) VALUES('tag','removed')",
-            vec![],
-        )
-        .await
-        .unwrap();
-        let tags = crate::storage::collect_rows(
-            a.inner
-                .lock(crate::replica::Class::Background)
-                .await
-                .conn
-                .query(
-                    "SELECT row,fields FROM secure_row_records WHERE scope=?",
-                    [encode(&lineage.scope("tags")).unwrap()],
-                )
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        if based {
-            seal(&lineage, &a).await;
-            a.compact(lineage.domain, 0).await.unwrap();
-        }
-        let statements = lineage.publish(&a, 4).await.unwrap();
-        a.inject_plan_fault(PlanStage::Switch, 0).await;
-        assert!(matches!(
-            lineage
-                .follow(&a, lineage.config(4, &key), 4, &statements)
-                .await,
-            Err(Error::InjectedFailure)
-        ));
-        {
-            let mut inner = a.inner.lock(crate::replica::Class::Background).await;
-            if removed {
-                let [SqlValue::Blob(row), SqlValue::Blob(fields)] = tags[0].as_slice() else {
-                    panic!("tag row")
-                };
-                inner
-                    .conn
-                    .execute(
-                        "INSERT INTO secure_row_records(scope,row,fields) VALUES(?,?,?)",
-                        [
-                            encode(&lineage.scope("tags")).unwrap(),
-                            row.clone(),
-                            fields.clone(),
-                        ],
-                    )
-                    .await
-                    .unwrap();
-            } else {
-                inner
-                    .conn
-                    .execute(
-                        "DELETE FROM secure_row_records WHERE scope=?",
-                        [encode(&lineage.scope("items")).unwrap()],
-                    )
-                    .await
-                    .unwrap();
-            }
-            inner.flush().unwrap();
-        }
-        drop(a);
-        let error = lineage
-            .reopen(&dir.path().join("a.db"), &key, 3, 3)
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("tampered reopen accepted: removed={removed} based={based}"));
-        assert!(
-            error
-                .to_string()
-                .contains("projection differs from signed encrypted history"),
-            "{error}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -304,7 +216,7 @@ async fn a_sideways_switch_audits_with_the_stored_target_definition() {
     .unwrap();
     a.follow_bookmark(lineage.domain, "dev").await.unwrap();
     lineage.install_required(&a).await;
-    a.inject_plan_fault(PlanStage::Switch, 0).await;
+    a.fail_next_plan_switch().await;
     let mut config = lineage.config(4, &key);
     config.manifest = lineage.config(3, &key).manifest;
     assert!(matches!(
@@ -414,7 +326,7 @@ async fn interrupted_offering(
         offer(lineage, &a).await;
     }
     let statements = lineage.publish(&a, 4).await.unwrap();
-    a.inject_plan_fault(PlanStage::Switch, 0).await;
+    a.fail_next_plan_switch().await;
     assert!(matches!(
         lineage
             .follow(&a, lineage.config(4, key), 4, &statements)
@@ -629,28 +541,6 @@ async fn a_deleted_bookmark_withdraws_the_staged_switch_and_stays_at_the_source(
     a.audit(lineage.scope("tags")).await.unwrap();
 }
 
-#[tokio::test]
-async fn an_unsent_write_the_staged_switch_voided_stays_held_after_withdrawal() {
-    let lineage = Lineage::new();
-    let dir = TempDir::new().unwrap();
-    let key = PrivateKey::new();
-    let (a, source, target) = interrupted_offering(&lineage, &dir, &key, false).await;
-    assert_eq!(a.held_changes().await.unwrap().len(), 1);
-    delete_main(&lineage, &a, target).await;
-    // Its signed void records stand: the write is held for re-authoring.
-    assert_eq!(intents(&a).await, 0);
-    assert_eq!(a.followed_tip().await, source);
-    assert_eq!(scalar(&a, "SELECT count(*) FROM tags").await, 0);
-    assert_eq!(scalar(&a, "SELECT count(*) FROM items").await, 1);
-    assert_eq!(a.held_changes().await.unwrap().len(), 1);
-    drop(a);
-    let a = lineage
-        .reopen(&dir.path().join("a.db"), &key, 3, 3)
-        .await
-        .unwrap();
-    a.audit(lineage.scope("tags")).await.unwrap();
-}
-
 /// The owner deletes `main`, which pointed at `target`.
 async fn delete_main(lineage: &Lineage, a: &Replica, target: TipId) {
     let deleted = TipStatement::Bookmark(
@@ -717,7 +607,7 @@ async fn a_revoked_target_withdraws_the_staged_switch() {
     a.receive_tip_statements(&[TipStatement::Seal(seal), TipStatement::Bookmark(moved)])
         .await
         .unwrap();
-    a.inject_plan_fault(PlanStage::Switch, 0).await;
+    a.fail_next_plan_switch().await;
     assert!(matches!(
         switch(&lineage, &a, &key, target, 4).await,
         Err(Error::InjectedFailure)
@@ -783,7 +673,7 @@ async fn an_own_publication_withdraws_with_its_staged_switch() {
     a.install_tip_schema(target, lineage.definition(4), b"verified".to_vec())
         .await
         .unwrap();
-    a.inject_plan_fault(PlanStage::Switch, 0).await;
+    a.fail_next_plan_switch().await;
     assert!(matches!(
         switch(&lineage, &a, &key, target, 4).await,
         Err(Error::InjectedFailure)
@@ -866,35 +756,4 @@ async fn an_own_publication_withdraws_with_its_staged_switch() {
         .await
         .unwrap();
     a.audit(lineage.scope("tags")).await.unwrap();
-}
-
-#[tokio::test]
-async fn a_later_staged_audit_fault_cleans_committed_scratch_and_reopens() {
-    let lineage = Lineage::new();
-    let dir = TempDir::new().unwrap();
-    let key = PrivateKey::new();
-    let (a, _, _) = interrupted(&lineage, &dir, &key).await;
-    let scopes = [lineage.scope("items"), lineage.scope("tags")];
-    let expected = a.audit_scopes(&scopes).await.unwrap();
-    assert_eq!((expected[0].1.replayed, expected[1].1.replayed), (1, 1));
-    let before = super::audit::snapshot(&a).await;
-    a.inject_stage_fault(crate::replica::checkpoint::Stage::AuditStaged, 1)
-        .await;
-    assert!(matches!(
-        a.audit_scopes(&scopes).await,
-        Err(Error::InjectedFailure)
-    ));
-    assert_eq!(a.audit_scratch_flags().await, (false, false));
-    assert_eq!(
-        scalar(&a, "SELECT count(*) FROM secure_checkpoint_scratch").await,
-        0
-    );
-    assert_eq!(super::audit::snapshot(&a).await, before);
-    assert_eq!(a.audit_scopes(&scopes).await.unwrap(), expected);
-    drop(a);
-    let reopened = lineage
-        .reopen(&dir.path().join("a.db"), &key, 3, 3)
-        .await
-        .unwrap();
-    assert_eq!(reopened.audit_scopes(&scopes).await.unwrap(), expected);
 }

@@ -1,9 +1,9 @@
-//! A target removal defers creation; restoring the source path mints once.
+//! A write to a table the target removed waits; restoring the source path
+//! applies it once.
 use super::*;
-use crate::storage::{bindings, rows};
 
 #[tokio::test]
-async fn an_absent_tables_filtered_birth_restores_with_its_original_receipt() {
+async fn a_write_to_a_removed_table_applies_once_its_path_returns() {
     let lineage = Lineage::pinned(131);
     let dir = TempDir::new().unwrap();
     let identity = PrivateKey::from_bytes(&[132; 32]);
@@ -93,131 +93,20 @@ async fn an_absent_tables_filtered_birth_restores_with_its_original_receipt() {
         .await
         .unwrap();
     let scope = lineage.scope("tags");
-    let binding_query = "SELECT allocation FROM secure_identity_partitions WHERE scope=?";
-    assert!(
-        crate::storage::collect_rows(
-            alice
-                .inner
-                .lock(crate::replica::Class::Background)
-                .await
-                .conn
-                .query(binding_query, [encode(&scope).unwrap()])
-                .await
-                .unwrap()
-        )
-        .await
-        .unwrap()
-        .is_empty()
-    );
     alice.receive(frame.clone()).await.unwrap();
-    let receipt = rows(
-        &alice
-            .inner
-            .lock(crate::replica::Class::Background)
-            .await
-            .conn,
-        "SELECT * FROM secure_admission_entries WHERE kind=0",
-    )
-    .await
-    .unwrap();
-    assert_eq!(receipt.len(), 1);
-    assert_eq!(
-        scalar(&alice, "SELECT count(*) FROM secure_admission_claims").await,
-        0
-    );
-    assert_eq!(
-        scalar(&alice, "SELECT count(*) FROM secure_identity_partitions").await,
-        0
-    );
-    assert_eq!(
-        scalar(&alice, "SELECT count(*) FROM secure_identity_marks").await,
-        0
-    );
     drop(alice);
     alice = lineage.open_with(&path, security(), 4, None).await.unwrap();
     alice.audit(lineage.scope("items")).await.unwrap();
     follow(&lineage, &alice, (&identity, &keys[0]), "main", 3).await;
-    assert_eq!(
-        select(&alice, "SELECT key,label FROM tags").await,
-        vec![vec![text("late"), text("restored")]]
-    );
-    assert_eq!(
-        rows(
-            &alice
-                .inner
-                .lock(crate::replica::Class::Background)
-                .await
-                .conn,
-            "SELECT * FROM secure_admission_entries WHERE kind=0"
-        )
-        .await
-        .unwrap(),
-        receipt
-    );
-    assert_eq!(
-        scalar(
-            &alice,
-            "SELECT count(*) FROM secure_admission_entries WHERE kind=1"
-        )
-        .await,
-        1
-    );
-    assert_eq!(
-        scalar(
-            &alice,
-            "SELECT count(*) FROM secure_admission_claims WHERE kind=0"
-        )
-        .await,
-        1
-    );
+    let restored = vec![vec![text("late"), text("restored")]];
+    assert_eq!(select(&alice, "SELECT key,label FROM tags").await, restored);
     alice.rebuild_projection(scope).await.unwrap();
     alice.audit(scope).await.unwrap();
-    // A duplicate appends nothing; the head only re-pins a later revision.
-    let journal = "SELECT entry,bytes,chain FROM secure_admission_entries UNION ALL SELECT allocation,identity,entry FROM secure_admission_claims";
-    let before = rows(
-        &alice
-            .inner
-            .lock(crate::replica::Class::Background)
-            .await
-            .conn,
-        journal,
-    )
-    .await
-    .unwrap();
+    // A duplicate changes nothing.
     alice.receive(frame.clone()).await.unwrap();
-    assert_eq!(
-        rows(
-            &alice
-                .inner
-                .lock(crate::replica::Class::Background)
-                .await
-                .conn,
-            journal
-        )
-        .await
-        .unwrap(),
-        before
-    );
-    let inner = alice.inner.lock(crate::replica::Class::Background).await;
-    let binding = crate::storage::collect_rows(
-        inner
-            .conn
-            .query(
-                binding_query,
-                bindings(vec![SqlValue::Blob(encode(&scope).unwrap())]),
-            )
-            .await
-            .unwrap(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(binding.len(), 1);
-    drop(inner);
+    assert_eq!(select(&alice, "SELECT key,label FROM tags").await, restored);
     drop(alice);
     let alice = lineage.reopen(&path, &keys[0], 3, 3).await.unwrap();
     alice.audit(scope).await.unwrap();
-    assert_eq!(
-        select(&alice, "SELECT key,label FROM tags").await,
-        vec![vec![text("late"), text("restored")]]
-    );
+    assert_eq!(select(&alice, "SELECT key,label FROM tags").await, restored);
 }

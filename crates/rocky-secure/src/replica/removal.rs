@@ -4,21 +4,27 @@ use super::*;
 
 pub(super) const SCHEMA: &[&str] =
     &["CREATE TABLE IF NOT EXISTS secure_rebuild_scopes(scope BLOB PRIMARY KEY) WITHOUT ROWID"];
-pub async fn local_row_counts(path: &Path) -> Result<BTreeMap<Commitment, u64>, Error> {
+
+/// Each named projection table's stored row count.
+pub async fn local_row_counts(
+    path: &Path,
+    tables: &[&str],
+) -> Result<BTreeMap<String, u64>, Error> {
     super::check_replica_format(path).await?;
     let file = crate::sqlite::Connection::open_read_only(path)?;
-    let mut counts = BTreeMap::<Commitment, u64>::new();
-    for row in file.rows(
-        "SELECT s.scope,count(r.fields) FROM secure_scope_state s LEFT JOIN secure_row_records r ON r.scope=s.scope GROUP BY s.id,s.scope",
-        (),
-    )? {
-        let [crate::sqlite::Value::Blob(scope), crate::sqlite::Value::Integer(count)] = row.as_slice() else {
-            return Err(Error::Corrupt("local row counts".into()));
+    let mut counts = BTreeMap::new();
+    for table in tables {
+        let rows = file.rows(
+            &format!("SELECT count(*) FROM {}", typed::quoted(table)),
+            (),
+        )?;
+        let [crate::sqlite::Value::Integer(count)] =
+            rows.first().map(Vec::as_slice).unwrap_or_default()
+        else {
+            return Err(Error::Corrupt("local row count".into()));
         };
-        let scope: ResourceScope = decode(scope)?;
         let count = u64::try_from(*count).map_err(|_| Error::Corrupt("local row count".into()))?;
-        let total = counts.entry(scope.table).or_default();
-        *total = total.checked_add(count).ok_or_else(|| Error::Corrupt("local row count overflow".into()))?;
+        counts.insert((*table).to_owned(), count);
     }
     Ok(counts)
 }

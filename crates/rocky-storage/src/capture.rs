@@ -50,7 +50,7 @@ pub struct Table {
     /// Position of the owning domain among the plan's parts.
     pub owner: usize,
     without_rowid: bool,
-    identity: Option<(usize, usize)>,
+    identity: Option<usize>,
     pub columns: Vec<Column>,
     names: Vec<String>,
     capture_order: Vec<usize>,
@@ -59,6 +59,8 @@ pub struct Table {
     key_columns: Vec<KeyColumn>,
     /// Selects one row by its key, every column in declared order.
     pub select: String,
+    /// Selects every row, every column in declared order.
+    pub scan: String,
     /// Sets the derived columns of one row, then names its key.
     pub restore: Option<String>,
     /// The table as a catalog lists it, under its schema name.
@@ -77,14 +79,14 @@ impl Table {
             table,
             names,
             owner,
-            Some((position("id")?, position("row_kind")?)),
+            Some(position("id")?),
         )
     }
     fn with_identity(
         table: &rocky_core::LogicalTable,
         names: &Names,
         owner: usize,
-        identity: Option<(usize, usize)>,
+        identity: Option<usize>,
     ) -> Result<Self, Error> {
         let installed = names
             .physical(&table.sql_name)
@@ -190,6 +192,7 @@ impl Table {
                 quoted(&installed),
                 by_key.join(" AND ")
             ),
+            scan: format!("SELECT {} FROM {}", selected.join(","), quoted(&installed)),
             restore: (!derived.is_empty()).then(|| {
                 format!(
                     "UPDATE {} SET {} WHERE {}",
@@ -683,13 +686,12 @@ impl Sink {
         };
         let (old, new) = (logical(old), logical(new));
         if self.mode == Mode::User
-            && let Some((id, kind)) = plan.tables[index].identity
+            && let Some(id) = plan.tables[index].identity
         {
             for image in old.iter().chain(&new) {
-                if image.get(kind) != Some(&Value::Integer(0))
-                    || !matches!(image.get(id), Some(Value::Integer(id)) if rocky_core::RowIdentity::from_integer(*id).is_ok())
+                if !matches!(image.get(id), Some(Value::Integer(id)) if rocky_core::RowIdentity::from_integer(*id).is_ok())
                 {
-                    self.fail("application rows require a positive id and row_kind = 0");
+                    self.fail("application rows require a positive id");
                     return;
                 }
             }
@@ -807,7 +809,7 @@ mod tests {
     use super::*;
     use crate::sqlite::{Connection, Run};
     use rocky_core::{
-        Collation, LOGICAL_SCHEMA_FORMAT, LogicalColumn, LogicalTable, SchemaSource, UpdatePolicy,
+        Collation, LOGICAL_SCHEMA_FORMAT, LogicalColumn, LogicalTable, SchemaSource,
     };
 
     fn column(name: &str, affinity: Affinity, collation: Collation) -> LogicalColumn {
@@ -817,15 +819,14 @@ mod tests {
             not_null: false,
             default: None,
             collation,
-            class: ColumnClass::Mergeable,
+            class: ColumnClass::Replicated,
         }
     }
     fn table(name: &str, sql: &str, columns: Vec<LogicalColumn>, key: &[&str]) -> LogicalTable {
         LogicalTable {
             sql_name: name.into(),
             granted_like: None,
-            class: TableClass::Mergeable,
-            coordinated: false,
+            class: TableClass::Replayed,
             create_sql: sql.into(),
             auto_generate: false,
             columns,
@@ -835,7 +836,6 @@ mod tests {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
 
-            existence_log: false,
         }
     }
     const PLAIN: &str = "CREATE TABLE plain(a INTEGER PRIMARY KEY NOT NULL,b TEXT,c REAL)";
@@ -862,7 +862,6 @@ mod tests {
                 version: 1,
                 identity: "t".into(),
             },
-            update_policy: UpdatePolicy::Changed,
             tables: vec![
                 table(
                     "plain",

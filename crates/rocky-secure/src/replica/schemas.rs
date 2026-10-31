@@ -865,7 +865,6 @@ impl<A: RowApplication> Inner<A> {
                 // The source stays installed while the switch is staged, as
                 // after a reopen, so that withdrawal always has it.
                 if inner.schema_switching().await? {
-                    inner.workspace.shadow = None;
                     definition.swap(inner);
                     inner.workspace.typed = old_typed;
                     inner.load_schemas().await?;
@@ -1062,9 +1061,15 @@ impl<A: RowApplication> Inner<A> {
             }
         }
         // Staging stripped only stored rows, never bases or history.
+        // Replayed scopes replay together once.
+        let (replayed, stored): (Vec<_>, Vec<_>) = stored
+            .into_iter()
+            .partition(|resource| self.replayed_scope(*resource));
         for resource in stored {
             self.rebuild_rows(resource).await?;
-            self.rebuild_constraints(Some(resource), None).await?;
+        }
+        if !replayed.is_empty() {
+            self.replay_from_frames(now()?).await?;
         }
         // The pending row keeps whether the bookmark moved until the
         // follow below replaces it.
@@ -1294,7 +1299,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
         let author = inner.node_author.clone();
         let nodes = inner.line_nodes.clone();
         let followed = inner.workspace.followed.clone();
-        let shadow = inner.workspace.shadow.clone();
         let ids: BTreeSet<Commitment> = stage
             .statements
             .iter()
@@ -1335,7 +1339,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 inner.node_author = author;
                 inner.line_nodes = nodes;
                 inner.workspace.followed = followed;
-                inner.workspace.shadow = shadow;
                 inner.invalidate_context();
                 Err(error)
             }
@@ -1420,7 +1423,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 .collect::<Vec<_>>(),
             inner.config.node.public_key(),
             &inner.config.credentials,
-            inner.workspace.shadow.is_some(),
         ))
         .unwrap()
     }

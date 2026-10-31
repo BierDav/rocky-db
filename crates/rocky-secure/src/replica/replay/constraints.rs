@@ -224,7 +224,6 @@ impl<A: RowApplication> Inner<A> {
                                 Vec::new()
                             },
                             waiting: Vec::new(),
-                            support: false,
                         },
                     );
                 }
@@ -246,17 +245,5 @@ impl<A: RowApplication> Inner<A> {
             }
         }
         Ok(None)
-    }
-}
-
-#[cfg(test)]
-impl<A: RowApplication> Inner<A> {
-    /// Whether the installed tables take part in mergeable constraint
-    /// resolution.
-    pub(crate) fn resolves_constraints(&self) -> bool {
-        self.workspace
-            .typed
-            .as_ref()
-            .is_some_and(|typed| typed.constraints.is_some())
     }
 }

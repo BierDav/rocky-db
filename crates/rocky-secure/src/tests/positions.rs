@@ -34,10 +34,6 @@ async fn audit_rejects_altered_position_indexes() {
             "UPDATE secure_log_ranges SET end=end+1",
             "UPDATE secure_log_ranges SET end=end-1",
         ),
-        (
-            "UPDATE secure_position_sources SET existence=existence+1",
-            "UPDATE secure_position_sources SET existence=existence-1",
-        ),
     ] {
         replica
             .inner
@@ -120,7 +116,6 @@ async fn position_ranges_merge_split_and_rollback_with_duplicate_custody() {
     assert_eq!(ranges().await.unwrap().len(), 2);
     header.seq_num = 1;
     header.extensions.author_sequence = start + 1;
-    header.extensions.existence = 3;
     header.sign(&node);
     crate::replica::positions::insert(&inner.conn, &header, 0, false, true)
         .await
@@ -129,21 +124,11 @@ async fn position_ranges_merge_split_and_rollback_with_duplicate_custody() {
         .await
         .unwrap();
     let mut pending = header.clone();
-    pending.extensions.existence = 7;
     pending.timestamp += 1;
     pending.sign(&node);
     crate::replica::positions::insert(&inner.conn, &pending, 0, true, false)
         .await
         .unwrap();
-    assert_eq!(
-        rows(
-            &inner.conn,
-            "SELECT count,settled_count FROM secure_existence_counts"
-        )
-        .await
-        .unwrap(),
-        vec![vec![SqlValue::Integer(7), SqlValue::Integer(3)]]
-    );
     inner
         .conn
         .execute(
@@ -152,15 +137,6 @@ async fn position_ranges_merge_split_and_rollback_with_duplicate_custody() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        rows(
-            &inner.conn,
-            "SELECT count,settled_count FROM secure_existence_counts"
-        )
-        .await
-        .unwrap(),
-        vec![vec![SqlValue::Integer(7), SqlValue::Integer(7)]]
-    );
     inner
         .conn
         .execute(
@@ -183,15 +159,6 @@ async fn position_ranges_merge_split_and_rollback_with_duplicate_custody() {
             .unwrap()
             .len(),
         1
-    );
-    assert_eq!(
-        rows(
-            &inner.conn,
-            "SELECT count,settled_count FROM secure_existence_counts"
-        )
-        .await
-        .unwrap(),
-        vec![vec![SqlValue::Integer(3), SqlValue::Integer(3)]]
     );
     inner.conn.execute("ROLLBACK TO ranges", ()).await.unwrap();
     inner.conn.execute("RELEASE ranges", ()).await.unwrap();

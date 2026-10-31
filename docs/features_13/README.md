@@ -287,10 +287,6 @@ bump in its evidence.
 | 4 | [Intent replay](04-intent-replay.md) | 2, 3 | 3–4 w | `Replayed` tables: intents, split, replay, drops, outcomes; [slices 1–9 implemented; L0 gate unmet (baseline too), L2 regression open](04-intent-replay-evidence.md) |
 | 5 | [Replayed constraints](05-replayed-constraints.md) | 4 | 2–3 w | Unique, FK, complex `CHECK` and assertions in replay; no field stamps or induced fan-out |
 | 6 | [Symbolic fast path](06-symbolic-fast-path.md) | 3, 5 | 2 w | `rocky-symbolic`, merged only if proven and faster; [proven equal, not faster in the mix: not merged](06-symbolic-fast-path-evidence.md) |
-| 7 | [Intent migrations](07-intent-migrations.md) | 4 | 2 w | Migrations publish as intents; bounded, resumable; [complete: fill 3.9 s, WAL ≤ 46 MB](07-intent-migrations-evidence.md) |
-| 8 | [Intent only](08-intent-only.md) | 5, 6, 7 | 2 w | `Mergeable`, registers and resolver deleted |
-| 7 | [Intent migrations](07-intent-migrations.md) | 4 | 2 w | Migrations publish as intents; bounded, resumable |
-| 8 | [Intent only](08-intent-only.md) | 5, 6, 7 | 2 w | `Mergeable`, registers and resolver deleted |
 | 7 | [Intent migrations](07-intent-migrations.md) | 4 | 2 w | Migrations publish as intents; bounded, resumable |
 | 8 | [Intent only](08-intent-only.md) | 5, 6, 7 | 3 w | `Mergeable`, registers and resolver deleted; replayed checkpoints |
 | 9 | [Qualification](09-qualification.md) | 1, 2, 8 | 1 w | Devices, convergence fuzz, sync non-regression |

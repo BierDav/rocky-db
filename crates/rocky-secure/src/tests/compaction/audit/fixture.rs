@@ -100,15 +100,3 @@ pub(super) async fn assert_clean(replica: &Replica) {
             .is_empty()
     );
 }
-pub(super) async fn trace_replay(replica: &Replica) {
-    let inner = replica.inner.lock(crate::replica::Class::Background).await;
-    inner
-        .conn
-        .execute(
-            "CREATE TEMP TABLE audit_replay_seen(scope INTEGER NOT NULL)",
-            (),
-        )
-        .await
-        .unwrap();
-    inner.conn.execute("CREATE TEMP TRIGGER audit_replay_seen AFTER INSERT ON secure_checkpoint_scratch BEGIN INSERT INTO audit_replay_seen VALUES(NEW.scope); END",()).await.unwrap();
-}

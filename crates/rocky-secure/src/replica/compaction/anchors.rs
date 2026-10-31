@@ -123,7 +123,6 @@ impl<A: RowApplication> Inner<A> {
                 scope.domain,
                 &[(scope, Some(id))],
                 &self.custody_scopes(now()?)?,
-                &BTreeSet::new(),
             )
             .await?;
         Ok(!blocking_gaps(seal, &starts, &[(scope, Some(id))], &held, &last, 1).is_empty())

@@ -10,5 +10,4 @@ data class RequestRow(
     val note: String,
     val requester: String,
     val id: Long,
-    @ColumnInfo(name = "row_kind") val rowKind: Long = 0,
 )

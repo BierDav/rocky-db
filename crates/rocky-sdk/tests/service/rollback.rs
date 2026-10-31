@@ -53,7 +53,7 @@ async fn a_compacted_member_waits_for_the_owners_kept_rollback_seal() -> Result<
     );
     step!(
         "setup.seed.write",
-        a.write("kept", 51, false).await,
+        a.write("kept", 51).await,
         &[("m", &m), ("a", &a), ("t", &t)]
     );
     trace.m_sync = Some(step!(
@@ -95,8 +95,7 @@ async fn a_compacted_member_waits_for_the_owners_kept_rollback_seal() -> Result<
     // still returned by the test and the phase remains traceable.
     trace.before("setup.retention.writes");
     for index in 0..257 {
-        a.write(&format!("later {index:03}"), 1000 + index, false)
-            .await?;
+        a.write(&format!("later {index:03}"), 1000 + index).await?;
     }
     trace.after();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -221,7 +220,7 @@ async fn a_compacted_member_waits_for_the_owners_kept_rollback_seal() -> Result<
     );
     step!(
         "offline.write",
-        m.write("after latest seal", 53, false).await,
+        m.write("after latest seal", 53).await,
         &[("m", &m), ("a", &a), ("t", &t)]
     );
     let original_endpoint = step!(
@@ -304,7 +303,7 @@ async fn a_compacted_member_waits_for_the_owners_kept_rollback_seal() -> Result<
     );
     trace.after();
     trace.before("rollback.wanted.write_refusal");
-    let refused = m.write("must wait", 54, false).await;
+    let refused = m.write("must wait", 54).await;
     eprintln!("rollback diagnostic: expected write refusal={refused:?}");
     trace.after();
     assert!(
@@ -417,7 +416,7 @@ async fn a_compacted_member_waits_for_the_owners_kept_rollback_seal() -> Result<
     );
     step!(
         "restored.write",
-        m.write("after restoration", 55, false).await,
+        m.write("after restoration", 55).await,
         &[("m", &m), ("a", &a), ("t", &t)]
     );
     step!(

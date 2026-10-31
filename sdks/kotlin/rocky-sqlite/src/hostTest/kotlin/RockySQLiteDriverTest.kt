@@ -59,6 +59,17 @@ class RockySQLiteDriverTest {
         it.bindLong(1, nextId(table))
         assertFalse(it.step())
     }
+
+    /** Inserts lists [keys] in the open transaction, one statement each. */
+    private fun SQLiteConnection.insertLists(keys: IntRange, key: (Int) -> String, title: (Int) -> String) = prepare("INSERT INTO lists(key, title, id) VALUES(?, ?, ?)").use { insert ->
+        for (i in keys) {
+            insert.bindText(1, key(i))
+            insert.bindText(2, title(i))
+            insert.bindLong(3, nextId("lists"))
+            assertFalse(insert.step())
+            insert.reset()
+        }
+    }
     private fun code(error: SQLiteException): Int = Regex("Error code: (\\d+)").find(error.message.orEmpty())!!.groupValues[1].toInt()
 
     @Test fun aTransactionWithSavepointsCommitsOnceAndReadersKeepTheirSnapshot() = withDatabase { _, driver ->
@@ -117,13 +128,12 @@ class RockySQLiteDriverTest {
 
     @Test fun pagesStreamAndStatementsRerunAfterReset() = withDatabase { _, driver ->
         val writer = driver.open("shopping")
-        writer.execSQL("BEGIN IMMEDIATE TRANSACTION")
-        writer.insertFrom(
-            "lists",
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 700) " +
-                "INSERT INTO lists(key, title, id) SELECT printf('l%04d', i), 'list ' || i, ? + i - 1 FROM n",
-        )
-        writer.execSQL("END TRANSACTION")
+        // A transaction replays at most 256 statements.
+        for (chunk in (1..700).chunked(200)) {
+            writer.execSQL("BEGIN IMMEDIATE TRANSACTION")
+            writer.insertLists(chunk.first()..chunk.last(), { "l" + it.toString().padStart(4, '0') }, { "list $it" })
+            writer.execSQL("END TRANSACTION")
+        }
         val reader = driver.open("shopping").reader()
         reader.prepare("SELECT key FROM lists WHERE title LIKE ? ORDER BY key").use { query ->
             query.bindText(1, "list%")
@@ -146,11 +156,7 @@ class RockySQLiteDriverTest {
     @Test fun bundleLimitsAndDeniedStatementsAreSQLiteErrors() = withDatabase { _, driver ->
         val writer = driver.open("shopping")
         writer.execSQL("BEGIN IMMEDIATE TRANSACTION")
-        writer.insertFrom(
-            "lists",
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2049) " +
-                "INSERT INTO lists(key, title, id) SELECT 'l' || i, 'x', ? + i - 1 FROM n",
-        )
+        writer.insertLists(1..257, { "l$it" }, { "x" })
         val oversized = assertFailsWith<SQLiteException> { writer.execSQL("END TRANSACTION") }
         assertEquals(18, code(oversized))
         assertFalse(writer.inTransaction())

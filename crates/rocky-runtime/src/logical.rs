@@ -1,7 +1,7 @@
 //! Binds an installed domain to its logical schema: the descriptor is stored
 //! once, a different one is refused, and the physical tables must match it.
 use crate::{Error, scoped_connection::ScopedConnection, storage};
-use rocky_core::{Affinity, Collation, LogicalSchema, LogicalTable, SqlValue, TableClass};
+use rocky_core::{Affinity, Collation, LogicalSchema, LogicalTable, SqlValue};
 
 const TABLE: &str = "CREATE TABLE IF NOT EXISTS rocky_logical_schema(id INTEGER PRIMARY KEY CHECK(id=1),descriptor BLOB NOT NULL)";
 
@@ -96,7 +96,6 @@ async fn verify_table(
         }
     }
     let mut created = 0;
-    let mut key_checked = false;
     for row in pragma(conn, "index_list", &installed).await? {
         let index = text(row.get(1));
         let unique = integer(row.get(2)) == 1;
@@ -136,24 +135,12 @@ async fn verify_table(
                 if expected != found {
                     return Err(differs(name, "primary key collation"));
                 }
-                key_checked = true;
-            }
-            _ if table.class == TableClass::Mergeable => {
-                return Err(differs(name, "unique constraint"));
             }
             _ => {}
         }
     }
     if created != table.indexes.len() {
         return Err(differs(name, "missing index"));
-    }
-    // Without a key index the key is the rowid, which has no collation.
-    let rowid = table.primary_key.len() == 1
-        && table
-            .key()
-            .all(|column| column.affinity == Affinity::Integer);
-    if table.class == TableClass::Mergeable && !key_checked && !rowid {
-        return Err(differs(name, "primary key cannot be verified"));
     }
     // Rows of one key share its id and arrive together, in column order.
     let (mut found, mut current) = (Vec::<ForeignKey>::new(), None);

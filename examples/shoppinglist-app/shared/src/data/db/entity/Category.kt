@@ -16,6 +16,5 @@ data class Category(
     val list: Long,
     val id: Long,
     val name: String,
-    @ColumnInfo(name = "row_kind") val rowKind: Long = 0,
     @ColumnInfo(defaultValue = "''") val position: String = "",
 )

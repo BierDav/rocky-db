@@ -1,7 +1,7 @@
 use rocky_sdk::{Database, Network, Open, Session, transport::memory::Hub};
 use serde_json::{Value, json};
 use std::{path::Path, sync::Arc};
-const SCHEMA: &str = r#"{"format":6,"application":"partitionsdk","version":1,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"list","type":"text","not_null":true},{"name":"key","type":"text","not_null":true},{"name":"amount","type":"integer","not_null":true}],"primary_key":["list","key"],"partition_by":["list"]}],"views":[{"name":"partial_items","create_sql":"CREATE VIEW partial_items AS SELECT * FROM items WHERE row_kind=0"}]}"#;
+const SCHEMA: &str = r#"{"format":6,"application":"partitionsdk","version":1,"tables":[{"name":"items","class":"replayed","columns":[{"name":"list","type":"text","not_null":true},{"name":"key","type":"text","not_null":true},{"name":"amount","type":"integer","not_null":true}],"primary_key":["list","key"],"partition_by":["list"]}],"views":[{"name":"partial_items","create_sql":"CREATE VIEW partial_items AS SELECT * FROM items WHERE amount>=0"}]}"#;
 fn open<'a>(directory: &'a Path, hub: &Arc<Hub>) -> Open<'a> {
     let name = directory.file_name().unwrap().to_str().unwrap();
     Open {
@@ -192,12 +192,6 @@ async fn public_partition_schema_keys_sql_identity_and_reopen() {
         json!({"type":"partition_create","table":"items","values":values("C")}),
     )
     .await;
-    let request = json!({"type":"move_row","table":"items","id":ids[0],"from":values("A"),"to":values("C"),"handle":vec![89u8;32]});
-    let moved = call(&session, &scope, request.clone()).await;
-    assert_eq!(moved["committed"]["frames"], 2);
-    assert_eq!(call(&session, &scope, request).await, moved);
-    let moved_rows = call(&session, &scope, json!({"type":"read","query":{"sql":"SELECT list,id FROM items WHERE list='C' AND row_kind=0","values":[],"max_rows":2}})).await;
-    assert_eq!(moved_rows["rows"][0][1]["value"], ids[0]);
     let revoked = call(
         &session,
         &scope,
@@ -226,7 +220,7 @@ async fn public_partition_schema_keys_sql_identity_and_reopen() {
 #[tokio::test]
 async fn own_id_partitions_continue_the_table_log() {
     let root = tempfile::tempdir().unwrap();
-    let schema = r#"{"format":6,"application":"ownid","version":1,"tables":[{"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"],"partition_by":["id"]}]}"#;
+    let schema = r#"{"format":6,"application":"ownid","version":1,"tables":[{"name":"lists","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"],"partition_by":["id"]}]}"#;
     let options = || Open {
         identity: None,
         directory: root.path(),
@@ -262,63 +256,5 @@ async fn own_id_partitions_continue_the_table_log() {
         call(&session,&scope,json!({"type":"sql","sql":"INSERT INTO lists(id,title) VALUES(?,?)","values":[{"type":"integer","value":id.to_string()},{"type":"text","value":"list"}]})).await;
         call(&session, &scope, json!({"type":"sql","sql":"COMMIT"})).await;
     }
-    db.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn moves_keep_historical_birth_proofs_after_an_application_generation() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("writer");
-    let hub = Arc::new(Hub::default());
-    let db = Database::create(open(&path, &hub), None).unwrap().database;
-    let scope: Value = serde_json::from_str(&db.scope()).unwrap();
-    let session = db.session();
-    // The owner follows `main`; the next version publishes on it.
-    for action in ["create", "follow"] {
-        call(
-            &session,
-            &scope,
-            json!({"type":"tips","action":action,"name":"main"}),
-        )
-        .await;
-    }
-    for name in ["A", "B"] {
-        call(
-            &session,
-            &scope,
-            json!({"type":"partition_create","table":"items","values":values(name)}),
-        )
-        .await;
-    }
-    call(&session, &scope, json!({"type":"sql","sql":"BEGIN"})).await;
-    let id = call(
-        &session,
-        &scope,
-        json!({"type":"next_id","table":"items","partition_values":values("A")}),
-    )
-    .await["id"]
-        .clone();
-    call(&session, &scope, json!({"type":"sql","sql":"INSERT INTO items(list,key,amount,id) VALUES('A','kept',10,?)","values":[{"type":"integer","value":id}]})).await;
-    call(&session, &scope, json!({"type":"sql","sql":"COMMIT"})).await;
-    db.close().await.unwrap();
-    let mut definition: Value = serde_json::from_str(SCHEMA).unwrap();
-    definition["version"] = json!(2);
-    definition["tables"][0]["columns"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"name":"note","type":"text","not_null":false}));
-    let schema = definition.to_string();
-    let db = Database::open(Open {
-        schema: &schema,
-        ..open(&path, &hub)
-    })
-    .unwrap()
-    .database;
-    let session = db.session();
-
-    call(&session, &scope, json!({"type":"move_row","handle":vec![92u8;32],"table":"items","id":id,"from":values("A"),"to":values("B")})).await;
-    let rows = call(&session, &scope, json!({"type":"read","query":{"sql":"SELECT id,note FROM items WHERE list='B' AND row_kind=0","values":[],"max_rows":2}})).await;
-    assert_eq!(rows["rows"][0][0]["value"], id);
-    assert_eq!(rows["rows"][0][1]["type"], "null");
     db.close().await.unwrap();
 }

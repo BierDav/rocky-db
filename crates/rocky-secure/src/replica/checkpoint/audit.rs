@@ -5,7 +5,8 @@ use super::*;
 pub struct AuditReport {
     /// Retained operations of the scope whose signatures and bindings verified.
     pub operations: u64,
-    /// Stored rows compared with the scope's digest; zero without the key.
+    /// Stored rows compared with the scope's digest, or a replayed scope's
+    /// table rows; zero without the key.
     pub rows: u64,
     /// The verified checkpoint the stored rows were checked against.
     pub checkpoint: Option<Commitment>,
@@ -226,6 +227,41 @@ impl<A: RowApplication> Inner<A> {
             SqlValue::Integer(id), None,
         ).await
     }
+    /// `verify_tail` for a replayed scope: its base rows match the signed
+    /// checkpoint. The audit's rebuild oracle checks the rows replayed on top.
+    async fn verify_replayed_tail(
+        &self,
+        scope: ResourceScope,
+        id: i64,
+        record: Option<Record>,
+    ) -> Result<(Option<SignedCheckpoint>, u64), Error> {
+        let (signed, cursor) = match record {
+            Some(record) => {
+                let signed = self.verify_record(scope, &record)?;
+                let rows = self.stored_images("secure_replayed_base", id, None).await?;
+                if replay::base_sets(&rows).rows_summary() != signed.statement.rows {
+                    return Err(mismatch());
+                }
+                (Some(signed), record.position)
+            }
+            None => (None, 0),
+        };
+        match collect_rows(
+            self.conn
+                .query(
+                    "SELECT COUNT(*) FROM secure_applied WHERE scope=? AND position>?",
+                    [id, cursor],
+                )
+                .await?,
+        )
+        .await?
+        .first()
+        .map(Vec::as_slice)
+        {
+            Some([SqlValue::Integer(count)]) => Ok((signed, *count as u64)),
+            _ => Err(Error::Corrupt("applied positions".into())),
+        }
+    }
     /// Replays the applied operations after the scope's verified checkpoint
     /// over it and compares the result with the stored rows. Returns the
     /// checkpoint and the operations replayed.
@@ -246,6 +282,9 @@ impl<A: RowApplication> Inner<A> {
                 .is_err()
         {
             super::super::blockers::refuse(self.readable_blockers(scope).await?)?;
+        }
+        if self.replayed_scope(scope) {
+            return self.verify_replayed_tail(scope, id, record).await;
         }
         let (signed, cursor, mut sets, ledger) = match record {
             Some(record) => {
@@ -569,6 +608,8 @@ impl<A: RowApplication> Inner<A> {
         let (Some(id), Ok(_)) = (id, self.scope_key(scope)) else {
             return Ok(report);
         };
+        // A replayed scope's rows are its table's; `verify_tail` checks its base.
+        let replayed = self.replayed_scope(scope);
         let live = self
             .row_sets(
                 "SELECT row,fields FROM secure_row_records WHERE scope=? AND row>? ORDER BY row LIMIT ?",
@@ -581,7 +622,9 @@ impl<A: RowApplication> Inner<A> {
             return Err(mismatch());
         }
         report.rows = rows;
-        if let Some(record) = self.checkpoint_record(id, true).await? {
+        if replayed {
+            report.rows = self.replayed_images(scope).await?.len() as u64;
+        } else if let Some(record) = self.checkpoint_record(id, true).await? {
             let signed = self.verify_record(scope, &record)?;
             let base = self
                 .row_sets(

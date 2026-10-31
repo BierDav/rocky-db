@@ -260,13 +260,12 @@ private class DeviceProcess {
                 put("tombstones", scalar("SELECT COALESCE(SUM(tombstones),0) FROM secure_scope_state") + scalar("SELECT count(*) FROM secure_rows WHERE fields IS NULL"))
                 put("operations", scalar("SELECT count(*) FROM secure_operations"))
                 put("stubs", scalar("SELECT count(*) FROM secure_stubs"))
-                put("existence", scalar("SELECT count(*) FROM secure_existence_log"))
                 put("history", scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'secure_history_%'"))
                 val self = database.tips.inspect().nodes.firstOrNull { it.keptTips != null }
                 put("tips", JsonArray(self?.keptTips.orEmpty().map(::JsonPrimitive)))
             }
 
-            // Approvals as the app writes them: a request is an ordinary row, a decision a coordinated write.
+            // Approvals as the app writes them: requests and decisions are ordinary rows.
             "ask" -> {
                 val key = RockyDatabase.newHandle()
                 val self = database.session().node
@@ -277,16 +276,14 @@ private class DeviceProcess {
             "decide" -> {
                 val key = request.text("key")
                 val self = database.session().node
-                database.coordinated {
-                    check(query("SELECT key FROM requests WHERE key=?", key).isNotEmpty()) { "request $key has not arrived" }
-                    execute("INSERT INTO decisions(key,approved,decider,id) VALUES(?,?,?,?)", key, true, self, nextId("decisions"))
-                }
-                JsonPrimitive(database.coordinatedStatus().position)
+                check(rows("SELECT key FROM requests WHERE key='$key'").isNotEmpty()) { "request $key has not arrived" }
+                database.write { execute("INSERT INTO decisions(key,approved,decider,id) VALUES(?,?,?,?)", key, true, self, nextId("decisions")) }
+                JsonPrimitive(key)
             }
 
             "decisions" -> JsonArray(rows("SELECT key FROM decisions ORDER BY key").map { JsonPrimitive(it[0]) })
 
-            "coordinated" -> JsonPrimitive(database.coordinatedStatus().position)
+            "coordinated" -> JsonPrimitive(database.coordinatedStatus().tip)
 
             "prepare" -> Credentials.prepare(directory().path)
 
@@ -421,8 +418,7 @@ private class DeviceProcess {
             }
 
             "move" -> {
-                repository.move(request.long("from"), request.long("id"), request.long("to"), request.text("handle"))
-                JsonNull
+                repository.move(request.long("from"), request.long("id"), request.long("to"))?.let(::JsonPrimitive) ?: JsonNull
             }
 
             "share" -> {
@@ -461,7 +457,7 @@ private class DeviceProcess {
                 if (room != null) {
                     room!!.lists().observeAll().first().map { JsonPrimitive("${it.id}:${it.title}") }
                 } else {
-                    rows("SELECT id, title FROM lists WHERE row_kind = 0 ORDER BY id").map { JsonPrimitive("${it[0]}:${it[1]}") }
+                    rows("SELECT id, title FROM lists ORDER BY id").map { JsonPrimitive("${it[0]}:${it[1]}") }
                 },
             )
 

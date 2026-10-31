@@ -149,8 +149,6 @@ struct Subscription {
 /// One session's reader and subscriptions. Sessions share the database.
 pub(crate) struct Client {
     reader: Mutex<Option<Reader>>,
-    /// The slot a coordinated transaction began at, until it commits.
-    slot: std::sync::Mutex<Option<rocky_secure::Slot>>,
     cursor_key: [u8; 32],
     subscriptions: std::sync::Mutex<BTreeMap<u64, Subscription>>,
     next: AtomicU64,
@@ -506,7 +504,6 @@ impl Node {
         }
         let client = Arc::new(Client {
             reader: Mutex::new(None),
-            slot: std::sync::Mutex::new(None),
             cursor_key: rand::random(),
             subscriptions: std::sync::Mutex::new(BTreeMap::new()),
             next: AtomicU64::new(1),
@@ -989,7 +986,7 @@ impl Node {
             }
             "network" => Ok(serde_json::to_value(self.observed_network().await?)?),
             "pairing" | "renew" | "sync" | "contact" => self.networked(client, kind, request).await,
-            "sql" | "next_id" | "move_row" => {
+            "sql" | "next_id" => {
                 let begins = kind == "sql"
                     && request["sql"]
                         .as_str()
@@ -1597,7 +1594,7 @@ impl Node {
             "current": generation(status.current),
             "pending": self.replica.pending_schema().await?.map(|pending| json!({"tip": HEXLOWER.encode(&pending.tip.0), "manifest": HEXLOWER.encode(&pending.manifest)})),
             "reason": (!followed).then_some("follow_required"),
-            "rebuilding": status.plan.map(|plan| json!({"filled": plan.filled, "tables": plan.tables})),
+            "rebuilding": status.plan.map(|plan| json!({"tables": plan.tables})),
             "application": application,
             "waiting_for_issuer": waiting_for_issuer,
             "held": self.replica.held_changes().await?.len(),
@@ -3235,10 +3232,7 @@ impl Node {
             Protocol::Renew => {
                 answer(stream, async |request| {
                     if let Some(bytes) = request.strip_prefix(b"rocky.sdk.staged-close.v1\n") {
-                        let outcome = self
-                            .replica
-                            .relay_staged_close(bytes, &coordinated::LinkPeers(self))
-                            .await?;
+                        let outcome = self.replica.relay_staged_close(bytes).await?;
                         return Ok(serde_json::to_vec(&outcome)?);
                     }
                     if let Some(bytes) = request.strip_prefix(crate::tip_schemas::PROTOCOL) {
@@ -3497,65 +3491,6 @@ impl Node {
             Some(reader) => reader,
             None => self.reader(client).await?,
         };
-        if kind == "move_row" {
-            let table = request["table"]
-                .as_str()
-                .ok_or_else(|| refused("table must be a string"))?;
-            let id: rocky_core::RowIdentity = serde_json::from_value(request["id"].clone())?;
-            let tuple = |name: &str| -> Result<Vec<SqlValue>, Failure> {
-                let values: Vec<Cell> = serde_json::from_value(request[name].clone())?;
-                values.into_iter().map(Cell::sql).collect()
-            };
-            let handle: Vec<u8> = serde_json::from_value(request["handle"].clone())?;
-            let handle: [u8; 32] = handle
-                .try_into()
-                .map_err(|_| refused("handle must be 32 bytes"))?;
-            let statements: Vec<(String, Vec<SqlValue>)> = request
-                .get("changes")
-                .map(|changes| -> Result<_, Failure> {
-                    let changes = changes
-                        .as_array()
-                        .filter(|changes| changes.len() <= 256)
-                        .ok_or_else(|| refused("move changes must be at most 256 statements"))?;
-                    changes
-                        .iter()
-                        .map(|change| {
-                            let sql = change["sql"]
-                                .as_str()
-                                .filter(|sql| sql.len() <= MAX_SQL)
-                                .ok_or_else(|| refused("sql must be a bounded string"))?;
-                            let values: Vec<Cell> =
-                                serde_json::from_value(change["values"].clone())?;
-                            if values.len() > 256 {
-                                return Err(refused("SQL parameter quota"));
-                            }
-                            Ok((
-                                sql.into(),
-                                values
-                                    .into_iter()
-                                    .map(Cell::sql)
-                                    .collect::<Result<_, _>>()?,
-                            ))
-                        })
-                        .collect()
-                })
-                .transpose()?
-                .unwrap_or_default();
-            let committed = reader
-                .sql
-                .move_row_with(
-                    secure_handle(&handle),
-                    table,
-                    id,
-                    &tuple("from")?,
-                    &tuple("to")?,
-                    &statements,
-                )
-                .await?;
-            return Ok(
-                json!({"committed": {"handle": HEXLOWER.encode(&committed.handle), "frames": committed.frames.len()}}),
-            );
-        }
         if kind == "next_id" {
             let table = request["table"]
                 .as_str()
@@ -3587,34 +3522,10 @@ impl Node {
         if values.len() > 256 {
             return Err(refused("SQL parameter quota"));
         }
-        let coordinated = match request.get("coordinated") {
-            None => false,
-            Some(flag) => flag
-                .as_bool()
-                .ok_or_else(|| refused("coordinated must be boolean"))?,
-        };
-        let slot = |client: &Client| {
-            client
-                .slot
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-        };
-        if coordinated && sql.trim().to_ascii_uppercase().starts_with("BEGIN") {
-            // The write must read committed state: decide, catch up and
-            // join before the transaction begins.
-            let next = self.coordinated_slot().await?;
-            let result = reader.sql.run(sql, Vec::new()).await?;
-            *client.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(next);
-            return Ok(
-                json!({"columns": result.columns, "rows": [], "changes": result.changes.to_string(), "committed": null, "position": next.expected.to_string()}),
-            );
-        }
-        // Any other end of the transaction ends its slot.
-        if !coordinated
-            && ["ROLLBACK", "COMMIT", "END"].contains(&sql.trim().to_ascii_uppercase().as_str())
-        {
-            slot(client);
+        // Rocky orders no writes through a coordinated log; applications
+        // coordinate their own.
+        if request.get("coordinated").is_some() {
+            return Err(refused("coordinated writes are not supported"));
         }
         let result = if sql.trim().eq_ignore_ascii_case("COMMIT") && request.get("handle").is_some()
         {
@@ -3626,45 +3537,7 @@ impl Node {
             let handle: [u8; 32] = handle
                 .try_into()
                 .map_err(|_| refused("handle must be 32 bytes"))?;
-            if coordinated {
-                if request.get("reauthors").is_some() {
-                    return Err(refused("a coordinated write re-authors nothing"));
-                }
-                let next = slot(client)
-                    .ok_or_else(|| refused("begin the coordinated transaction with coordinated"))?;
-                let staged = reader
-                    .sql
-                    .commit_coordinated(secure_handle(&handle), next)
-                    .await?;
-                let frames = staged
-                    .committed
-                    .as_ref()
-                    .map_or(0, |commit| commit.frames.len());
-                let committed = self.propose(next.log).await?;
-                return Ok(json!({
-                    "columns": staged.columns,
-                    "rows": [],
-                    "changes": staged.changes.to_string(),
-                    "committed": {
-                        "handle": HEXLOWER.encode(&secure_handle(&handle)),
-                        "frames": frames,
-                        "position": committed.position.to_string(),
-                        "hash": HEXLOWER.encode(&committed.hash),
-                    },
-                }));
-            }
-            match request.get("reauthors") {
-                Some(_) => {
-                    reader
-                        .sql
-                        .commit_reauthoring(
-                            secure_handle(&handle),
-                            held::held_id(request, "reauthors")?,
-                        )
-                        .await?
-                }
-                None => reader.sql.commit(secure_handle(&handle)).await?,
-            }
+            reader.sql.commit(secure_handle(&handle)).await?
         } else {
             reader
                 .sql
@@ -3900,8 +3773,6 @@ pub fn error(error: &Failure) -> Value {
                 "coordinator_unavailable" | "behind" | "recovery_pending"
             ),
         )
-    } else if let Some(coordinated) = error.downcast_ref::<coordinated::Coordinated>() {
-        coordinated.code()
     } else if let Some(coordination) = error.downcast_ref::<rocky_core::CoordinationError>() {
         coordination_code(coordination)
     } else if let Some(service) = error.downcast_ref::<ServiceError>() {
@@ -3936,23 +3807,16 @@ pub fn error(error: &Failure) -> Value {
         }
     };
     let mut value = json!({"code": code, "retryable": retryable, "message": error.to_string()});
-    let clock = if let Some(coordinated::Coordinated(rocky_secure::CoordinatedError::ClockSkew {
-        coordinator_time,
-    })) = error.downcast_ref::<coordinated::Coordinated>()
-    {
-        Some(*coordinator_time)
-    } else {
-        match error
-            .downcast_ref::<rocky_core::CoordinationError>()
-            .or_else(|| match error.downcast_ref::<Error>() {
-                Some(Error::Coordination(error)) => Some(error),
-                _ => None,
-            }) {
-            Some(rocky_core::CoordinationError::ClockSkew { coordinator_time }) => {
-                Some(*coordinator_time)
-            }
+    let clock = match error
+        .downcast_ref::<rocky_core::CoordinationError>()
+        .or_else(|| match error.downcast_ref::<Error>() {
+            Some(Error::Coordination(error)) => Some(error),
             _ => None,
+        }) {
+        Some(rocky_core::CoordinationError::ClockSkew { coordinator_time }) => {
+            Some(*coordinator_time)
         }
+        _ => None,
     };
     if let Some(time) = clock {
         value["coordinator_time"] = json!(time);
@@ -3996,17 +3860,12 @@ mod error_tests {
     #[test]
     fn clock_skew_reports_authority_time_through_every_error_path() {
         let time = 1_900_000_000;
-        let errors: [Failure; 3] = [
+        let errors: [Failure; 2] = [
             Box::new(rocky_core::CoordinationError::ClockSkew {
                 coordinator_time: time,
             }),
             Box::new(Error::Coordination(
                 rocky_core::CoordinationError::ClockSkew {
-                    coordinator_time: time,
-                },
-            )),
-            Box::new(coordinated::Coordinated(
-                rocky_secure::CoordinatedError::ClockSkew {
                     coordinator_time: time,
                 },
             )),
@@ -4026,7 +3885,6 @@ mod error_tests {
             code(refusal("coordinator_unavailable")),
             ("coordinator_unavailable".into(), true)
         );
-        assert_eq!(code(refusal("abandoned")), ("abandoned".into(), false));
         let sealed: Failure = Box::new(rocky_core::CoordinationError::Sealed);
         assert_eq!(code(sealed), ("sealed".into(), false));
     }

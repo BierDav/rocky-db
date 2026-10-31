@@ -8,8 +8,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// Current descriptor format, including row identities and partition groups.
-pub const LOGICAL_SCHEMA_FORMAT: u32 = 5;
+/// Current descriptor format: replayed and local tables only.
+pub const LOGICAL_SCHEMA_FORMAT: u32 = 6;
+/// The domain rule and operation shape of a typed manifest.
+pub const TYPED_RULE: &str = "rocky.sdk.typed.v2";
 /// Largest canonical descriptor a parser accepts.
 pub const MAX_LOGICAL_SCHEMA_BYTES: usize = 4 * 1024 * 1024;
 
@@ -33,8 +35,6 @@ pub enum Collation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TableClass {
-    /// Replicated rows with register columns.
-    Mergeable,
     /// Installed, never written by a replicated operation.
     LocalOnly,
     /// Replicated as intents: replicas replay each partition's transactions
@@ -42,27 +42,20 @@ pub enum TableClass {
     Replayed,
 }
 impl TableClass {
-    /// Keyed rows other replicas hold: registers or replayed intents.
+    /// Keyed rows other replicas hold.
     pub fn typed(self) -> bool {
-        matches!(self, Self::Mergeable | Self::Replayed)
+        self == Self::Replayed
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ColumnClass {
-    Mergeable,
+    Replicated,
     LocalOnly,
     /// Recomputed from the row's other columns by this installed expression.
     Derived {
         rule: String,
     },
-}
-/// Which assigned values an update publishes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UpdatePolicy {
-    Changed,
-    Assigned,
 }
 /// The ORM's own schema identity, carried and never interpreted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,16 +82,6 @@ pub struct IndexColumn {
     pub name: String,
     pub descending: bool,
 }
-/// What a remote write that collides on a unique index of a mergeable table
-/// does to the row with the earlier stamp. See `docs/runtime/mergeable-constraints.md`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConflictPolicy {
-    /// Its indexed columns read NULL while the clash lasts.
-    SetNull,
-    /// The whole row is hidden.
-    LatestWins,
-}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogicalIndex {
@@ -106,12 +89,10 @@ pub struct LogicalIndex {
     pub unique: bool,
     pub columns: Vec<IndexColumn>,
     pub create_sql: String,
-    /// Required on a unique index of a mergeable table; omitted otherwise.
-    pub on_conflict: Option<ConflictPolicy>,
-    /// Replayed only: rule expressions indexed after `columns`.
+    /// Rule expressions indexed after `columns`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expressions: Vec<String>,
-    /// Replayed only: the rule expression choosing the indexed rows.
+    /// The rule expression choosing the indexed rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicate: Option<String>,
 }
@@ -123,8 +104,7 @@ pub struct LogicalForeignKey {
     pub references: Vec<String>,
     pub on_delete: String,
     pub on_update: String,
-    /// Replayed only: checked when the transaction ends rather than after
-    /// each statement. A mergeable table's keys are always deferred.
+    /// Checked when the transaction ends rather than after each statement.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
 }
@@ -170,9 +150,6 @@ pub struct LogicalTable {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_like: Option<String>,
     pub class: TableClass,
-    /// Replayed only: writes go through the coordinated log, in its order.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub coordinated: bool,
     /// The ORM's own statement, naming `sql_name`.
     pub create_sql: String,
     /// The engine or ORM assigns the key.
@@ -186,8 +163,6 @@ pub struct LogicalTable {
     pub partition_group: Option<String>,
     pub indexes: Vec<LogicalIndex>,
     pub foreign_keys: Vec<LogicalForeignKey>,
-    /// Publish row liveness to readers of other scopes.
-    pub existence_log: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,7 +171,6 @@ pub struct LogicalSchema {
     pub publisher: [u8; 32],
     pub application: String,
     pub source: SchemaSource,
-    pub update_policy: UpdatePolicy,
     /// Sorted by name, each table's identity.
     pub tables: Vec<LogicalTable>,
     pub views: Vec<LogicalView>,
@@ -206,38 +180,17 @@ pub struct LogicalSchema {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Incompatibility {
-    AutoGeneratedKey,
-    UniqueConstraint,
     ForeignKey,
-    CheckConstraint,
     /// A replayed table's expression or an assertion calls a function
     /// outside the deterministic allowlist, named.
     Function(String),
-    GeneratedColumn,
-    NullableKey(String),
-    Affinity(String),
-    LocalColumn(String),
-    DerivedRule(String),
-    View,
-    /// The secure profile stores no derived column.
-    DerivedColumn(String),
-    /// A conflict policy this index cannot have, named by the index.
-    ConflictPolicy(String),
     /// A foreign key Rocky cannot resolve, named by its first column.
     Reference(String),
     /// Parent and child of a foreign key lie in different reader scopes.
     CrossScopeReference(String),
-    /// A table with an existence log, or one its support rows need, cannot
-    /// hold deterministic support rows; names the conflicting key/constraint.
-    SupportRow(String),
-    /// Only a replayed table may be coordinated.
-    Coordinated,
-    /// A foreign key between a replayed and a mergeable table, named by its
-    /// first column: the two replicate differently.
+    /// A foreign key between a replayed and a local table, named by its
+    /// first column.
     ClassReference(String),
-    /// A foreign key from a coordinated table to an uncoordinated one, named
-    /// by its first column.
-    CoordinatedReference(String),
     /// An assertion that is not one deterministic `SELECT` of replayed
     /// tables in one partition group, and why.
     Assertion(String),
@@ -245,22 +198,6 @@ pub enum Incompatibility {
     Unsupported(TableClass),
 }
 
-/// Why a foreign key from `table` to `target` mixes replication classes.
-fn class_reference(
-    table: &LogicalTable,
-    target: &LogicalTable,
-    key: &LogicalForeignKey,
-) -> Option<Incompatibility> {
-    let column = || key.columns.first().cloned().unwrap_or_default();
-    let replayed = |table: &LogicalTable| table.class == TableClass::Replayed;
-    if replayed(table) != replayed(target) && (table.class.typed() || target.class.typed()) {
-        return Some(Incompatibility::ClassReference(column()));
-    }
-    if replayed(table) && table.coordinated && !target.coordinated {
-        return Some(Incompatibility::CoordinatedReference(column()));
-    }
-    None
-}
 /// The storage profile a descriptor is installed on. Their differences are
 /// listed in `docs/runtime/schema-definitions.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,42 +327,9 @@ pub fn identifier(name: &str) -> bool {
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
-/// The statement of a unique index of a mergeable table: real rows only.
-pub fn unique_index_sql(table: &str, index: &str, columns: &[IndexColumn]) -> String {
-    let terms: Vec<String> = columns
-        .iter()
-        .map(|column| {
-            let order = if column.descending { " DESC" } else { "" };
-            format!("{}{order}", quote(&column.name))
-        })
-        .collect();
-    format!(
-        "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({}) WHERE \"row_kind\" = 0",
-        quote(index),
-        quote(table),
-        terms.join(",")
-    )
-}
-/// The clause of a foreign key of a mergeable table. SQLite checks it at
-/// commit and performs no action; Rocky derives the delete action.
+/// The clause of a foreign key: SQLite performs its delete action inside
+/// the transaction that deletes the parent.
 pub fn foreign_key_clause(key: &LogicalForeignKey) -> String {
-    let list = |names: &[String]| {
-        names
-            .iter()
-            .map(|name| quote(name))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    format!(
-        "FOREIGN KEY({}) REFERENCES {}({}) DEFERRABLE INITIALLY DEFERRED",
-        list(&key.columns),
-        quote(&key.table),
-        list(&key.references)
-    )
-}
-/// The clause of a foreign key of a replayed table: SQLite performs its
-/// delete action inside the transaction that deletes the parent.
-pub fn replayed_foreign_key_clause(key: &LogicalForeignKey) -> String {
     let deferred = if key.deferred {
         " DEFERRABLE INITIALLY DEFERRED"
     } else {
@@ -450,6 +354,8 @@ pub fn replayed_foreign_key_clause(key: &LogicalForeignKey) -> String {
 /// The delete actions a foreign key may declare.
 pub const DELETE_CASCADE: &str = "CASCADE";
 pub const DELETE_SET_NULL: &str = "SET NULL";
+/// The name prefix of the triggers `LogicalSchema::delete_triggers` makes.
+pub const DELETE_TRIGGERS: &str = "rocky_set_null_";
 fn reserved(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.starts_with("rocky_") || name.starts_with("sqlite_") || name == "excluded"
@@ -650,6 +556,24 @@ fn invalid<T>(reason: impl Into<String>) -> Result<T, SchemaError> {
     Err(SchemaError::Invalid(reason.into()))
 }
 impl LogicalTable {
+    /// The clause SQLite enforces for `key`. SQLite's `SET NULL` nulls
+    /// every column of a reference, so one with a non-null column, such as
+    /// a partition column, takes no action and `delete_triggers` nulls only
+    /// its nullable columns.
+    pub fn foreign_key_sql(&self, key: &LogicalForeignKey) -> String {
+        if key.on_delete == DELETE_SET_NULL && !self.nulls_whole(key) {
+            return foreign_key_clause(&LogicalForeignKey {
+                on_delete: "NO ACTION".into(),
+                ..key.clone()
+            });
+        }
+        foreign_key_clause(key)
+    }
+    fn nulls_whole(&self, key: &LogicalForeignKey) -> bool {
+        key.columns
+            .iter()
+            .all(|name| self.column(name).is_some_and(|column| !column.not_null))
+    }
     /// The identity index columns, which foreign keys reference: the
     /// partition columns in front of `id`.
     pub fn identity_columns(&self) -> Vec<String> {
@@ -680,10 +604,10 @@ impl LogicalTable {
     pub fn key(&self) -> impl Iterator<Item = &LogicalColumn> {
         self.primary_key.iter().filter_map(|name| self.column(name))
     }
-    /// Replicated register columns, the key excluded, in declaration order.
-    pub fn registers(&self) -> impl Iterator<Item = &LogicalColumn> {
+    /// Replicated columns, the key excluded, in declaration order.
+    pub fn fields(&self) -> impl Iterator<Item = &LogicalColumn> {
         self.columns.iter().filter(|column| {
-            column.class == ColumnClass::Mergeable
+            column.class == ColumnClass::Replicated
                 && !self
                     .primary_key
                     .iter()
@@ -716,7 +640,7 @@ impl LogicalTable {
                 !key.insert(column.to_ascii_lowercase())
                     || self
                         .column(column)
-                        .is_none_or(|column| column.class != ColumnClass::Mergeable)
+                        .is_none_or(|column| column.class != ColumnClass::Replicated)
             })
         {
             return invalid(format!("{name} primary key"));
@@ -728,12 +652,10 @@ impl LogicalTable {
                 || reserved(&index.name)
                 || !create
                 || statement.contains(&Token::Symbol(';'))
-                || (index.columns.is_empty() && self.class != TableClass::Replayed)
                 || index
                     .columns
                     .iter()
                     .any(|column| self.column(&column.name).is_none())
-                || (index.on_conflict.is_some() && !index.unique)
             {
                 return invalid(format!("{name} index {}", index.name));
             }
@@ -750,202 +672,40 @@ impl LogicalTable {
         }
         Ok(())
     }
-    /// Unique indexes that resolve remote collisions by a policy.
-    pub fn policy_indexes(&self) -> impl Iterator<Item = (&LogicalIndex, ConflictPolicy)> {
-        self.indexes
-            .iter()
-            .filter_map(|index| index.on_conflict.map(|policy| (index, policy)))
-    }
     fn installable(&self) -> Result<(), Incompatibility> {
-        if !self.partition_by.is_empty() {
-            for (index, policy) in self.policy_indexes() {
-                if policy == ConflictPolicy::SetNull
-                    || self
-                        .partition_by
-                        .iter()
-                        .any(|name| !index.columns.iter().any(|column| &column.name == name))
-                {
-                    return Err(Incompatibility::ConflictPolicy(index.name.clone()));
-                }
-            }
-        }
-        if self.coordinated && self.class != TableClass::Replayed {
-            return Err(Incompatibility::Coordinated);
-        }
-        if !self.class.typed() {
-            if !self.foreign_keys.is_empty()
-                || tokenize(&self.create_sql)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|token| keyword(token, "REFERENCES"))
-            {
-                return Err(Incompatibility::ForeignKey);
-            }
-            if let Some((index, _)) = self.policy_indexes().next() {
-                return Err(Incompatibility::ConflictPolicy(index.name.clone()));
-            }
-            return Ok(());
-        }
-        if self.class == TableClass::Replayed {
-            // SQLite enforces a replayed table's constraints during replay;
-            // references are checked across tables by the schema.
-            let statement = tokenize(&self.create_sql).unwrap_or_default();
-            let references = statement
-                .iter()
-                .filter(|token| keyword(token, "REFERENCES"))
-                .count();
-            if references != self.foreign_keys.len() {
-                return Err(Incompatibility::ForeignKey);
-            }
-            for key in &self.foreign_keys {
-                let clause = replayed_foreign_key_clause(key);
-                if ![DELETE_CASCADE, DELETE_SET_NULL].contains(&key.on_delete.as_str())
-                    || key.on_update != "NO ACTION"
-                    || !(self.create_sql.contains(&format!("{clause},"))
-                        || self.create_sql.contains(&format!("{clause})")))
-                {
-                    return Err(Incompatibility::Reference(
-                        key.columns.first().cloned().unwrap_or_default(),
-                    ));
-                }
-            }
-            if let Some((index, _)) = self.policy_indexes().next() {
-                return Err(Incompatibility::ConflictPolicy(index.name.clone()));
-            }
-            if let Some(function) = std::iter::once(&self.create_sql)
-                .chain(self.indexes.iter().map(|index| &index.create_sql))
-                .find_map(|sql| crate::deterministic::refused_function(sql))
-            {
-                return Err(Incompatibility::Function(function));
-            }
-            return Ok(());
-        }
         let statement = tokenize(&self.create_sql).unwrap_or_default();
-        let has = |keyword: &str| {
-            statement.iter().any(
-                |token| matches!(token, Token::Word(word) if word.eq_ignore_ascii_case(keyword)),
-            )
-        };
-        let generated = statement.windows(2).any(|pair| {
-            matches!(&pair[0], Token::Word(word) if word.eq_ignore_ascii_case("AS"))
-                && pair[1] == Token::Symbol('(')
-        });
-        if self.auto_generate || has("AUTOINCREMENT") {
-            return Err(Incompatibility::AutoGeneratedKey);
-        }
-
-        if has("UNIQUE")
-            || self.indexes.iter().any(|index| {
-                index.unique && !self.is_identity_index(index) && index.on_conflict.is_none()
-            })
-        {
-            return Err(Incompatibility::UniqueConstraint);
-        }
-        for (index, policy) in self.policy_indexes() {
-            let reserved = |name: &str| {
-                ["id", "row_kind"]
-                    .iter()
-                    .any(|reserved| name.eq_ignore_ascii_case(reserved))
-            };
-            if index.create_sql != unique_index_sql(&self.sql_name, &index.name, &index.columns)
-                || index.columns.iter().any(|column| {
-                    reserved(&column.name)
-                        || (policy == ConflictPolicy::SetNull
-                            && (self
-                                .primary_key
-                                .iter()
-                                .any(|name| name.eq_ignore_ascii_case(&column.name))
-                                || self
-                                    .column(&column.name)
-                                    .is_none_or(|column| column.not_null)))
-                })
-            {
-                return Err(Incompatibility::ConflictPolicy(index.name.clone()));
-            }
-        }
         let references = statement
             .iter()
             .filter(|token| keyword(token, "REFERENCES"))
             .count();
+        if !self.class.typed() {
+            if !self.foreign_keys.is_empty() || references > 0 {
+                return Err(Incompatibility::ForeignKey);
+            }
+            return Ok(());
+        }
+        // SQLite enforces a replayed table's constraints during replay;
+        // references are checked across tables by the schema.
         if references != self.foreign_keys.len() {
             return Err(Incompatibility::ForeignKey);
         }
         for key in &self.foreign_keys {
-            let clause = foreign_key_clause(key);
-            let set_null = key.on_delete == DELETE_SET_NULL;
-            let refused = !(key.on_delete == DELETE_CASCADE || set_null)
-                || key.deferred
+            let clause = self.foreign_key_sql(key);
+            if ![DELETE_CASCADE, DELETE_SET_NULL].contains(&key.on_delete.as_str())
                 || key.on_update != "NO ACTION"
                 || !(self.create_sql.contains(&format!("{clause},"))
                     || self.create_sql.contains(&format!("{clause})")))
-                || key.columns.iter().any(|name| {
-                    ["id", "row_kind"]
-                        .iter()
-                        .any(|reserved| name.eq_ignore_ascii_case(reserved))
-                        || self.column(name).is_none_or(|column| {
-                            (column.affinity != Affinity::Integer
-                                && !self
-                                    .partition_by
-                                    .iter()
-                                    .any(|partition| partition.eq_ignore_ascii_case(name)))
-                                || (set_null
-                                    && !self
-                                        .partition_by
-                                        .iter()
-                                        .any(|partition| partition.eq_ignore_ascii_case(name))
-                                    && (column.not_null
-                                        || self
-                                            .primary_key
-                                            .iter()
-                                            .any(|column| column.eq_ignore_ascii_case(name))))
-                        })
-                });
-            if set_null
-                && key.columns.iter().all(|name| {
-                    self.partition_by
-                        .iter()
-                        .any(|partition| partition.eq_ignore_ascii_case(name))
-                })
             {
-                return Err(Incompatibility::Reference(
-                    "SET NULL requires a non-partition reference column".into(),
-                ));
-            }
-            if refused {
                 return Err(Incompatibility::Reference(
                     key.columns.first().cloned().unwrap_or_default(),
                 ));
             }
         }
-        if has("CHECK") {
-            return Err(Incompatibility::CheckConstraint);
-        }
-        if has("GENERATED") || generated {
-            return Err(Incompatibility::GeneratedColumn);
-        }
-        if self.primary_key.is_empty() {
-            return Err(Incompatibility::NullableKey("no primary key".into()));
-        }
-        if let Some(column) = self.key().find(|column| !column.not_null) {
-            return Err(Incompatibility::NullableKey(column.sql_name.clone()));
-        }
-        let sources: Vec<&str> = self
-            .columns
-            .iter()
-            .filter(|column| column.class == ColumnClass::Mergeable)
-            .map(|column| column.sql_name.as_str())
-            .collect();
-        for column in &self.columns {
-            let name = || column.sql_name.clone();
-            if column.affinity == Affinity::Numeric {
-                return Err(Incompatibility::Affinity(name()));
-            }
-            match &column.class {
-                ColumnClass::Mergeable => {}
-                ColumnClass::LocalOnly => return Err(Incompatibility::LocalColumn(name())),
-                ColumnClass::Derived { rule } if derived_rule(rule, &sources) => {}
-                ColumnClass::Derived { .. } => return Err(Incompatibility::DerivedRule(name())),
-            }
+        if let Some(function) = std::iter::once(&self.create_sql)
+            .chain(self.indexes.iter().map(|index| &index.create_sql))
+            .find_map(|sql| crate::deterministic::refused_function(sql))
+        {
+            return Err(Incompatibility::Function(function));
         }
         Ok(())
     }
@@ -958,11 +718,6 @@ struct ReplicatedColumn<'a> {
     not_null: bool,
     collation: Collation,
     default: Option<&'a str>,
-}
-#[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
-struct ReplicatedUnique<'a> {
-    columns: Vec<&'a str>,
-    on_conflict: ConflictPolicy,
 }
 #[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
 struct ReplicatedReference<'a> {
@@ -979,14 +734,11 @@ struct ReplicatedTable<'a> {
     granted_like: Option<&'a str>,
     key: Vec<ReplicatedColumn<'a>>,
     fields: Vec<ReplicatedColumn<'a>>,
-    unique: Vec<ReplicatedUnique<'a>>,
     references: Vec<ReplicatedReference<'a>>,
     partition_by: Vec<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     partition_group: Option<&'a str>,
-    existence_log: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    replayed: Option<ReplayedConstraints<'a>>,
+    replayed: ReplayedConstraints<'a>,
 }
 /// What SQLite enforces when a replayed table's transactions replay: every
 /// replica must run the same statements and assertions.
@@ -1001,7 +753,6 @@ struct ReplayedConstraints<'a> {
 #[derive(Serialize)]
 struct Replicated<'a> {
     format: u32,
-    update_policy: UpdatePolicy,
     tables: Vec<ReplicatedTable<'a>>,
 }
 fn replicated_column(column: &LogicalColumn) -> ReplicatedColumn<'_> {
@@ -1014,25 +765,13 @@ fn replicated_column(column: &LogicalColumn) -> ReplicatedColumn<'_> {
     }
 }
 fn replicated_table<'a>(schema: &'a LogicalSchema, table: &'a LogicalTable) -> ReplicatedTable<'a> {
-    let mut fields: Vec<_> = table.registers().map(replicated_column).collect();
+    let mut fields: Vec<_> = table.fields().map(replicated_column).collect();
     fields.sort_by_key(|column| column.name);
     let name = |name: &str| {
         table
             .column(name)
             .map_or_else(|| "", |column| column.sql_name.as_str())
     };
-    let mut unique: Vec<_> = table
-        .policy_indexes()
-        .map(|(index, on_conflict)| ReplicatedUnique {
-            columns: index
-                .columns
-                .iter()
-                .map(|column| name(&column.name))
-                .collect(),
-            on_conflict,
-        })
-        .collect();
-    unique.sort();
     let mut references: Vec<_> = table
         .foreign_keys
         .iter()
@@ -1046,13 +785,18 @@ fn replicated_table<'a>(schema: &'a LogicalSchema, table: &'a LogicalTable) -> R
         })
         .collect();
     references.sort();
+    let mut indexes: Vec<_> = table
+        .indexes
+        .iter()
+        .map(|index| index.create_sql.as_str())
+        .collect();
+    indexes.sort_unstable();
     ReplicatedTable {
         class: table.class,
         name: &table.sql_name,
         granted_like: table.granted_like.as_deref(),
         key: table.key().map(replicated_column).collect(),
         fields,
-        unique,
         references,
         partition_by: table
             .partition_by
@@ -1060,36 +804,16 @@ fn replicated_table<'a>(schema: &'a LogicalSchema, table: &'a LogicalTable) -> R
             .filter_map(|name| table.column(name).map(|column| column.sql_name.as_str()))
             .collect(),
         partition_group: table.partition_group.as_deref(),
-        existence_log: table.existence_log,
-        replayed: (table.class == TableClass::Replayed).then(|| {
-            let mut indexes: Vec<_> = table
-                .indexes
+        replayed: ReplayedConstraints {
+            create_sql: &table.create_sql,
+            indexes,
+            assertions: schema
+                .assertions
                 .iter()
-                .map(|index| index.create_sql.as_str())
-                .collect();
-            indexes.sort_unstable();
-            ReplayedConstraints {
-                create_sql: &table.create_sql,
-                indexes,
-                assertions: schema
-                    .assertions
-                    .iter()
-                    .filter(|assertion| assertion.reads_table(&table.sql_name))
-                    .collect(),
-            }
-        }),
+                .filter(|assertion| assertion.reads_table(&table.sql_name))
+                .collect(),
+        },
     }
-}
-/// The replicated shape of a table's key, in key order, for comparison.
-pub(crate) fn key_shape(table: &LogicalTable) -> String {
-    json(&table.key().map(replicated_column).collect::<Vec<_>>())
-}
-/// The replicated shape of every register, by name.
-pub(crate) fn register_shapes(table: &LogicalTable) -> std::collections::BTreeMap<String, String> {
-    table
-        .registers()
-        .map(|column| (column.sql_name.clone(), json(&replicated_column(column))))
-        .collect()
 }
 fn json(value: &impl Serialize) -> String {
     // These values hold only strings, numbers, booleans and lists.
@@ -1097,6 +821,43 @@ fn json(value: &impl Serialize) -> String {
 }
 
 impl LogicalSchema {
+    /// Triggers that null the nullable columns of each `SET NULL`
+    /// reference SQLite cannot null whole, when its parent row is deleted:
+    /// those whose two tables are `installed`.
+    pub fn delete_triggers(&self, installed: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut triggers = Vec::new();
+        for table in self.tables.iter().filter(|table| installed(&table.sql_name)) {
+            for (index, key) in table.foreign_keys.iter().enumerate() {
+                if key.on_delete != DELETE_SET_NULL
+                    || table.nulls_whole(key)
+                    || !installed(&key.table)
+                {
+                    continue;
+                }
+                let nulled: Vec<_> = key
+                    .columns
+                    .iter()
+                    .filter(|name| table.column(name).is_some_and(|column| !column.not_null))
+                    .map(|name| format!("{}=NULL", quote(name)))
+                    .collect();
+                let matched: Vec<_> = key
+                    .columns
+                    .iter()
+                    .zip(&key.references)
+                    .map(|(column, parent)| format!("{}=OLD.{}", quote(column), quote(parent)))
+                    .collect();
+                triggers.push(format!(
+                    "CREATE TRIGGER {} AFTER DELETE ON {} FOR EACH ROW BEGIN UPDATE {} SET {} WHERE {}; END",
+                    quote(&format!("{DELETE_TRIGGERS}{}_{index}", table.sql_name)),
+                    quote(&key.table),
+                    quote(&table.sql_name),
+                    nulled.join(","),
+                    matched.join(" AND "),
+                ));
+            }
+        }
+        triggers
+    }
     pub fn app_id(&self) -> AppId {
         ApplicationManifest::app_id(self.publisher, &self.application)
     }
@@ -1117,10 +878,10 @@ impl LogicalSchema {
         for table in &self.tables {
             table.validate()?;
             if let Some(like) = &table.granted_like
-                && (table.class != TableClass::Mergeable
+                && (!table.class.typed()
                     || like == &table.sql_name
                     || self.table(like).is_none_or(|parent| {
-                        parent.class != TableClass::Mergeable || parent.granted_like.is_some()
+                        !parent.class.typed() || parent.granted_like.is_some()
                     }))
             {
                 return invalid(format!("{}: invalid granted_like {like}", table.sql_name));
@@ -1135,7 +896,7 @@ impl LogicalSchema {
                             .any(|column| column.eq_ignore_ascii_case(name))
                         || table.column(name).is_none_or(|column| {
                             !column.not_null
-                                || column.class != ColumnClass::Mergeable
+                                || column.class != ColumnClass::Replicated
                                 || column.affinity == Affinity::Numeric
                         })
                 })
@@ -1146,10 +907,10 @@ impl LogicalSchema {
                 ));
             }
             {
-                for name in ["id", "row_kind"] {
+                for name in ["id"] {
                     let column = table.column(name).ok_or_else(|| {
                         SchemaError::Invalid(format!(
-                            "{}.{} is required by descriptor format 5",
+                            "{}.{} is required by descriptor format 6",
                             table.sql_name, name
                         ))
                     })?;
@@ -1157,7 +918,7 @@ impl LogicalSchema {
                         || column.affinity != Affinity::Integer
                         || !column.not_null
                         || column.collation != Collation::Binary
-                        || column.class != ColumnClass::Mergeable
+                        || column.class != ColumnClass::Replicated
                     {
                         return invalid(format!(
                             "{}.{} must be a non-null integer identity column",
@@ -1259,41 +1020,30 @@ impl LogicalSchema {
                     .tables
                     .iter()
                     .find(|target| target.sql_name.eq_ignore_ascii_case(&key.table))
-                    && let Some(reason) = class_reference(table, target, key)
+                    && target.class != table.class
                 {
-                    return incompatible(&table.sql_name, reason);
+                    let column = key.columns.first().cloned().unwrap_or_default();
+                    return incompatible(&table.sql_name, Incompatibility::ClassReference(column));
                 }
             }
             if let Err(reason) = table.installable() {
                 return incompatible(&table.sql_name, reason);
             }
             for key in &table.foreign_keys {
-                let target = self
-                    .tables
-                    .iter()
-                    .find(|target| target.sql_name.eq_ignore_ascii_case(&key.table));
-                let mergeable = target.is_some_and(|target| target.class == TableClass::Mergeable);
-                if let Some(target) = target {
+                if let Some(target) = self.table(&key.table) {
                     for name in &key.references {
                         if target.column(name).is_none() {
                             return invalid(format!("{} column {name}", target.sql_name));
                         }
                     }
-                }
-                if let Some(target) = target {
                     let reason = if !target.partition_by.is_empty()
                         && (table.partition_by.is_empty()
                             || table.partition_group.is_none()
                             || table.partition_group != target.partition_group)
                     {
                         Some("partitioned references require the same explicit partition group")
-                    } else if !table.partition_by.is_empty()
-                        && target.partition_by.is_empty()
-                        && !target.existence_log
-                    {
-                        Some(
-                            "a partitioned child requires an unpartitioned logged parent outside its group",
-                        )
+                    } else if !table.partition_by.is_empty() && target.partition_by.is_empty() {
+                        Some("a partitioned child cannot reference an unpartitioned parent")
                     } else {
                         None
                     };
@@ -1304,59 +1054,6 @@ impl LogicalSchema {
                         );
                     }
                 }
-                // Only the parent's identity names one incarnation.
-                if table.class == TableClass::Mergeable
-                    && !target.is_some_and(|target| {
-                        mergeable
-                            && (target.partition_by.is_empty()
-                                && (table.partition_by.is_empty() || target.existence_log)
-                                || !table.partition_by.is_empty()
-                                    && table.partition_group.is_some()
-                                    && table.partition_group == target.partition_group
-                                    && target.partition_by.iter().zip(&table.partition_by).all(
-                                        |(parent, child)| {
-                                            key.references.iter().zip(&key.columns).any(|(r, c)| {
-                                                r.eq_ignore_ascii_case(parent)
-                                                    && c.eq_ignore_ascii_case(child)
-                                            })
-                                        },
-                                    ))
-                            && target
-                                .identity_columns()
-                                .iter()
-                                .map(String::as_str)
-                                .zip(&key.references)
-                                .all(|(identity, reference)| {
-                                    identity.eq_ignore_ascii_case(reference)
-                                })
-                            && target.identity_columns().len() == key.references.len()
-                    })
-                {
-                    return incompatible(
-                        &table.sql_name,
-                        Incompatibility::Reference(
-                            key.columns.first().cloned().unwrap_or_default(),
-                        ),
-                    );
-                }
-            }
-        }
-        // Support rows are keyed by `id` alone: puppets copy it from a
-        // reference and the virtual row is `id = 0`.
-        for table in self.support_tables() {
-            let reason = if table.class != TableClass::Mergeable {
-                Some("existence log on a table that is not mergeable".to_string())
-            } else if !table.partition_by.is_empty() {
-                Some(format!("partition_by ({})", table.partition_by.join(",")))
-            } else if !(table.primary_key.len() == 1
-                && table.primary_key[0].eq_ignore_ascii_case("id"))
-            {
-                Some(format!("primary key ({})", table.primary_key.join(",")))
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                return incompatible(&table.sql_name, Incompatibility::SupportRow(reason));
             }
         }
         for assertion in &self.assertions {
@@ -1391,11 +1088,8 @@ impl LogicalSchema {
         let Some(first) = tables.first() else {
             return refused("reads no table");
         };
-        if tables
-            .iter()
-            .any(|table| group(table) != group(first) || table.coordinated != first.coordinated)
-        {
-            return refused("tables must share one partition group and replay order");
+        if tables.iter().any(|table| group(table) != group(first)) {
+            return refused("tables must share one partition group");
         }
         Ok(())
     }
@@ -1406,56 +1100,15 @@ impl LogicalSchema {
             return vec![error];
         }
         // Only the secure profile replays intents.
-        let replaying = profile == Profile::Secure;
-        let replayed: Vec<_> = self
-            .tables
-            .iter()
-            .filter(|table| table.class == TableClass::Replayed && !replaying)
+        if profile == Profile::Secure {
+            return Vec::new();
+        }
+        self.typed()
             .map(|table| SchemaError::Incompatible {
                 table: table.sql_name.clone(),
                 reason: Incompatibility::Unsupported(TableClass::Replayed),
             })
-            .collect();
-        if !replayed.is_empty() {
-            return replayed;
-        }
-        let mut found = Vec::new();
-        let mut refuse = |table: &LogicalTable, reason| {
-            found.push(SchemaError::Incompatible {
-                table: table.sql_name.clone(),
-                reason,
-            })
-        };
-        if profile == Profile::Trusted {
-            // The trusted profile does not resolve hidden rows.
-            for table in self.mergeable() {
-                if table.existence_log {
-                    refuse(table, Incompatibility::SupportRow("existence log".into()));
-                }
-                if table.policy_indexes().next().is_some() {
-                    refuse(table, Incompatibility::UniqueConstraint);
-                }
-                if !table.foreign_keys.is_empty() {
-                    refuse(table, Incompatibility::ForeignKey);
-                }
-            }
-            return found;
-        }
-        for table in &self.tables {
-            // A replayed derived column is SQLite's own generated column.
-            if !table.class.typed() || table.class == TableClass::Replayed {
-                continue;
-            }
-            for column in &table.columns {
-                if let ColumnClass::Derived { .. } = column.class {
-                    refuse(
-                        table,
-                        Incompatibility::DerivedColumn(column.sql_name.clone()),
-                    );
-                }
-            }
-        }
-        found
+            .collect()
     }
     /// Whether `profile` can install the schema with every stated guarantee.
     /// Refusals happen here, before anything is created or applied.
@@ -1487,12 +1140,11 @@ impl LogicalSchema {
     pub fn fingerprint(&self) -> Result<Commitment, SchemaError> {
         Ok(commitment("rocky.logical-schema.v1", &self.canonical()?))
     }
-    /// Commits to what replicas must agree on: mergeable tables by name,
-    /// their class, keys and registers, and the update policy.
+    /// Commits to what replicas must agree on: replayed tables by name,
+    /// their keys, fields and the constraints replay enforces.
     pub fn replicated_fingerprint(&self) -> Commitment {
         let replicated = Replicated {
             format: self.format,
-            update_policy: self.update_policy,
             tables: self
                 .typed()
                 .map(|table| replicated_table(self, table))
@@ -1503,63 +1155,7 @@ impl LogicalSchema {
             json(&replicated).as_bytes(),
         )
     }
-    pub fn mergeable(&self) -> impl Iterator<Item = &LogicalTable> {
-        self.tables
-            .iter()
-            .filter(|table| table.class == TableClass::Mergeable)
-    }
-    /// Whether a mergeable table takes part in constraint resolution: it has
-    /// a policy index or a foreign key, or a foreign key references it.
-    pub fn constrained(&self, table: &LogicalTable) -> bool {
-        table.class == TableClass::Mergeable
-            && (table.policy_indexes().next().is_some()
-                || !table.foreign_keys.is_empty()
-                || self.mergeable().any(|child| {
-                    child
-                        .foreign_keys
-                        .iter()
-                        .any(|key| key.table.eq_ignore_ascii_case(&table.sql_name))
-                }))
-    }
-    /// Tables whose rows' liveness their existence log decides.
-    pub fn existence_tables(&self) -> impl Iterator<Item = &LogicalTable> {
-        self.tables.iter().filter(|table| table.existence_log)
-    }
-    /// Tables that may hold support rows: those with an existence log and,
-    /// transitively, the parents of a support row's `NOT NULL` references,
-    /// which receive a virtual row. In schema order.
-    pub fn support_tables(&self) -> Vec<&LogicalTable> {
-        let mut found: BTreeSet<&str> = self
-            .existence_tables()
-            .map(|table| table.sql_name.as_str())
-            .collect();
-        loop {
-            let reached: Vec<&str> = self
-                .tables
-                .iter()
-                .filter(|table| found.contains(table.sql_name.as_str()))
-                .flat_map(|table| {
-                    table.foreign_keys.iter().filter(|key| {
-                        key.columns
-                            .iter()
-                            .any(|name| table.column(name).is_some_and(|column| column.not_null))
-                    })
-                })
-                .filter_map(|key| self.table(&key.table))
-                .map(|parent| parent.sql_name.as_str())
-                .collect();
-            let before = found.len();
-            found.extend(reached);
-            if found.len() == before {
-                break;
-            }
-        }
-        self.tables
-            .iter()
-            .filter(|table| found.contains(table.sql_name.as_str()))
-            .collect()
-    }
-    /// Mergeable and replayed tables: those with signed entities and fields.
+    /// Replayed tables: those with signed entities and fields.
     pub fn typed(&self) -> impl Iterator<Item = &LogicalTable> {
         self.tables.iter().filter(|table| table.class.typed())
     }
@@ -1598,7 +1194,7 @@ impl LogicalSchema {
             }
             entities.push(item("entity", table.sql_name.clone(), json(&replicated)));
         }
-        let shape = format!("rocky.sdk.typed.v1:{:?}", self.update_policy);
+        let shape = TYPED_RULE.to_string();
         ApplicationManifest {
             publisher,
             name: self.application.clone(),
@@ -1616,20 +1212,10 @@ impl LogicalSchema {
                 .map(|domain| DomainRule {
                     domain: *domain,
                     author_log: AuthorLogScope::Domain,
-                    rule: "rocky.sdk.typed.v1".into(),
+                    rule: TYPED_RULE.into(),
                 })
                 .collect(),
         }
-    }
-}
-
-impl LogicalIndex {
-    /// The unpartitioned identity index. Partition-aware validation is phase 11.
-    pub fn is_identity(&self) -> bool {
-        self.unique
-            && self.columns.len() == 1
-            && self.columns[0].name.eq_ignore_ascii_case("id")
-            && !self.columns[0].descending
     }
 }
 
@@ -1644,7 +1230,7 @@ mod tests {
             not_null: true,
             default: None,
             collation: Collation::Binary,
-            class: ColumnClass::Mergeable,
+            class: ColumnClass::Replicated,
         }
     }
     fn schema() -> LogicalSchema {
@@ -1657,22 +1243,19 @@ mod tests {
                 version: 2,
                 identity: "abc".into(),
             },
-            update_policy: UpdatePolicy::Changed,
             tables: vec![LogicalTable {
                 sql_name: "items".into(),
             granted_like: None,
-                class: TableClass::Mergeable,
-                coordinated: false,
-                create_sql: "CREATE TABLE `items` (`key` TEXT NOT NULL, `title` TEXT NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`key`))".into(),
+                class: TableClass::Replayed,
+                create_sql: "CREATE TABLE `items` (`key` TEXT NOT NULL, `title` TEXT NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`key`))".into(),
                 auto_generate: false,
-                columns: vec![column("key", Affinity::Text), column("title", Affinity::Text), column("id", Affinity::Integer), column("row_kind", Affinity::Integer)],
+                columns: vec![column("key", Affinity::Text), column("title", Affinity::Text), column("id", Affinity::Integer)],
                 primary_key: vec!["key".into()],
                 partition_by: Vec::new(),
             partition_group: None,
-                indexes: vec![LogicalIndex { name: "items_identity".into(), unique: true, columns: vec![IndexColumn { name: "id".into(), descending: false }], create_sql: "CREATE UNIQUE INDEX items_identity ON items(id)".into(), on_conflict: None, expressions: Vec::new(), predicate: None }],
+                indexes: vec![LogicalIndex { name: "items_identity".into(), unique: true, columns: vec![IndexColumn { name: "id".into(), descending: false }], create_sql: "CREATE UNIQUE INDEX items_identity ON items(id)".into(), expressions: Vec::new(), predicate: None }],
                 foreign_keys: Vec::new(),
 
-                existence_log: false,
             }],
             views: Vec::new(),
             assertions: Vec::new(),
@@ -1685,7 +1268,7 @@ mod tests {
         table.primary_key = vec!["KEY".into()];
         assert_eq!(table.column("TITLE").unwrap().sql_name, "title");
         assert_eq!(table.key().next().unwrap().sql_name, "key");
-        assert!(!table.registers().any(|column| column.sql_name == "key"));
+        assert!(!table.fields().any(|column| column.sql_name == "key"));
         let key = LogicalForeignKey {
             columns: vec!["link".into()],
             table: "ITEMS".into(),
@@ -1766,7 +1349,16 @@ mod tests {
     fn local_details_keep_the_replicated_identity_and_renames_do_not() {
         let schema = schema();
         let mut local = schema.clone();
-        local.tables[0].indexes.push(LogicalIndex {
+        local.source.identity = "def".into();
+        local.installable().unwrap();
+        assert_ne!(schema.fingerprint().unwrap(), local.fingerprint().unwrap());
+        assert_eq!(
+            schema.replicated_fingerprint(),
+            local.replicated_fingerprint()
+        );
+        // Replay enforces indexes, so replicas agree on them.
+        let mut indexed = schema.clone();
+        indexed.tables[0].indexes.push(LogicalIndex {
             name: "by_title".into(),
             unique: false,
             columns: vec![IndexColumn {
@@ -1774,16 +1366,12 @@ mod tests {
                 descending: false,
             }],
             create_sql: "CREATE INDEX by_title ON items(title)".into(),
-            on_conflict: None,
             expressions: Vec::new(),
             predicate: None,
         });
-        local.source.identity = "def".into();
-        local.installable().unwrap();
-        assert_ne!(schema.fingerprint().unwrap(), local.fingerprint().unwrap());
-        assert_eq!(
+        assert_ne!(
             schema.replicated_fingerprint(),
-            local.replicated_fingerprint()
+            indexed.replicated_fingerprint()
         );
         let domain = [DomainId([1; 16])];
         assert_eq!(
@@ -1825,9 +1413,9 @@ mod tests {
         );
     }
     #[test]
-    fn replayed_tables_refuse_mixed_and_coordinated_references() {
+    fn replayed_tables_refuse_mixed_references() {
         // `items` references `parents` by its identity.
-        let reason = |child: TableClass, parent: TableClass, coordinated: [bool; 2]| {
+        let reason = |child: TableClass, parent: TableClass| {
             let mut schema = schema();
             let mut parents = schema.tables[0].clone();
             parents.sql_name = "parents".into();
@@ -1836,10 +1424,8 @@ mod tests {
                 index.name = index.name.replace("items", "parents");
             }
             parents.class = parent;
-            parents.coordinated = coordinated[1];
             let items = &mut schema.tables[0];
             items.class = child;
-            items.coordinated = coordinated[0];
             let key = LogicalForeignKey {
                 table: "parents".into(),
                 columns: vec!["id".into()],
@@ -1849,7 +1435,7 @@ mod tests {
                 deferred: false,
             };
             items.create_sql.pop();
-            items.create_sql += &format!(", {})", replayed_foreign_key_clause(&key));
+            items.create_sql += &format!(", {})", foreign_key_clause(&key));
             items.foreign_keys.push(key);
             schema.tables.push(parents);
             schema.tables.sort_by(|a, b| a.sql_name.cmp(&b.sql_name));
@@ -1859,24 +1445,13 @@ mod tests {
                 Err(error) => panic!("{error}"),
             }
         };
-        use TableClass::{Mergeable, Replayed};
+        use TableClass::{LocalOnly, Replayed};
         let mixed = Some(Incompatibility::ClassReference("id".into()));
-        assert_eq!(reason(Replayed, Mergeable, [false; 2]), mixed);
-        assert_eq!(reason(Mergeable, Replayed, [false; 2]), mixed);
-        assert_eq!(reason(Replayed, Replayed, [false; 2]), None);
-        assert_eq!(reason(Replayed, Replayed, [false, true]), None);
-        assert_eq!(reason(Replayed, Replayed, [true; 2]), None);
-        assert_eq!(
-            reason(Replayed, Replayed, [true, false]),
-            Some(Incompatibility::CoordinatedReference("id".into()))
-        );
-        assert_eq!(
-            reason(Mergeable, Mergeable, [true, false]),
-            Some(Incompatibility::Coordinated)
-        );
+        assert_eq!(reason(Replayed, LocalOnly), mixed);
+        assert_eq!(reason(LocalOnly, Replayed), mixed);
+        assert_eq!(reason(Replayed, Replayed), None);
         // Only the secure profile replays.
-        let mut schema = schema();
-        schema.tables[0].class = Replayed;
+        let schema = schema();
         assert_eq!(schema.installable(), Ok(()));
         assert_eq!(
             schema.supported_on(Profile::Trusted),
@@ -1888,7 +1463,7 @@ mod tests {
         assert_eq!(schema.supported_on(Profile::Secure), Ok(()));
     }
     #[test]
-    fn schemas_that_cannot_converge_are_refused() {
+    fn references_must_be_declared_and_replayable() {
         let reason = |change: &dyn Fn(&mut LogicalTable)| {
             let mut schema = schema();
             change(&mut schema.tables[0]);
@@ -1900,26 +1475,6 @@ mod tests {
         };
         assert_eq!(reason(&|_| {}), None);
         assert_eq!(
-            reason(&|table| table.auto_generate = true),
-            Some(Incompatibility::AutoGeneratedKey)
-        );
-        assert_eq!(
-            reason(&|table| table.create_sql.push_str(" CHECK(1)")),
-            Some(Incompatibility::CheckConstraint)
-        );
-        assert_eq!(
-            reason(&|table| table.columns[0].not_null = false),
-            Some(Incompatibility::NullableKey("key".into()))
-        );
-        assert_eq!(
-            reason(&|table| table.columns[1].affinity = Affinity::Numeric),
-            Some(Incompatibility::Affinity("title".into()))
-        );
-        assert_eq!(
-            reason(&|table| table.columns[1].class = ColumnClass::LocalOnly),
-            Some(Incompatibility::LocalColumn("title".into()))
-        );
-        assert_eq!(
             reason(&|table| table.foreign_keys.push(LogicalForeignKey {
                 table: "items".into(),
                 columns: vec!["title".into()],
@@ -1930,7 +1485,11 @@ mod tests {
             })),
             Some(Incompatibility::ForeignKey)
         );
-        // The same constraints are local SQL checks on a local-only table.
+        assert_eq!(
+            reason(&|table| table.create_sql.push_str(" CHECK(random() > 0)")),
+            Some(Incompatibility::Function("random".into()))
+        );
+        // Local constraints are SQLite's own on a local-only table.
         assert_eq!(
             reason(&|table| {
                 table.class = TableClass::LocalOnly;

@@ -34,7 +34,7 @@ private val ShoppingSchemaV6 = schema("shopping", version = 6) {
         integer("category", nullable = true)
         primaryKey("list", "key")
         partitionBy("list", group = "list")
-        unique("list", "title", onConflict = Conflict.LatestWins)
+        unique("list", "title")
         index("index_items_list_category", "list", "category")
         reference("list", "lists", onDelete = Delete.Cascade)
         reference(listOf("list", "category"), "categories", onDelete = Delete.SetNull)

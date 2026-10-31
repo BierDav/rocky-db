@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 type Positions = (
     BTreeMap<u32, BTreeSet<u64>>,
     BTreeMap<(ResourceScope, u32), u64>,
-    BTreeMap<(ResourceScope, u32), BTreeMap<u64, u64>>,
 );
 
 #[tokio::test]
@@ -133,7 +132,7 @@ async fn the_optional_scan_index_tracks_rows_and_is_not_backfilled_at_open() {
         vec![vec![SqlValue::Integer(0)]]
     );
     assert_eq!(
-        scan(&replica, f.public.domain, &[f.public], &[f.public], &[])
+        scan(&replica, f.public.domain, &[f.public], &[f.public])
             .await
             .unwrap()
             .0
@@ -175,7 +174,6 @@ async fn scan(
     domain: rocky_core::Scope,
     ready: &[ResourceScope],
     held: &[ResourceScope],
-    logged: &[ResourceScope],
 ) -> Result<Positions, Error> {
     replica
         .inner
@@ -185,7 +183,6 @@ async fn scan(
             domain,
             &ready.iter().map(|scope| (*scope, None)).collect::<Vec<_>>(),
             &held.iter().copied().collect(),
-            &logged.iter().copied().collect(),
         )
         .await
 }
@@ -243,16 +240,10 @@ fn rejected<T>(result: Result<T, Error>, expected: &str) {
 async fn excluded_and_other_domain_headers_still_decode_after_warming() {
     let (f, _dir, target, frames) = pending().await;
     let original = frames[0].header_bytes();
-    let empty = scan(
-        &target,
-        f.public.domain,
-        &[f.public],
-        &[f.public],
-        &[f.public],
-    )
-    .await
-    .unwrap();
-    assert_eq!(empty, (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
+    let empty = scan(&target, f.public.domain, &[f.public], &[f.public])
+        .await
+        .unwrap();
+    assert_eq!(empty, (BTreeMap::new(), BTreeMap::new()));
     target
         .inner
         .lock(crate::replica::Class::Background)
@@ -288,7 +279,7 @@ async fn excluded_and_other_domain_headers_still_decode_after_warming() {
     ] {
         replace_header(&target, &bytes).await;
         rejected(
-            scan(&target, f.public.domain, &[f.public], &[f.public], &[]).await,
+            scan(&target, f.public.domain, &[f.public], &[f.public]).await,
             message,
         );
         rejected(
@@ -325,19 +316,16 @@ async fn excluded_and_other_domain_headers_still_decode_after_warming() {
         .stored_header_memo_limits(1, 1);
     replace_header(&target, &[0xff]).await;
     rejected(
-        scan(&target, f.public.domain, &[f.public], &[], &[]).await,
+        scan(&target, f.public.domain, &[f.public], &[]).await,
         "invalid secure frame",
     );
     let mut other = f.public.domain;
     other.app.0[0] ^= 1;
-    rejected(
-        scan(&target, other, &[], &[], &[]).await,
-        "invalid secure frame",
-    );
+    rejected(scan(&target, other, &[], &[]).await, "invalid secure frame");
     assert_eq!(state(&target).await, before);
     replace_header(&target, original).await;
     assert_eq!(
-        scan(&target, f.public.domain, &[f.public], &[f.public], &[])
+        scan(&target, f.public.domain, &[f.public], &[f.public])
             .await
             .unwrap(),
         empty
@@ -367,14 +355,12 @@ async fn warm_syntax_keeps_pending_key_ready_and_status_predicates_live() {
         crate::decode(frames[0].header_bytes()).unwrap();
     let author = header.extensions.author.unwrap();
     let position = header.extensions.author_sequence;
-    assert_eq!(header.extensions.existence, 0);
     let scopes = [(f.public, None)];
     let held = BTreeSet::from([f.public]);
-    let logged = held.clone();
     let mut inner = target.inner.lock(crate::replica::Class::Background).await;
     inner.stored_header_memo_limits(8, 1 << 20);
     let first = inner
-        .scan_positions_for_test(f.public.domain, &scopes, &held, &logged)
+        .scan_positions_for_test(f.public.domain, &scopes, &held)
         .await
         .unwrap();
     assert!(first.0.is_empty());
@@ -383,7 +369,7 @@ async fn warm_syntax_keeps_pending_key_ready_and_status_predicates_live() {
     assert_eq!(warmed.1, frames[0].header_bytes().len());
     assert_eq!(
         inner
-            .scan_positions_for_test(f.public.domain, &scopes, &held, &logged)
+            .scan_positions_for_test(f.public.domain, &scopes, &held)
             .await
             .unwrap(),
         first
@@ -395,22 +381,21 @@ async fn warm_syntax_keeps_pending_key_ready_and_status_predicates_live() {
     );
     let keys = std::mem::take(&mut inner.config.keys);
     let counted = inner
-        .scan_positions_for_test(f.public.domain, &scopes, &held, &logged)
+        .scan_positions_for_test(f.public.domain, &scopes, &held)
         .await
         .unwrap();
     assert_eq!(counted.0[&author], BTreeSet::from([position]));
     assert_eq!(counted.1[&(f.public, author)], position);
-    assert!(counted.2.is_empty());
     inner.config.keys = keys;
     assert_eq!(
         inner
-            .scan_positions_for_test(f.public.domain, &scopes, &held, &logged)
+            .scan_positions_for_test(f.public.domain, &scopes, &held)
             .await
             .unwrap(),
         first
     );
     let not_ready = inner
-        .scan_positions_for_test(f.public.domain, &[], &held, &logged)
+        .scan_positions_for_test(f.public.domain, &[], &held)
         .await
         .unwrap();
     assert_eq!(not_ready.0, counted.0);
@@ -427,7 +412,7 @@ async fn warm_syntax_keeps_pending_key_ready_and_status_predicates_live() {
         .unwrap();
     assert_eq!(
         inner
-            .scan_positions_for_test(f.public.domain, &scopes, &held, &logged)
+            .scan_positions_for_test(f.public.domain, &scopes, &held)
             .await
             .unwrap(),
         counted
@@ -444,7 +429,7 @@ async fn warm_syntax_keeps_pending_key_ready_and_status_predicates_live() {
         .unwrap();
     assert_eq!(
         inner
-            .scan_positions_for_test(f.public.domain, &scopes, &held, &logged)
+            .scan_positions_for_test(f.public.domain, &scopes, &held)
             .await
             .unwrap(),
         first
@@ -452,15 +437,9 @@ async fn warm_syntax_keeps_pending_key_ready_and_status_predicates_live() {
     assert_eq!(inner.stored_header_memo_stats(), warmed);
     drop(inner);
     target.receive(frames[1].clone()).await.unwrap();
-    let applied = scan(
-        &target,
-        f.public.domain,
-        &[f.public],
-        &[f.public],
-        &[f.public],
-    )
-    .await
-    .unwrap();
+    let applied = scan(&target, f.public.domain, &[f.public], &[f.public])
+        .await
+        .unwrap();
     assert_eq!(applied.0[&author].len(), 2);
     assert_eq!(target.snapshot(f.public).await.unwrap().rows.len(), 40);
     target.audit(f.public).await.unwrap();
@@ -475,7 +454,7 @@ async fn warm_void_and_placement_headers_keep_distinct_coverage_powers() {
     let sequence = header.extensions.author_sequence;
     let hash = frames[0].id().unwrap();
     assert!(
-        scan(&target, f.public.domain, &[f.public], &[f.public], &[])
+        scan(&target, f.public.domain, &[f.public], &[f.public])
             .await
             .unwrap()
             .0
@@ -494,18 +473,11 @@ async fn warm_void_and_placement_headers_keep_distinct_coverage_powers() {
         .await
         .unwrap();
     drop(inner);
-    let void = scan(
-        &target,
-        f.public.domain,
-        &[f.public],
-        &[f.public],
-        &[f.public],
-    )
-    .await
-    .unwrap();
+    let void = scan(&target, f.public.domain, &[f.public], &[f.public])
+        .await
+        .unwrap();
     assert_eq!(void.0[&author], BTreeSet::from([sequence]));
     assert_eq!(void.1[&(f.public, author)], sequence);
-    assert!(void.2.is_empty());
     let inner = target.inner.lock(crate::replica::Class::Background).await;
     inner
         .conn
@@ -528,24 +500,17 @@ async fn warm_void_and_placement_headers_keep_distinct_coverage_powers() {
         .await
         .unwrap();
     drop(inner);
-    let placed = scan(&target, f.public.domain, &[f.public], &[], &[f.public])
+    let placed = scan(&target, f.public.domain, &[f.public], &[])
         .await
         .unwrap();
     assert_eq!(placed.0, void.0);
     assert!(placed.1.is_empty());
-    assert!(placed.2.is_empty());
     assert!(
-        scan(
-            &target,
-            f.public.domain,
-            &[f.public],
-            &[f.public],
-            &[f.public]
-        )
-        .await
-        .unwrap()
-        .0
-        .is_empty()
+        scan(&target, f.public.domain, &[f.public], &[f.public])
+            .await
+            .unwrap()
+            .0
+            .is_empty()
     );
     let inner = target.inner.lock(crate::replica::Class::Background).await;
     inner
@@ -566,10 +531,10 @@ async fn warm_void_and_placement_headers_keep_distinct_coverage_powers() {
 #[tokio::test]
 async fn fresh_rows_rollback_and_bounded_fallback_never_reuse_position_results() {
     let (f, _dir, target, frames) = pending().await;
-    let first = scan(&target, f.public.domain, &[], &[], &[]).await.unwrap();
+    let first = scan(&target, f.public.domain, &[], &[]).await.unwrap();
     assert_eq!(first.0.values().map(BTreeSet::len).sum::<usize>(), 1);
     target.receive(frames[1].clone()).await.unwrap();
-    let both = scan(&target, f.public.domain, &[], &[], &[]).await.unwrap();
+    let both = scan(&target, f.public.domain, &[], &[]).await.unwrap();
     assert_eq!(both.0.values().map(BTreeSet::len).sum::<usize>(), 2);
     let mut inner = target.inner.lock(crate::replica::Class::Background).await;
     inner
@@ -587,7 +552,7 @@ async fn fresh_rows_rollback_and_bounded_fallback_never_reuse_position_results()
         .unwrap();
     assert_eq!(
         inner
-            .scan_positions_for_test(f.public.domain, &[], &BTreeSet::new(), &BTreeSet::new())
+            .scan_positions_for_test(f.public.domain, &[], &BTreeSet::new())
             .await
             .unwrap()
             .0
@@ -625,8 +590,7 @@ async fn fresh_rows_rollback_and_bounded_fallback_never_reuse_position_results()
                 .scan_positions_for_test(
                     f.public.domain,
                     &[(f.public, None)],
-                    &BTreeSet::from([f.public]),
-                    &BTreeSet::new()
+                    &BTreeSet::from([f.public])
                 )
                 .await?
                 .0
@@ -650,12 +614,7 @@ async fn fresh_rows_rollback_and_bounded_fallback_never_reuse_position_results()
         for _ in 0..2 {
             assert_eq!(
                 inner
-                    .scan_positions_for_test(
-                        f.public.domain,
-                        &[],
-                        &BTreeSet::new(),
-                        &BTreeSet::new()
-                    )
+                    .scan_positions_for_test(f.public.domain, &[], &BTreeSet::new())
                     .await
                     .unwrap(),
                 both
@@ -673,7 +632,7 @@ async fn fresh_rows_rollback_and_bounded_fallback_never_reuse_position_results()
 async fn shared_parsing_keeps_frontier_hash_author_and_live_status_checks() {
     let (f, _dir, target, frames) = pending().await;
     let original = frames[0].header_bytes();
-    scan(&target, f.public.domain, &[f.public], &[], &[])
+    scan(&target, f.public.domain, &[f.public], &[])
         .await
         .unwrap();
     let inner = target.inner.lock(crate::replica::Class::Background).await;
@@ -709,7 +668,7 @@ async fn shared_parsing_keeps_frontier_hash_author_and_live_status_checks() {
         .unwrap();
     assert!(
         inner
-            .scan_positions_for_test(f.public.domain, &[], &BTreeSet::new(), &BTreeSet::new())
+            .scan_positions_for_test(f.public.domain, &[], &BTreeSet::new())
             .await
             .unwrap()
             .0
@@ -746,12 +705,7 @@ async fn shared_parsing_keeps_frontier_hash_author_and_live_status_checks() {
     );
     assert_eq!(
         inner
-            .scan_positions_for_test(
-                f.public.domain,
-                &[(f.public, None)],
-                &BTreeSet::new(),
-                &BTreeSet::new()
-            )
+            .scan_positions_for_test(f.public.domain, &[(f.public, None)], &BTreeSet::new())
             .await
             .unwrap()
             .0

@@ -3,16 +3,15 @@ package rocky
 import kotlinx.serialization.json.*
 
 enum class TableClass(internal val wire: String) {
-    Mergeable("mergeable"),
-
     /**
-     * Replicates each transaction's statements; replicas replay them in canonical order and drop a transaction
-     * whose replay fails. [RockyDatabase.transactionOutcome] reports how a committed transaction stands.
+     * The default: replicates each transaction's statements; replicas replay them in canonical order and drop a
+     * transaction whose replay fails. See [SqlWrite] and [RockyDatabase.transactionOutcome].
      */
     Replayed("replayed"),
+
+    /** Never leaves this device. */
     LocalOnly("local_only"),
 }
-enum class UpdatePolicy(internal val wire: String) { Changed("changed"), Assigned("assigned") }
 enum class Collation(internal val wire: String) { Binary("binary"), Nocase("nocase"), Rtrim("rtrim") }
 data class IndexColumn(val name: String, val descending: Boolean = false) {
     init {
@@ -20,28 +19,18 @@ data class IndexColumn(val name: String, val descending: Boolean = false) {
     }
 }
 
-/** What a remote write that collides on a unique index does to the row with the earlier stamp. */
-enum class Conflict(internal val wire: String) {
-    /** Its indexed columns read NULL while the clash lasts; they must be nullable. */
-    SetNull("set_null"),
-
-    /** The whole row is hidden. */
-    LatestWins("latest_wins"),
-}
-
-/** What a child shows while its parent is not alive. */
+/** What deleting a parent does to its children, in the same transaction. */
 enum class Delete(internal val wire: String) {
-    /** The child is hidden. */
+    /** The children are deleted. */
     Cascade("cascade"),
 
-    /** The reference reads NULL; the column must be nullable and outside the key. */
+    /** The reference becomes NULL; the column must be nullable and outside the key. */
     SetNull("set_null"),
 }
 data class Index(
     val name: String,
     val columns: List<IndexColumn>,
     val unique: Boolean = false,
-    val onConflict: Conflict? = null,
     /** Replayed tables only: terms indexed after [columns], such as `lower(name)`. */
     val expressions: List<String> = emptyList(),
     /** Replayed tables only: indexes just the rows this expression holds for. */
@@ -49,7 +38,6 @@ data class Index(
 ) {
     init {
         require(name.matches(IDENTIFIER) && (columns.isNotEmpty() || expressions.isNotEmpty())) { "invalid index $name" }
-        require(onConflict == null || unique) { "$name: onConflict needs a unique index" }
     }
     internal fun json(): JsonObject = buildJsonObject {
         put("name", name)
@@ -65,14 +53,13 @@ data class Index(
                 },
             ),
         )
-        onConflict?.let { put("on_conflict", it.wire) }
         if (expressions.isNotEmpty()) put("expressions", JsonArray(expressions.map(::JsonPrimitive)))
         where?.let { put("where", it) }
     }
 }
 
 /**
- * A reference to the identity of a parent table of the same class, mergeable or replayed: its partition columns, then `id`. [columns] holds one
+ * A reference to the identity of a replayed parent table: its partition columns, then `id`. [columns] holds one
  * child column per identity column; [references], when given (as Room declares them), must name that identity.
  */
 data class ForeignKey(
@@ -128,7 +115,6 @@ class SchemaBuilder internal constructor(private val application: String, privat
         require(name !in views) { "duplicate view $name" }
         views[name] = select
     }
-    var updatePolicy: UpdatePolicy = UpdatePolicy.Changed
     private val migrations = mutableListOf<Migration>()
 
     /** Steps computing values schema [version] needs in existing rows; see [Migration]. */
@@ -152,7 +138,7 @@ class SchemaBuilder internal constructor(private val application: String, privat
             }
         }
     }
-    internal fun build(): Schema = Schema(application, version, tables.values.map { it.build() }, updatePolicy, views, migrations.toList(), assertions.values.toList())
+    internal fun build(): Schema = Schema(application, version, tables.values.map { it.build() }, views, migrations.toList(), assertions.values.toList())
 }
 
 class TableBuilder internal constructor(val name: String) {
@@ -163,13 +149,7 @@ class TableBuilder internal constructor(val name: String) {
     private val indexes = linkedMapOf<String, Index>()
     private val foreignKeys = mutableListOf<ForeignKey>()
     private val checks = mutableListOf<String>()
-    var tableClass: TableClass = TableClass.Mergeable
-
-    /**
-     * Every device of the domain may read this table's row creations and deletions (never values),
-     * so a table in another reader scope may reference it. The key must be `id`; see secure SQL.
-     */
-    var existenceLog: Boolean = false
+    var tableClass: TableClass = TableClass.Replayed
 
     /**
      * Grants naming [table] also cover this table, for devices enrolled before it existed. Declare it only when
@@ -178,7 +158,7 @@ class TableBuilder internal constructor(val name: String) {
     var grantedLike: String? = null
     internal var roomIdentityIndex: List<String>? = null
     fun column(column: Column) {
-        require(column.name !in setOf("id", "row_kind")) { "id and row_kind are implicit identity columns" }
+        require(column.name != "id") { "id is the implicit identity column" }
         require(column.name !in columns) { "$name: duplicate column ${column.name}" }
         columns[column.name] = column
     }
@@ -208,14 +188,8 @@ class TableBuilder internal constructor(val name: String) {
         indexes[index.name] = index
     }
 
-    /** A unique index of real rows; Room's default name unless [name] is given. A replayed table takes no [onConflict]. */
-    fun unique(vararg columns: String, onConflict: Conflict? = null, name: String = "index_${this.name}_${columns.joinToString("_")}") = index(Index(name, columns.map { IndexColumn(it) }, unique = true, onConflict = onConflict))
-
-    /** Adds Rocky's conflict policy to a unique index, such as one Room's export declared. */
-    fun onConflict(index: String, policy: Conflict) {
-        val old = indexes[index] ?: error("${this.name}: unknown index $index")
-        indexes[index] = old.copy(onConflict = policy)
-    }
+    /** A unique index of real rows; Room's default name unless [name] is given. */
+    fun unique(vararg columns: String, name: String = "index_${this.name}_${columns.joinToString("_")}") = index(Index(name, columns.map { IndexColumn(it) }, unique = true))
 
     /**
      * A `CHECK` of a replayed table, using deterministic functions only; a replayed transaction that fails it drops.
@@ -255,25 +229,10 @@ class TableBuilder internal constructor(val name: String) {
     internal fun build(policies: Boolean = true): Table {
         require(key.isNotEmpty() && key.distinct().size == key.size) { "$name: declare a non-empty primary key" }
         require(key.all { it == "id" || columns[it]?.nullable == false }) { "$name: key columns must exist and be non-null" }
-        require(indexes.values.all { (it.columns.isNotEmpty() || it.expressions.isNotEmpty()) && it.columns.all { term -> term.name in columns || term.name in setOf("id", "row_kind") } }) { "$name: index names an absent column" }
-        if (policies && tableClass == TableClass.Mergeable) {
-            indexes.values.firstOrNull { it.unique && it.onConflict == null }?.let {
-                error("$name: unique index ${it.name} needs onConflict (Conflict.SetNull or Conflict.LatestWins)")
-            }
-        }
+        require(indexes.values.all { (it.columns.isNotEmpty() || it.expressions.isNotEmpty()) && it.columns.all { term -> term.name in columns || term.name == "id" } }) { "$name: index names an absent column" }
         if (policies) {
-            for (index in indexes.values.filter { it.unique && it.onConflict != null }) {
-                require(tableClass == TableClass.Mergeable && index.columns.all { it.name in columns }) { "$name: conflict policy needs mergeable application columns" }
-                if (index.onConflict == Conflict.SetNull) require(index.columns.all { columns[it.name]?.nullable == true && it.name !in key }) { "$name: SetNull index columns must be nullable and outside the key" }
-                // Rows clash only within one partition; uniqueness across partitions needs a coordinated write.
-                if (partitions.isNotEmpty()) {
-                    require(index.onConflict == Conflict.LatestWins) { "$name: unique index ${index.name} on a partitioned table takes Conflict.LatestWins; Conflict.SetNull is refused" }
-                    require(partitions.all { column -> index.columns.any { it.name == column } }) { "$name: unique index ${index.name} must include every partition column (${partitions.joinToString()}); uniqueness across partitions is refused" }
-                }
-            }
             for (reference in foreignKeys) {
-                require(tableClass != TableClass.LocalOnly) { "$name: a reference needs a mergeable or replayed table" }
-                require(!reference.deferred || tableClass == TableClass.Replayed) { "$name: a deferred reference needs a replayed table" }
+                require(tableClass == TableClass.Replayed) { "$name: a reference needs a replayed table" }
                 for (column in reference.columns) {
                     require(column in partitions || columns[column]?.kind == "integer") { "$name.$column: a reference holds an integer id unless the column is a partition column" }
                 }
@@ -288,10 +247,8 @@ class TableBuilder internal constructor(val name: String) {
         require(tableClass == TableClass.Replayed || indexes.values.all { it.expressions.isEmpty() && it.where == null }) { "$name: index expressions and predicates need a replayed table" }
         require(foreignKeys.all { key -> key.columns.all { it in columns } }) { "$name: a foreign key names an absent column" }
         require(partitions.all { it in key && (it == "id" || columns[it]?.let { column -> !column.nullable && !column.localOnly && column.derived == null } == true) }) { "$name: partition columns must be non-null primary-key columns" }
-        // Puppets copy only the id of a referenced row.
-        require(!existenceLog || (tableClass == TableClass.Mergeable && partitions.isEmpty() && key == listOf("id"))) { "$name: an existence log needs an unpartitioned mergeable table keyed by id" }
         val identity = partitions + listOf("id").filterNot { it in partitions }
         require(roomIdentityIndex == null || roomIdentityIndex == identity) { "$name: Room identity index must contain partition columns followed by id" }
-        return Table(name, columns.values.toList(), key, indexes.values.toList(), tableClass, foreignKeys.toList(), partitions, existenceLog = existenceLog, partitionGroup = partitionGroup, grantedLike = grantedLike, checks = checks.toList())
+        return Table(name, columns.values.toList(), key, indexes.values.toList(), tableClass, foreignKeys.toList(), partitions, partitionGroup = partitionGroup, grantedLike = grantedLike, checks = checks.toList())
     }
 }

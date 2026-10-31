@@ -2,11 +2,11 @@ mod admission;
 pub(crate) mod lock;
 mod maintenance;
 mod wal;
+#[cfg(any(test, feature = "qualification"))]
+pub use lock::LockMeasurements;
 pub(crate) use lock::{Class, Guard, ReplicaLock};
 #[cfg(feature = "qualification")]
-pub use lock::{HolderMeasurements, with_measurement_connection};
-#[cfg(any(test, feature = "qualification"))]
-pub use lock::{LockMeasurements, Measurements};
+pub use lock::{HolderMeasurements, Measurements, with_measurement_connection};
 mod apply;
 mod author;
 mod backup;
@@ -19,14 +19,12 @@ pub(crate) mod checkpoint;
 mod compaction;
 mod crypto;
 pub use compaction::{CompactReport, CompactionStatus, FrameReplay, SealRebootstrap};
-mod constraints;
 mod coordinated;
 #[cfg(any(test, feature = "qualification"))]
 mod crash;
 #[cfg(any(test, feature = "qualification"))]
 pub use crash::CrashPoint;
 mod evict;
-mod existence;
 mod frontiers;
 mod generation;
 mod schemas;
@@ -42,11 +40,9 @@ pub(crate) mod headers;
 mod held;
 mod history;
 pub use history::{HeldSeal, KeptSeals, SealViews};
+mod author_sets;
 mod holdings;
 mod identity;
-#[cfg(test)]
-pub(crate) use identity::Raise;
-mod author_sets;
 mod incoming;
 mod intents;
 mod keys;
@@ -98,19 +94,11 @@ pub use checkpoint::{
     CoveredMark, CustodySummary, LogPosition, MAX_CHECKPOINT_LOGS, PruneBlock, PruneReport,
     PrunedPage, RebootstrapReport, RetentionLimits, RetentionPolicy, SetSummary, SignedCheckpoint,
 };
-pub use coordinated::{
-    CommittedEntry, CoordinatedCommit, CoordinatedEntry, CoordinatedError, CoordinatedStatus,
-    ENTRY_DEADLINE, EntryPeers, MAX_CATCH_UP_ENTRIES, PeerFuture, Refusal, Slot, StagedCloseStatus,
-    entry_hash,
-};
+pub use coordinated::{Refusal, StagedCloseStatus};
 pub use evict::EvictReport;
-pub use existence::{
-    EXISTENCE_FORMAT, ExistenceBaseAttachment, ExistenceBasePage, ExistenceBasis, ExistenceEvent,
-    ExistencePage, ExistenceRecord, MAX_EXISTENCE_PAGE,
-};
 pub use generation::GenerationStatus;
 pub use held::{CurrentValue, HeldChange, HeldField, HeldKind, HeldRow, SignedVoid};
-pub use migrate::{PLAN_ROWS, ProjectionPlan};
+pub use migrate::ProjectionPlan;
 pub use offload::RemotePage;
 use p2panda_core::validate_backlink;
 use p2panda_store::operations::LocalOperationStore;
@@ -135,7 +123,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 
 /// Keys are supplied from external secret storage and are never persisted in protocol tables.
 /// A scope may hold several generations: the highest seals new writes, the
@@ -185,9 +173,6 @@ pub enum ReceiveStatus {
     Rejected,
     /// At or before this replica's pruned_prefix: already part of its checkpoint.
     Pruned,
-    /// The owner's recovery abandoned its coordinated write: held for its
-    /// author, never applied; its author log continues.
-    Abandoned,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Companion {
@@ -379,8 +364,7 @@ pub(super) struct Inner<A> {
     /// The recovery context after the last call that committed or changed
     /// keys, grants, schemas or the tip graph; see `quarantine_context`.
     recovery_events: watch::Sender<i64>,
-    /// Set while a SQL session commits: a projection must find its rows.
-    strict_projection: bool,
+    /// Set while a tip switch rebuilds a scope's rows.
     rebuilding_tip: bool,
     /// Supplied exclusions wait until the stored projection and L verify,
     /// then reconcile atomically through learn_revocations before open returns.
@@ -392,8 +376,6 @@ pub(super) struct Inner<A> {
     /// transaction of any size, so the retained-history bound cannot hold
     /// it back; later writes wait until it is delivered and pruned.
     publishing: bool,
-    /// Constrained rows a change may affect, until the frame or commit settles.
-    settling: std::sync::Mutex<constraints::Seeds>,
     /// This device's grants as last resolved, for the authority, partition
     /// count and second they were resolved at: resolving the chain against
     /// every registered partition otherwise repeats for each frame and scope.
@@ -496,7 +478,7 @@ pub(super) struct Inner<A> {
     #[cfg(test)]
     schema_stage_pause: Option<staging::StagePause>,
     #[cfg(test)]
-    plan_fault: Option<(migrate::PlanStage, usize)>,
+    plan_fault: bool,
     /// The stage fault exits the process instead of returning an error.
     #[cfg(test)]
     stage_exit: bool,
@@ -694,8 +676,9 @@ pub struct EncryptedReplica<A> {
     pub(super) inner: Arc<ReplicaLock<Inner<A>>>,
     queue: Arc<group::Queue>,
     revisions: watch::Receiver<u64>,
-    /// The coordinated log this trusted node acknowledges stored entries to.
-    domain_log: Arc<coordinated::Trusted>,
+    /// The coordinated log whose terminal entries this trusted node ends
+    /// and acknowledges.
+    domain_log: Arc<std::sync::RwLock<Option<Arc<dyn rocky_core::DomainLog>>>>,
 }
 impl<A> Clone for EncryptedReplica<A> {
     fn clone(&self) -> Self {
@@ -712,26 +695,19 @@ impl<A> EncryptedReplica<A> {
     pub fn lock_measurements(&self) -> LockMeasurements {
         self.inner.measurements()
     }
-    /// Makes this replica a trusted node of a coordinated log: peers may
-    /// store entries on it, which it acknowledges through `log`.
+    /// Makes this replica a trusted node of a coordinated log: it ends
+    /// tips' logs with their seals and acknowledges their terminal entries.
     pub fn set_domain_log(&self, log: Option<Arc<dyn rocky_core::DomainLog>>) {
         *self
             .domain_log
-            .log
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = log;
     }
     pub fn domain_log(&self) -> Option<Arc<dyn rocky_core::DomainLog>> {
         self.domain_log
-            .log
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-    }
-    /// Changes whenever this replica stores another proposer's entry, which
-    /// then waits for `resolve_coordinated`.
-    pub fn observe_entries(&self) -> watch::Receiver<u64> {
-        self.domain_log.stored.subscribe()
     }
 }
 fn protocol_schema() -> impl Iterator<Item = String> {
@@ -747,12 +723,11 @@ fn protocol_schema() -> impl Iterator<Item = String> {
         held::SCHEMA,
         placements::SCHEMA,
         history::SCHEMA,
-        coordinated::SCHEMA,
-        coordinated::abandoned::SCHEMA,
         coordinated::statements::SCHEMA,
         coordinated::relay::SCHEMA,
         bundle::SCHEMA,
         replay::SCHEMA,
+        replay::BASE_SCHEMA,
         replay::outcomes::SCHEMA,
         typed::SCHEMA,
         identity::SCHEMA,
@@ -770,8 +745,6 @@ fn protocol_schema() -> impl Iterator<Item = String> {
         compaction::SCHEMA,
         roles::SCHEMA,
         keys::SCHEMA,
-        existence::SCHEMA,
-        constraints::SCHEMA,
         chains::SCHEMA,
         publication::SCHEMA,
         publication::INTENT_SCHEMA,
@@ -1043,12 +1016,10 @@ impl<A: RowApplication> EncryptedReplica<A> {
             authority: 1,
             authority_events: watch::channel(1).0,
             recovery_events: watch::channel(0).0,
-            strict_projection: false,
             rebuilding_tip: false,
             opening_revocations: None,
             tip_base: false,
             publishing: false,
-            settling: Default::default(),
             local: Default::default(),
             local_selectors: Default::default(),
             deferred_maintenance: BTreeSet::new(),
@@ -1103,7 +1074,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
             #[cfg(test)]
             schema_stage_pause: None,
             #[cfg(test)]
-            plan_fault: None,
+            plan_fault: false,
             #[cfg(test)]
             stage_exit: false,
             #[cfg(test)]
@@ -1671,24 +1642,16 @@ impl<A: RowApplication> EncryptedReplica<A> {
     /// Whether a mutation handle committed, whatever its writes were. A
     /// caller that lost a commit's answer checks this before planning the
     /// writes again. Handles are retained as `RetentionLimits` describes.
-    /// A handle whose write the owner's recovery abandoned reports that.
     pub async fn handle_committed(&self, handle: Commitment) -> Result<bool, Error> {
         let inner = self.inner.lock(crate::replica::Class::Background).await;
         let mut result = inner
             .conn
             .query(
-                "SELECT hash FROM secure_handles WHERE handle=?",
+                "SELECT 1 FROM secure_handles WHERE handle=?",
                 [handle.to_vec()],
             )
             .await?;
-        let Some(row) = result.next().await? else {
-            return Ok(false);
-        };
-        let hash = Hash::try_from(row.get::<Vec<u8>>(0)?.as_slice())
-            .map_err(|_| denied("invalid handle hash"))?;
-        drop(result);
-        inner.refuse_abandoned(hash).await?;
-        Ok(true)
+        Ok(result.next().await?.is_some())
     }
     /// Flushes first: the status may be acknowledged to the sender.
     pub async fn receipt_status(&self, id: Hash) -> Result<ReceiveStatus, Error> {
@@ -2069,12 +2032,35 @@ impl<A: RowApplication> Inner<A> {
         // every frame, against the current revocations.
         self.verify_header_authority(&operation.header, frame.chain()?.credentials(), time)
     }
+    /// The write authority a frame was admitted with: its chain at its own
+    /// time, unaffected by later revocations and expiry.
+    pub(super) fn historical_frame_authority(
+        &self,
+        frame: &EncryptedFrame,
+    ) -> Result<Vec<rocky_core::ResourceGrant>, Error> {
+        let header = &frame.operation_ref()?.header;
+        self.header_authority(
+            header,
+            frame.chain()?.credentials(),
+            &RevocationSet::new(),
+            header.timestamp / 1_000_000,
+        )
+    }
     /// A signed row header's write authority under `credentials`, the chain
     /// its digest names, against the current revocations.
     pub(super) fn verify_header_authority(
         &self,
         header: &p2panda_core::Header<Extensions>,
         credentials: &CredentialChain,
+        time: u64,
+    ) -> Result<Vec<rocky_core::ResourceGrant>, Error> {
+        self.header_authority(header, credentials, &self.config.revocations, time)
+    }
+    fn header_authority(
+        &self,
+        header: &p2panda_core::Header<Extensions>,
+        credentials: &CredentialChain,
+        revocations: &RevocationSet,
         time: u64,
     ) -> Result<Vec<rocky_core::ResourceGrant>, Error> {
         let extension = &header.extensions;
@@ -2095,7 +2081,7 @@ impl<A: RowApplication> Inner<A> {
         let number = extension
             .author
             .ok_or_else(|| denied("node author number missing"))?;
-        let verified = self.verified_chain(credentials, &self.config.revocations, time)?;
+        let verified = self.verified_chain(credentials, revocations, time)?;
         let grants = match &extension.partition {
             Some(tuple) => {
                 verified.partition_author(header.public_key, number, extension.scope, tuple, time)
@@ -2161,7 +2147,6 @@ impl<A: RowApplication> Inner<A> {
         match row.get::<String>(0)?.as_str() {
             "applied" => Ok(ReceiveStatus::Applied),
             "held" => Ok(ReceiveStatus::Held),
-            "abandoned" => Ok(ReceiveStatus::Abandoned),
             "rejected" => Ok(ReceiveStatus::Rejected),
             "pending" => {
                 let header: p2panda_core::Header<Extensions> = decode(&row.get::<Vec<u8>>(1)?)?;
@@ -2198,7 +2183,6 @@ impl<A: RowApplication> Inner<A> {
         let hash = Hash::try_from(row.get::<Vec<u8>>(1)?.as_slice())
             .map_err(|_| denied("invalid handle hash"))?;
         drop(result);
-        self.refuse_abandoned(hash).await?;
         if stored != input {
             return Err(Error::Conflict);
         }

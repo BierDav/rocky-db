@@ -122,7 +122,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 "SELECT 1 FROM secure_held_frames WHERE hash=?",
                 "SELECT 1 FROM secure_voids WHERE hash=?",
                 "SELECT 1 FROM secure_unoffered WHERE hash=?",
-                "SELECT 1 FROM secure_staged WHERE hash=?",
                 "SELECT 1 FROM secure_stubs WHERE hash=?",
                 "SELECT 1 FROM secure_checkpoint_stubs WHERE hash=?",
             ] {

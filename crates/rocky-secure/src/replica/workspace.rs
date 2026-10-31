@@ -11,9 +11,6 @@ pub(crate) struct Workspace {
     pub(crate) tip: TipId,
     /// Installed typed tables that stored rows project into.
     pub(super) typed: Option<Arc<typed::Typed>>,
-    /// The shadow tables of a pending projection plan, which rows also
-    /// project into.
-    pub(super) shadow: Option<Arc<typed::Typed>>,
     /// Cursors, table events and the authority mirror of the live tables.
     pub(crate) queries: queries::Queries,
     /// Bulk rebuilds of the live tables in progress.
@@ -25,7 +22,6 @@ impl Workspace {
             followed: None,
             tip,
             typed: None,
-            shadow: None,
             queries: Default::default(),
             bulk: Default::default(),
         }

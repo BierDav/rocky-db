@@ -3,7 +3,7 @@ use rocky_sdk::{Affinity, Column, Configuration, Failure, Schema, Table, params}
 fn schema() -> Result<Schema, Failure> {
     Schema::builder("rust_application", 1)
         .table(
-            Table::mergeable("notes")
+            Table::replayed("notes")
                 .column(Column::new("body", Affinity::Text).required())
                 .column(Column::new("optional", Affinity::Text)),
         )
@@ -105,19 +105,22 @@ async fn dropped_and_cancelled_transactions_release_the_writer() -> Result<(), F
 async fn paged_reads_hold_a_snapshot_and_decode_aliases() -> Result<(), Failure> {
     let directory = tempfile::tempdir()?;
     let schema = Schema::builder("paging", 1)
-        .table(Table::mergeable("cache").column(Column::new("n", Affinity::Integer).required()))
+        .table(Table::replayed("cache").column(Column::new("n", Affinity::Integer).required()))
         .build()?;
     let db = Configuration::new(directory.path(), &schema)?
         .create()
         .await?
         .database;
-    let mut tx = db.transaction().await?;
-    for n in 1..=300_i64 {
-        let id = tx.next_id("cache", params![]).await?;
-        tx.execute("INSERT INTO cache(id,n) VALUES(?,?)", params![id, n])
-            .await?;
+    // Two transactions, each under the intent statement quota.
+    for batch in [1..=150_i64, 151..=300] {
+        let mut tx = db.transaction().await?;
+        for n in batch {
+            let id = tx.next_id("cache", params![]).await?;
+            tx.execute("INSERT INTO cache(id,n) VALUES(?,?)", params![id, n])
+                .await?;
+        }
+        tx.commit().await?;
     }
-    tx.commit().await?;
     let mut snapshot = db
         .query("SELECT n FROM cache ORDER BY n", params![])
         .await?;
@@ -154,7 +157,7 @@ async fn paged_reads_hold_a_snapshot_and_decode_aliases() -> Result<(), Failure>
 fn invalid_schema_is_refused_before_installation() {
     assert!(
         Schema::builder("bad", 0)
-            .table(Table::mergeable("notes").column(Column::new("body", Affinity::Text)))
+            .table(Table::replayed("notes").column(Column::new("body", Affinity::Text)))
             .build()
             .is_err()
     );

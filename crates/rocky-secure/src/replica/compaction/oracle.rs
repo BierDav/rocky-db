@@ -97,7 +97,6 @@ impl<A: RowApplication> Inner<A> {
         for table in [
             "secure_applied",
             "secure_scope_shapes",
-            "secure_support",
             "secure_row_positions",
             "secure_birth_positions",
             "secure_identity_marks",
@@ -169,9 +168,8 @@ impl<A: RowApplication> Inner<A> {
                 .map(|(row, record)| Ok((row, record.as_ref().map(encode).transpose()?)))
                 .collect::<Result<Vec<_>, Error>>()
         };
-        let full_drops = canonical_drops(self.seal_drops(scope, self.workspace.tip, false).await?)?;
-        let indexed_drops =
-            canonical_drops(self.seal_drops(scope, self.workspace.tip, true).await?)?;
+        let full_drops = canonical_drops(self.seal_drops(scope, false).await?)?;
+        let indexed_drops = canonical_drops(self.seal_drops(scope, true).await?)?;
         if full_drops != indexed_drops {
             return Err(Error::Corrupt(
                 "seal drop index differs from full scan".into(),
@@ -183,7 +181,11 @@ impl<A: RowApplication> Inner<A> {
         let actual = async {
             // verify_tail already compared the canonical full replay, including
             // staged schema transforms, with these authoritative stored rows.
-            self.reproject(scope).await?;
+            if self.replayed_scope(scope) {
+                self.replay_from_frames(now()?).await?;
+            } else {
+                self.reproject(scope).await?;
+            }
             self.finalization_snapshot().await
         }
         .await;
@@ -217,33 +219,22 @@ impl<A: RowApplication> EncryptedReplica<A> {
 }
 
 impl<A> Inner<A> {
-    fn take_oracle_state(&self) -> (queries::Touched, constraints::Seeds) {
-        let touched = std::mem::take(
+    pub(in crate::replica) fn take_oracle_state(&self) -> queries::Touched {
+        std::mem::take(
             &mut *self
                 .workspace
                 .queries
                 .touched
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        let seeds = std::mem::take(
-            &mut *self
-                .settling
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        (touched, seeds)
+        )
     }
-    fn restore_oracle_state(&self, (touched, seeds): (queries::Touched, constraints::Seeds)) {
+    pub(in crate::replica) fn restore_oracle_state(&self, touched: queries::Touched) {
         *self
             .workspace
             .queries
             .touched
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = touched;
-        *self
-            .settling
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = seeds;
     }
 }

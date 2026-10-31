@@ -24,7 +24,6 @@ struct Entry {
     changed: watch::Sender<Option<Vec<ResourceScope>>>,
     frontiers: BTreeMap<ResourceScope, [u8; 32]>,
     cursors: BTreeMap<ResourceScope, rocky_secure::ScopeFrontier>,
-    auxiliary: BTreeMap<ResourceScope, [u8; 32]>,
 }
 pub(super) struct Registry {
     pub(super) publishing: Mutex<()>,
@@ -547,10 +546,8 @@ impl Node {
         let changed = watch::channel(None).0;
         let mut frontiers = BTreeMap::new();
         let mut cursors = BTreeMap::new();
-        let mut auxiliary = BTreeMap::new();
         for scope in &opened.held {
             cursors.insert(*scope, self.replica.frontier(*scope).await?);
-            auxiliary.insert(*scope, self.link_auxiliary(*scope).await?);
             let token = match opened.local_states.get(scope) {
                 Some(token) => *token,
                 None => self.link_scope_state(*scope).await?,
@@ -604,7 +601,6 @@ impl Node {
                         changed: changed.clone(),
                         frontiers,
                         cursors,
-                        auxiliary,
                     },
                 ) {
                     old.close.send_replace(Some(CloseReason::Duplicate));
@@ -742,15 +738,13 @@ impl Node {
                     entry.handle.clone(),
                     entry.frontiers.clone(),
                     entry.cursors.clone(),
-                    entry.auxiliary.clone(),
                 )
             })
             .collect();
         let attempts = stream::iter(holdings)
-            .map(|(peer, id, handle, old, cursors, auxiliary)| async move {
+            .map(|(peer, id, handle, old, cursors)| async move {
                 let mut frontiers = old.clone();
                 let mut next = cursors.clone();
-                let mut aux = auxiliary.clone();
                 let mut scopes = BTreeSet::new();
                 for (scope, cursor) in &cursors {
                     let token = self.link_scope_state(*scope).await?;
@@ -759,16 +753,14 @@ impl Node {
                     }
                     // Capture the cursor before export; a later commit must remain pending.
                     let frontier = self.replica.frontier(*scope).await?;
-                    let metadata = self.link_auxiliary(*scope).await?;
                     let rows_changed = frontier != *cursor;
                     let pushed =
                         rows_changed && handle.push_committed(&self.replica, cursor).await?;
-                    if !pushed || auxiliary.get(scope) != Some(&metadata) {
+                    if !pushed {
                         scopes.insert(*scope);
                     }
                     frontiers.insert(*scope, token);
                     next.insert(*scope, frontier);
-                    aux.insert(*scope, metadata);
                 }
                 self.replica.flush().await?;
                 let mut entries = service
@@ -784,7 +776,6 @@ impl Node {
                 };
                 entry.frontiers = frontiers;
                 entry.cursors = next;
-                entry.auxiliary = aux;
                 if !scopes.is_empty() {
                     if let Some(pending) = entry.changed.borrow().as_ref() {
                         scopes.extend(pending);
@@ -823,7 +814,6 @@ impl Node {
     ) -> Result<(), Failure> {
         let frontier = self.replica.frontier(scope).await?;
         let token = self.link_scope_state(scope).await?;
-        let metadata = self.link_auxiliary(scope).await?;
         let mut entries = service
             .live
             .entries
@@ -849,23 +839,10 @@ impl Node {
             }
         }
         cursor.logs.sort_by_key(|log| log.author);
-        if *cursor == frontier && entry.auxiliary.get(&scope) == Some(&metadata) {
+        if *cursor == frontier {
             entry.frontiers.insert(scope, token);
         }
         Ok(())
-    }
-    async fn link_auxiliary(&self, scope: ResourceScope) -> Result<[u8; 32], Failure> {
-        Ok(commitment(
-            "rocky.link-auxiliary.v1",
-            &rocky_credentials::encode(
-                &self
-                    .replica
-                    .installed_existence_base(scope)
-                    .await?
-                    .map(|base| base.id())
-                    .transpose()?,
-            )?,
-        ))
     }
     async fn link_scope_state(&self, scope: ResourceScope) -> Result<[u8; 32], Failure> {
         Ok(link::scope_token(&self.replica, scope).await?)

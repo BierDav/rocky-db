@@ -4,7 +4,6 @@
 //! renewal messages. A runtime enforces
 //! what these verify. See `docs/runtime/credentials.md`.
 mod author_binding;
-mod carry;
 mod checkpoint_record;
 mod coordination;
 mod delivery;
@@ -26,7 +25,6 @@ mod signed;
 mod tips;
 
 pub use author_binding::AuthorBinding;
-pub use carry::{CARRY_FORMAT, CarryStatement, MAX_CARRY_BYTES, MAX_CARRY_FRAMES, SignedCarry};
 pub use checkpoint_record::{
     CHECKPOINT_RECORD_FORMAT, CheckpointRecordStatement, SignedCheckpointRecord,
 };

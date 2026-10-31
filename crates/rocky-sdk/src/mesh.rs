@@ -464,7 +464,7 @@ mod tests {
     use crate::{FileSecretStore, SecretStore, schema::Schema};
     use rocky_credentials::{Revocation, SignedRevocation};
     use std::{collections::BTreeSet, sync::Arc};
-    const SCHEMA: &str = r#"{"application":"contacts","version":1,"format":6,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"]}]}"#;
+    const SCHEMA: &str = r#"{"application":"contacts","version":1,"format":6,"tables":[{"name":"items","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"]}]}"#;
     #[test]
     fn equal_sets_derive_equal_topics_missing_values_differ_and_substitution_is_refused()
     -> Result<(), Failure> {

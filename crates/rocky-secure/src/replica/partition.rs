@@ -481,13 +481,6 @@ impl<A: RowApplication> Inner<A> {
         let Some(typed) = &self.workspace.typed else {
             return Ok(BTreeMap::new());
         };
-        let support: Vec<&str> = typed
-            .rows
-            .schema()
-            .support_tables()
-            .into_iter()
-            .map(|table| table.sql_name.as_str())
-            .collect();
         let mut rules = BTreeMap::new();
         for projected in &typed.tables {
             if referenced.is_some_and(|names| {
@@ -501,21 +494,6 @@ impl<A: RowApplication> Inner<A> {
                 .table(&projected.table.sql_name)
                 .ok_or_else(|| denied("unknown table"))?;
             if logical.partition_by.is_empty() {
-                // Puppets and the virtual row are never readable: a table
-                // that may hold them reads its real rows only, and one
-                // outside the session's readable scopes needs row_kind = 0.
-                if support.contains(&logical.sql_name.as_str()) {
-                    rules.insert(
-                        logical.sql_name.to_ascii_lowercase(),
-                        rocky_storage::partition_sql::TablePartitions {
-                            columns: Vec::new(),
-                            complete: status.readable.contains(&projected.scope),
-                            held: Vec::new(),
-                            waiting: Vec::new(),
-                            support: true,
-                        },
-                    );
-                }
                 continue;
             }
             let readiness = self.readiness(typed.domain).await?;
@@ -545,7 +523,6 @@ impl<A: RowApplication> Inner<A> {
                     complete,
                     held,
                     waiting,
-                    support: false,
                 },
             );
         }
@@ -565,15 +542,11 @@ impl<A: RowApplication> Inner<A> {
             return Ok(unchanged());
         };
         let schema = typed.rows.schema();
-        let support: Vec<&str> = schema
-            .support_tables()
-            .into_iter()
-            .map(|table| table.sql_name.as_str())
-            .collect();
         if schema.views.is_empty()
-            && schema.tables.iter().all(|table| {
-                table.partition_by.is_empty() && !support.contains(&table.sql_name.as_str())
-            })
+            && schema
+                .tables
+                .iter()
+                .all(|table| table.partition_by.is_empty())
         {
             return Ok(unchanged());
         }

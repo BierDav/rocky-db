@@ -7,7 +7,7 @@ use crate::{
     transport::{Connector, memory::Hub},
 };
 
-const SCHEMA: &str = r#"{"application":"sync","version":1,"format":6,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"key","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}]}"#;
+const SCHEMA: &str = r#"{"application":"sync","version":1,"format":6,"tables":[{"name":"items","class":"replayed","columns":[{"name":"key","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],"primary_key":["key"]}]}"#;
 
 /// A request session of `dialer` and the session of `acceptor` answering it,
 /// on a link over an in-memory pipe that the test drives instead of a service.
@@ -468,7 +468,7 @@ async fn consumer_sql_allocates_string_ids_with_node_author() -> Result<(), Fail
     tokio::task::LocalSet::new().run_until(async {
     let root = tempfile::tempdir()?;
     let schema = Schema::parse(
-        r#"{"format":6,"application":"numeric_consumer","version":1,"tables":[{"name":"items","class":"mergeable","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"]}]}"#,
+        r#"{"format":6,"application":"numeric_consumer","version":1,"tables":[{"name":"items","class":"replayed","columns":[{"name":"title","type":"text","not_null":true}],"primary_key":["id"]}]}"#,
     )?;
     let store: Arc<dyn crate::SecretStore> =
         Arc::new(FileSecretStore::new(root.path().join("secrets")));
@@ -487,11 +487,11 @@ async fn consumer_sql_allocates_string_ids_with_node_author() -> Result<(), Fail
         .dispatch(&client, &json!({"type":"next_id","table":"items"}))
         .await?;
     let id = identity["id"].as_str().ok_or("id is not a string")?;
-    let rows = node.dispatch(&client, &json!({"type":"sql","sql":"INSERT INTO items(title,id) VALUES('first',?) RETURNING id,row_kind", "values":[{"type":"integer","value":id}]})).await?;
+    let rows = node.dispatch(&client, &json!({"type":"sql","sql":"INSERT INTO items(title,id) VALUES('first',?) RETURNING id", "values":[{"type":"integer","value":id}]})).await?;
     assert_eq!(rows["rows"][0][0]["value"], id);
     node.dispatch(&client, &json!({"type":"sql","sql":"COMMIT"}))
         .await?;
-    let rows = node.dispatch(&client, &json!({"type":"read","query":{"sql":"SELECT id,row_kind FROM items WHERE row_kind=0","max_rows":64}})).await?;
+    let rows = node.dispatch(&client, &json!({"type":"read","query":{"sql":"SELECT id FROM items","max_rows":64}})).await?;
     assert_eq!(rows["rows"][0][0]["value"], id);
     node.detach(None).await;
     Ok(())

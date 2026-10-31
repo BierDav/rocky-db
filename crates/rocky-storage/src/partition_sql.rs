@@ -26,14 +26,11 @@ pub struct TablePartitions {
     /// Held partitions whose rows are not all here: a read that may reach
     /// one is refused as incomplete, never answered as absence.
     pub waiting: Vec<Vec<SqlValue>>,
-    /// The table may hold puppets or a virtual row (`docs/runtime/existence-logs.md`): every
-    /// read is filtered to real rows, complete or not.
-    pub support: bool,
 }
 impl TablePartitions {
     /// Whether reads of the table are rewritten to a filtered subquery.
     fn filtered(&self) -> bool {
-        self.support || (!self.complete && !self.columns.is_empty())
+        !self.complete && !self.columns.is_empty()
     }
 }
 /// Why a statement is refused: outside the supported surface, or a table
@@ -276,27 +273,6 @@ fn propagate(proof: &mut Proof) {
 fn normalize(column: &PartitionColumn, value: &SqlValue) -> Result<PartitionValue, String> {
     PartitionValue::new(column.key, value.clone()).map_err(|error| error.to_string())
 }
-fn mentions_kind(expr: &Expr) -> bool {
-    struct Kind;
-    impl Visitor for Kind {
-        type Break = ();
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-            let kind = match expr {
-                Expr::Identifier(name) => name.value.eq_ignore_ascii_case("row_kind"),
-                Expr::CompoundIdentifier(names) => names
-                    .last()
-                    .is_some_and(|name| name.value.eq_ignore_ascii_case("row_kind")),
-                _ => false,
-            };
-            if kind {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        }
-    }
-    matches!(expr.visit(&mut Kind), ControlFlow::Break(()))
-}
 struct Checker<'a> {
     tables: &'a BTreeMap<String, TablePartitions>,
     bindings: &'a Bindings<'a>,
@@ -344,7 +320,7 @@ impl Checker<'_> {
             let Some(rule) = self.tables.get(name) else {
                 continue;
             };
-            if rule.complete || (rule.columns.is_empty() && !rule.support) {
+            if rule.complete || rule.columns.is_empty() {
                 continue;
             }
             let mut effective = Proof {
@@ -362,45 +338,23 @@ impl Checker<'_> {
                 }
             }
             propagate(&mut effective);
-            // Real rows only: the filter hides rows of partitions not held.
-            let real = effective
-                .values
-                .get(&(alias.clone(), "row_kind".into()))
-                .is_some_and(|values| values == &[SqlValue::Integer(0)]);
             let incomplete = || Refusal::Unavailable {
                 table: name.clone(),
                 reason: crate::sql::Unavailable::Incomplete,
             };
-            if rule.columns.is_empty() {
-                if real {
-                    continue;
-                }
-                return Err(format!(
-                    "{name}: a table this device does not hold needs row_kind = 0"
-                )
-                .into());
-            }
             let mut tuples = vec![Vec::new()];
             for column in &rule.columns {
                 let Some(values) = effective
                     .values
                     .get(&(alias.clone(), column.name.to_ascii_lowercase()))
                 else {
-                    // Every partition may be read: one that waits refuses it.
+                    // Every partition may be read: one that waits refuses
+                    // it, and the filter hides those not held.
                     if !rule.waiting.is_empty() && !self.assertion {
                         return Err(incomplete());
                     }
-                    if real {
-                        tuples.clear();
-                        break;
-                    }
-                    if !self.assertion {
-                        return Err(format!(
-                            "{name}: a partial table needs held partition equality/IN or row_kind = 0"
-                        )
-                        .into());
-                    }
-                    continue;
+                    tuples.clear();
+                    break;
                 };
                 if tuples.len().saturating_mul(values.len()) > 4096 {
                     return Err("partition proof quota".into());
@@ -432,7 +386,7 @@ impl Checker<'_> {
                 return Err(incomplete());
             }
             let held = normalized(&rule.held)?;
-            if !self.assertion && !real && tuples.iter().any(|tuple| !held.contains(tuple)) {
+            if !self.assertion && tuples.iter().any(|tuple| !held.contains(tuple)) {
                 return Err(Refusal::Unavailable {
                     table: name.clone(),
                     reason: crate::sql::Unavailable::NotHeld,
@@ -483,46 +437,6 @@ impl Visitor for Checker<'_> {
             Ok(()) => ControlFlow::Continue(()),
             Err(error) => ControlFlow::Break(error),
         }
-    }
-    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Refusal> {
-        let is_kind = |expr: &Expr| match unnest(expr) {
-            Expr::Identifier(name) => name.value.eq_ignore_ascii_case("row_kind"),
-            Expr::CompoundIdentifier(names) => names
-                .last()
-                .is_some_and(|name| name.value.eq_ignore_ascii_case("row_kind")),
-            _ => false,
-        };
-        let refused = match unnest(expr) {
-            Expr::BinaryOp { left, op, right } if is_kind(left) || is_kind(right) => {
-                let other = if is_kind(left) { right } else { left };
-                *op != BinaryOperator::Eq
-                    || value(other, self.bindings) != Some(SqlValue::Integer(0))
-            }
-            Expr::InList {
-                expr,
-                list,
-                negated,
-            } if is_kind(expr) => {
-                *negated
-                    || list
-                        .iter()
-                        .any(|expr| value(expr, self.bindings) != Some(SqlValue::Integer(0)))
-            }
-            // The subquery is checked as its own query block.
-            Expr::InSubquery { expr, .. } => mentions_kind(expr),
-            Expr::Identifier(_)
-            | Expr::CompoundIdentifier(_)
-            | Expr::Value(_)
-            | Expr::Nested(_)
-            | Expr::BinaryOp { .. }
-            | Expr::Subquery(_)
-            | Expr::Exists { .. } => false,
-            other => mentions_kind(other),
-        };
-        if refused {
-            return ControlFlow::Break("reserved row_kind cannot be selected".into());
-        }
-        ControlFlow::Continue(())
     }
 }
 /// A statement with its views expanded, and the tables it may reference.
@@ -690,23 +604,8 @@ fn literal(value: &SqlValue) -> String {
         ),
     }
 }
-/// Real rows of the held partitions; their values bind as parameters
-/// after `params`, so the text depends only on how many there are.
-fn held_filter(rule: &TablePartitions, alias: Option<&str>, params: &mut Vec<SqlValue>) -> String {
-    let partitions = held_partitions(rule, alias, params);
-    if !rule.support {
-        return partitions;
-    }
-    let kind = match alias {
-        Some(alias) => format!("{}.\"row_kind\"", quoted(alias)),
-        None => "\"row_kind\"".into(),
-    };
-    if rule.complete {
-        format!("{kind} = 0")
-    } else {
-        format!("{kind} = 0 AND {partitions}")
-    }
-}
+/// Rows of the held partitions; their values bind as parameters after
+/// `params`, so the text depends only on how many there are.
 fn held_partitions(
     rule: &TablePartitions,
     alias: Option<&str>,
@@ -757,7 +656,7 @@ fn filter_expr(
 ) -> Result<Expr, String> {
     let Statement::Query(query) = parse(&format!(
         "SELECT 1 WHERE {}",
-        held_filter(rule, alias, params)
+        held_partitions(rule, alias, params)
     ))?
     else {
         return Err("partition filter".into());
@@ -865,7 +764,7 @@ impl VisitorMut for Filter<'_> {
         let query = match parse(&format!(
             "SELECT * FROM {} WHERE {}",
             quoted(&name),
-            held_filter(rule, None, &mut self.params)
+            held_partitions(rule, None, &mut self.params)
         )) {
             Ok(Statement::Query(query)) => query,
             _ => return ControlFlow::Break("partition filter".into()),
@@ -1041,7 +940,6 @@ mod tests {
                 complete: false,
                 held: vec![vec![SqlValue::Text("A".into())]],
                 waiting: Vec::new(),
-                support: false,
             },
         )]
         .into()
@@ -1053,31 +951,18 @@ mod tests {
             "SELECT * FROM items WHERE list='a'",
             "SELECT * FROM items WHERE list IN ('a','A')",
             "UPDATE items SET amount=1 WHERE list='A'",
-            "DELETE FROM items WHERE row_kind=0",
-            "SELECT SUM(amount) FROM main.items WHERE row_kind=0",
-            "SELECT amount FROM items WHERE list='A' UNION ALL SELECT amount FROM items WHERE row_kind=0",
+            "DELETE FROM items",
+            "SELECT SUM(amount) FROM main.items",
+            "SELECT amount FROM items WHERE list='A' UNION ALL SELECT amount FROM items",
             "SELECT a.amount,b.amount FROM items a JOIN items b ON a.list=b.list WHERE a.list='A'",
-            "SELECT a.amount,b.amount FROM items a LEFT JOIN items b ON b.row_kind=0 WHERE a.list='A'",
+            "SELECT * FROM items WHERE list='A' OR amount=1",
         ] {
             check(sql, &[], &rules).unwrap_or_else(|error| panic!("{sql}: {error}"));
         }
         for sql in [
-            "SELECT SUM(amount) FROM items",
             "SELECT * FROM items WHERE list IN ('A','B')",
-            "SELECT * FROM items WHERE list='A' OR amount=1",
-            "SELECT * FROM items WHERE row_kind=0 OR amount=1",
-            "SELECT a.amount,b.amount FROM items a LEFT JOIN items b ON a.row_kind=0 AND b.row_kind=0",
-            "UPDATE items SET amount=1",
             "DELETE FROM items WHERE list='B'",
-            "SELECT * FROM items WHERE row_kind=2",
-            "SELECT SUM(amount) FROM main.items",
-            "SELECT amount FROM items WHERE list='A' UNION ALL SELECT amount FROM items",
-            "UPDATE items AS a SET amount=b.amount FROM items AS b WHERE a.list='A'",
-            "SELECT SUM(amount) FROM (items)",
-            "SELECT * FROM items WHERE row_kind IN (1,2)",
-            "SELECT * FROM items WHERE list='A' AND coalesce(row_kind,0)=1",
-            "SELECT * FROM items WHERE list='A' AND NOT(row_kind=0)",
-            "SELECT * FROM items WHERE row_kind != 0",
+            "SELECT a.amount,b.amount FROM items a LEFT JOIN items b ON b.list='B' WHERE a.list='A'",
         ] {
             assert!(check(sql, &[], &rules).is_err(), "{sql}");
         }
@@ -1099,37 +984,35 @@ mod tests {
     #[test]
     fn partial_reads_filter_cached_unheld_rows_without_changing_left_join_semantics() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE items(list TEXT,amount INTEGER,row_kind INTEGER); INSERT INTO items VALUES('A',10,0),('B',20,0);").unwrap();
-        let sql = check(
-            "SELECT SUM(amount) FROM items WHERE row_kind=0",
+        conn.execute_batch(
+            "CREATE TABLE items(list TEXT,amount INTEGER); INSERT INTO items VALUES('A',10),('B',20);",
+        )
+        .unwrap();
+        for read in ["SELECT SUM(amount) FROM items", "SELECT SUM(amount) FROM main.items"] {
+            let sql = check(read, &[], &rules()).unwrap();
+            assert_eq!(
+                conn.query_row(&sql, [], |row| row.get::<_, i64>(0)).unwrap(),
+                10
+            );
+        }
+        let union = check(
+            "SELECT amount FROM items UNION ALL SELECT amount FROM items",
             &[],
             &rules(),
         )
         .unwrap();
-        assert_eq!(
-            conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            10
-        );
-        let qualified = check(
-            "SELECT SUM(amount) FROM main.items WHERE row_kind=0",
-            &[],
-            &rules(),
-        )
-        .unwrap();
-        assert_eq!(
-            conn.query_row(&qualified, [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            10
-        );
-        let union = check("SELECT amount FROM items WHERE row_kind=0 UNION ALL SELECT amount FROM items WHERE row_kind=0", &[], &rules()).unwrap();
         let count: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM ({union})"), [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(count, 2);
-        let sql=check("SELECT a.amount,b.amount FROM items a LEFT JOIN items b ON b.list='B' AND b.row_kind=0 WHERE a.list='A'",&[],&rules()).unwrap();
+        let sql = check(
+            "SELECT a.amount,b.amount FROM items a LEFT JOIN items b ON b.amount=20 WHERE a.list='A'",
+            &[],
+            &rules(),
+        )
+        .unwrap();
         assert_eq!(
             conn.query_row(&sql, [], |row| Ok((
                 row.get::<_, i64>(0)?,
@@ -1156,7 +1039,7 @@ mod tests {
         for sql in [
             "SELECT * FROM items WHERE list='b'",
             "SELECT * FROM items WHERE list IN ('A','B')",
-            "SELECT SUM(amount) FROM items WHERE row_kind=0",
+            "SELECT SUM(amount) FROM items",
         ] {
             assert!(incomplete(sql), "{sql}");
         }
@@ -1167,8 +1050,8 @@ mod tests {
     #[test]
     fn held_values_bind_after_the_callers_parameters_and_keep_the_text_stable() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE items(list TEXT,amount INTEGER,row_kind INTEGER); INSERT INTO items VALUES('A',10,0),('B',20,0);").unwrap();
-        let sql = "SELECT ? + SUM(amount) FROM items WHERE row_kind=0 AND amount>?";
+        conn.execute_batch("CREATE TABLE items(list TEXT,amount INTEGER); INSERT INTO items VALUES('A',10),('B',20);").unwrap();
+        let sql = "SELECT ? + SUM(amount) FROM items WHERE amount>?";
         let checked = check_with_views(
             sql,
             &[SqlValue::Integer(1), SqlValue::Integer(5)],
@@ -1220,136 +1103,12 @@ mod tests {
         // Too few parameters for a filtered statement is refused, not padded.
         assert!(check_with_views(sql, &[SqlValue::Integer(1)], &rules(), &[]).is_err());
     }
-    /// `customers` may hold support rows: unheld by `partial`, fully held
-    /// otherwise.
-    fn support(complete: bool) -> BTreeMap<String, TablePartitions> {
-        [(
-            "customers".into(),
-            TablePartitions {
-                columns: Vec::new(),
-                complete,
-                held: Vec::new(),
-                waiting: Vec::new(),
-                support: true,
-            },
-        )]
-        .into()
-    }
-    #[test]
-    fn support_rows_are_unreadable_through_every_statement_form() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE customers(id INTEGER PRIMARY KEY,name TEXT NOT NULL,row_kind INTEGER NOT NULL);
-             CREATE TABLE orders(id INTEGER PRIMARY KEY,customer INTEGER NOT NULL,row_kind INTEGER NOT NULL);
-             INSERT INTO customers VALUES(0,'',2),(7,'',1);
-             INSERT INTO orders VALUES(1,7,0);",
-        )
-        .unwrap();
-        let views = vec![
-            rocky_core::LogicalView {
-                name: "partial_customers".into(),
-                create_sql:
-                    "CREATE VIEW partial_customers AS SELECT * FROM customers WHERE row_kind = 0"
-                        .into(),
-            },
-            rocky_core::LogicalView {
-                name: "nested_customers".into(),
-                create_sql: "CREATE VIEW nested_customers AS SELECT * FROM partial_customers"
-                    .into(),
-            },
-            rocky_core::LogicalView {
-                name: "all_customers".into(),
-                create_sql: "CREATE VIEW all_customers AS SELECT * FROM customers".into(),
-            },
-        ];
-        let unheld = support(false);
-        for sql in [
-            "SELECT * FROM customers",
-            "SELECT count(*) FROM customers",
-            "SELECT * FROM customers WHERE id=7",
-            "SELECT * FROM customers WHERE row_kind=1",
-            "SELECT * FROM customers WHERE row_kind IN (0,1)",
-            "SELECT * FROM customers WHERE row_kind=0 OR id=7",
-            "SELECT o.id,c.name FROM orders o LEFT JOIN customers c ON c.id=o.customer",
-            "SELECT o.id,c.name FROM orders o JOIN customers c ON c.id=o.customer",
-            "SELECT * FROM all_customers",
-            "SELECT id FROM orders WHERE customer IN (SELECT id FROM customers)",
-            "SELECT id FROM orders UNION SELECT id FROM customers",
-            "UPDATE customers SET name='x' WHERE id=7",
-            "DELETE FROM customers WHERE id=7",
-        ] {
-            assert!(
-                check_with_views(sql, &[], &unheld, &views).is_err(),
-                "{sql}"
-            );
-        }
-        let read = |sql: &str, rules: &BTreeMap<String, TablePartitions>| {
-            let sql = check_with_views(sql, &[], rules, &views)
-                .map(|checked| inline(&checked))
-                .unwrap_or_else(|error| panic!("{sql}: {error}"));
-            let mut statement = conn.prepare(&sql).unwrap();
-            let width = statement.column_count();
-            statement
-                .query_map([], |row| {
-                    (0..width)
-                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-        };
-        use rusqlite::types::Value::{Integer, Null};
-        // orders LEFT JOIN partial_customers: NULL for the puppet's columns.
-        for sql in [
-            "SELECT o.id,c.name FROM orders o LEFT JOIN partial_customers c ON c.id=o.customer",
-            "SELECT o.id,c.name FROM orders o LEFT JOIN nested_customers c ON c.id=o.customer",
-            "SELECT o.id,c.name FROM orders o LEFT JOIN customers c ON c.id=o.customer AND c.row_kind=0",
-        ] {
-            assert_eq!(read(sql, &unheld), vec![vec![Integer(1), Null]], "{sql}");
-        }
-        for sql in [
-            "SELECT * FROM customers WHERE row_kind=0",
-            "SELECT * FROM partial_customers",
-            "SELECT id FROM orders WHERE customer IN (SELECT id FROM partial_customers)",
-        ] {
-            assert!(read(sql, &unheld).is_empty(), "{sql}");
-        }
-        // A fully held table reads its real rows only, also without a filter.
-        let held = support(true);
-        for sql in [
-            "SELECT * FROM customers",
-            "SELECT * FROM all_customers",
-            "SELECT * FROM customers WHERE id IN (0,7)",
-            "SELECT c.* FROM orders o JOIN customers c ON c.id=o.customer",
-        ] {
-            assert!(read(sql, &held).is_empty(), "{sql}");
-        }
-        for sql in [
-            "SELECT * FROM customers WHERE row_kind=2",
-            "SELECT * FROM customers WHERE row_kind<>0",
-            "SELECT * FROM customers WHERE row_kind IN (SELECT 1)",
-        ] {
-            assert!(check_with_views(sql, &[], &held, &views).is_err(), "{sql}");
-        }
-        for sql in ["UPDATE customers SET name='x'", "DELETE FROM customers"] {
-            let sql = check_with_views(sql, &[], &held, &views).unwrap().sql;
-            assert!(sql.contains("row_kind"), "{sql}");
-            conn.execute(&sql, []).unwrap();
-        }
-        let left: i64 = conn
-            .query_row("SELECT count(*) FROM customers WHERE name=''", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(left, 2);
-    }
     #[test]
     fn nested_views_are_expanded_and_cycles_refused() {
         let views = vec![
             rocky_core::LogicalView {
                 name: "partial_items".into(),
-                create_sql: "CREATE VIEW partial_items AS SELECT * FROM items WHERE row_kind=0"
+                create_sql: "CREATE VIEW partial_items AS SELECT * FROM items WHERE amount>0"
                     .into(),
             },
             rocky_core::LogicalView {

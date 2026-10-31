@@ -194,52 +194,6 @@ fn maximal_frontier_batches_are_split_in_both_directions() {
     assert!(sent > 1);
 }
 #[test]
-fn existence_pages_fit_with_eight_link_credentials() {
-    let key = PrivateKey::from_bytes(&[7; 32]);
-    let credentials = eight_links(2);
-    let records: Vec<_> = (1..=128)
-        .map(|id| {
-            ExistenceRecord::forge(
-                &key,
-                credentials.clone(),
-                TipId([255; 32]),
-                scope(1),
-                (1_i64 << 32) | id,
-                ExistenceEvent::Created,
-                u32::MAX,
-                u64::MAX,
-                Some([255; 32]),
-            )
-        })
-        .collect();
-    let mut remaining = records.as_slice();
-    let mut pages = 0;
-    while !remaining.is_empty() {
-        let count = page_len(remaining, 128).unwrap();
-        let page = remaining[..count].to_vec();
-        fits(
-            ExistenceMessage::Records {
-                page: ExistencePage {
-                    records: page.clone(),
-                    next: Some((key.public_key(), u64::MAX)),
-                },
-            }
-            .into(),
-        );
-        fits(
-            ExistenceMessage::Push {
-                scope: scope(1),
-                records: page,
-            }
-            .into(),
-        );
-        remaining = &remaining[count..];
-        pages += 1;
-    }
-    assert!(pages > 1);
-}
-
-#[test]
 fn holdings_proofs_fit_with_maximal_tuples_and_four_epochs() {
     use rocky_core::{Affinity, Collation, KeyColumn, PartitionTuple, PartitionValue, SqlValue};
     let value = PartitionValue::new(

@@ -1,16 +1,14 @@
 //! SQL sessions on typed tables of an encrypted replica.
 use super::*;
 mod catch_up;
-mod compact;
 mod intents;
 mod maintenance;
-mod publication;
 use crate::sql::{AbortReason, SqlError, SqlOptions, SqlState};
 use crate::storage::collect_rows;
 use rocky_core::{
     Affinity, Collation, ColumnClass, DomainId, LOGICAL_SCHEMA_FORMAT, LogicalColumn,
     LogicalSchema, LogicalTable, RowApplication, SchemaSource, Scope, SqlValue, TableClass,
-    TypedRows, UpdatePolicy,
+    TypedRows,
 };
 
 const ITEMS: &str =
@@ -35,23 +33,19 @@ fn column(name: &str, affinity: Affinity, not_null: bool) -> LogicalColumn {
         not_null,
         default: None,
         collation: Collation::Binary,
-        class: ColumnClass::Mergeable,
+        class: ColumnClass::Replicated,
     }
 }
 fn table(name: &str, sql: &str, mut columns: Vec<LogicalColumn>) -> LogicalTable {
     columns.push(column("id", Affinity::Integer, true));
-    let mut kind = column("row_kind", Affinity::Integer, true);
-    kind.default = Some("0".into());
-    columns.push(kind);
     let sql = format!(
-        "{},id INTEGER NOT NULL,row_kind INTEGER NOT NULL DEFAULT 0)",
+        "{},id INTEGER NOT NULL)",
         sql.trim_end_matches(')')
     );
     LogicalTable {
         sql_name: name.into(),
         granted_like: None,
-        class: TableClass::Mergeable,
-        coordinated: false,
+        class: TableClass::Replayed,
         create_sql: sql,
         auto_generate: false,
         columns,
@@ -66,20 +60,17 @@ fn table(name: &str, sql: &str, mut columns: Vec<LogicalColumn>) -> LogicalTable
                 descending: false,
             }],
             create_sql: format!("CREATE UNIQUE INDEX {name}_identity ON {name}(id)"),
-            on_conflict: None,
             expressions: Vec::new(),
             predicate: None,
         }],
         foreign_keys: Vec::new(),
-
-        existence_log: false,
     }
 }
 fn text(value: &str) -> SqlValue {
     SqlValue::Text(value.into())
 }
 impl Typed {
-    fn new(policy: UpdatePolicy) -> Self {
+    fn new() -> Self {
         let publisher = PrivateKey::new();
         let mut drafts = table(
             "drafts",
@@ -99,7 +90,6 @@ impl Typed {
                 version: 1,
                 identity: "secure-sql".into(),
             },
-            update_policy: policy,
             tables: vec![
                 drafts,
                 table(
@@ -426,7 +416,7 @@ async fn insert(
 
 #[tokio::test]
 async fn a_sql_transaction_over_two_reader_scopes_commits_one_bundle() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -468,8 +458,12 @@ async fn a_sql_transaction_over_two_reader_scopes_commits_one_bundle() {
     assert_eq!(committed.state, SqlState::Idle);
     let frames = committed.committed.unwrap().frames;
     assert_eq!(frames.len(), 2);
-    assert_eq!(alice.snapshot(t.items).await.unwrap().rows.len(), 3);
-    assert_eq!(alice.snapshot(t.salaries).await.unwrap().rows.len(), 1);
+    for (table, count) in [("items", 3), ("salaries", 1)] {
+        assert_eq!(
+            select(&session, &format!("SELECT count(*) FROM {table}")).await,
+            vec![vec![SqlValue::Integer(count)]]
+        );
+    }
 
     // A public reader projects the public partition into its typed table and
     // cannot read the private one.
@@ -541,22 +535,16 @@ async fn a_sql_transaction_over_two_reader_scopes_commits_one_bundle() {
     );
 
     // Single statements commit by themselves; peers follow updates and deletes.
-    let updated = session
-        .run("UPDATE items SET done=1 WHERE key='b'", vec![])
-        .await
-        .unwrap();
-    let deleted = session
-        .run("DELETE FROM items WHERE key='c'", vec![])
-        .await
-        .unwrap();
-    for frame in updated
-        .committed
-        .unwrap()
-        .frames
-        .into_iter()
-        .chain(deleted.committed.unwrap().frames)
-    {
-        assert_eq!(bob.receive(frame).await.unwrap(), ReceiveStatus::Applied);
+    // The items log also carries the author's outcome record of the bundle.
+    for statement in [
+        "UPDATE items SET done=1 WHERE key='b'",
+        "DELETE FROM items WHERE key='c'",
+    ] {
+        session.run(statement, vec![]).await.unwrap();
+    }
+    let page = transfer(&alice, &bob, t.items).await;
+    for status in bob.receive_all(page.frames).await {
+        status.unwrap();
     }
     assert_eq!(
         select(&reader, "SELECT key,done FROM items ORDER BY key").await,
@@ -577,7 +565,7 @@ async fn a_sql_transaction_over_two_reader_scopes_commits_one_bundle() {
 
 #[tokio::test]
 async fn statements_outside_the_session_and_unpermitted_fields_are_refused() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -703,7 +691,7 @@ async fn statements_outside_the_session_and_unpermitted_fields_are_refused() {
 
 #[tokio::test]
 async fn authority_changes_wait_for_the_lease_and_end_the_session() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let node = PrivateKey::new();
@@ -766,7 +754,7 @@ async fn authority_changes_wait_for_the_lease_and_end_the_session() {
 
 #[tokio::test]
 async fn credentials_expiring_inside_an_open_transaction_refuse_it() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let node = PrivateKey::new();
@@ -818,7 +806,6 @@ async fn credentials_expiring_inside_an_open_transaction_refuse_it() {
         text("cheese"),
         SqlValue::Integer(0),
         SqlValue::Integer(4294967297),
-        SqlValue::Integer(0),
     ];
     let (id, fields) = {
         let table = typed
@@ -853,7 +840,7 @@ async fn credentials_expiring_inside_an_open_transaction_refuse_it() {
 
 #[tokio::test]
 async fn cancel_and_timeout_roll_back_and_free_the_replica() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -921,7 +908,7 @@ async fn cancel_and_timeout_roll_back_and_free_the_replica() {
 
 #[tokio::test]
 async fn savepoint_rollback_and_cancellation_do_not_cache_uncommitted_frontiers() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let scopes = [t.items, t.salaries];
     let replica = t
@@ -980,8 +967,8 @@ async fn savepoint_rollback_and_cancellation_do_not_cache_uncommitted_frontiers(
 }
 
 #[tokio::test]
-async fn a_handle_recovers_its_commit_after_restart_and_policies_shape_masks() {
-    let t = Typed::new(UpdatePolicy::Assigned);
+async fn a_handle_recovers_its_commit_after_restart() {
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let node = PrivateKey::new();
@@ -1017,7 +1004,7 @@ async fn a_handle_recovers_its_commit_after_restart_and_policies_shape_masks() {
         .run("UPDATE items SET title='apples'", vec![])
         .await
         .unwrap();
-    // Under the assigned policy an equal assignment is published.
+    // An intent publishes its statement, even an equal assignment.
     let assigned = session.commit([9; 32]).await.unwrap().committed.unwrap();
     assert_eq!(assigned.frames.len(), 1);
     assert_ne!(
@@ -1053,7 +1040,7 @@ async fn a_handle_recovers_its_commit_after_restart_and_policies_shape_masks() {
 
 #[tokio::test]
 async fn concurrent_sql_edits_converge_in_every_typed_table() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -1100,15 +1087,11 @@ async fn concurrent_sql_edits_converge_in_every_typed_table() {
     let rows = select(&a, "SELECT * FROM items").await;
     assert_eq!(rows, select(&c, "SELECT * FROM items").await);
     assert_eq!(rows[0][2], SqlValue::Integer(1));
-    assert_eq!(
-        alice.snapshot(t.items).await.unwrap().rows,
-        carol.snapshot(t.items).await.unwrap().rows
-    );
 }
 
 #[tokio::test]
 async fn an_edit_concurrent_with_a_delete_applies_and_its_log_continues() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -1167,10 +1150,6 @@ async fn an_edit_concurrent_with_a_delete_applies_and_its_log_continues() {
     let rows = select(&a, "SELECT key,title FROM items").await;
     assert_eq!(rows, vec![vec![text("b"), text("bread")]]);
     assert_eq!(rows, select(&c, "SELECT key,title FROM items").await);
-    assert_eq!(
-        alice.snapshot(t.items).await.unwrap().rows,
-        carol.snapshot(t.items).await.unwrap().rows
-    );
 }
 
 async fn rows_of(cursor: &mut crate::cursor::SnapshotCursor) -> Vec<Vec<SqlValue>> {
@@ -1188,7 +1167,7 @@ async fn rows_of(cursor: &mut crate::cursor::SnapshotCursor) -> Vec<Vec<SqlValue
 async fn catalogs_cursors_and_joins_report_unavailable_rows_instead_of_absence() {
     use crate::cursor::CursorLimits;
     use crate::sql::Unavailable;
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -1285,7 +1264,7 @@ async fn catalogs_cursors_and_joins_report_unavailable_rows_instead_of_absence()
 #[tokio::test]
 async fn secure_cursors_keep_their_snapshot_and_end_when_authority_changes() {
     use crate::cursor::CursorLimits;
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -1345,7 +1324,7 @@ async fn secure_cursors_keep_their_snapshot_and_end_when_authority_changes() {
 #[tokio::test]
 async fn secure_table_events_follow_commits_receipts_and_authority() {
     use crate::observe::Cause;
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let alice = t
@@ -1423,13 +1402,13 @@ async fn definition_compound_keys_indexes_real_and_blob_survive_bundles_and_reop
     let definition = r#"{
         "format":6, "publisher": "PUBLISHER",
         "application": "samples", "tables": [
-            {"name":"items", "class":"mergeable", "columns":[
+            {"name":"items", "class":"replayed", "columns":[
                 {"name":"sensor", "type":"text", "not_null":true},
                 {"name":"sequence", "type":"integer", "not_null":true},
                 {"name":"reading", "type":"real"}, {"name":"raw", "type":"blob"}],
              "primary_key":["sensor","sequence"],
              "indexes":[{"name":"items_by_reading", "columns":[{"name":"reading", "descending":true}]}]},
-            {"name":"salaries", "class":"mergeable", "columns":[
+            {"name":"salaries", "class":"replayed", "columns":[
                 {"name":"key", "type":"text", "not_null":true}, {"name":"amount", "type":"integer", "not_null":true}],
              "primary_key":["key"]}
         ]
@@ -1535,12 +1514,12 @@ async fn identity_descriptor_installs_shared_columns_and_reopens() {
         for name in ["items", "salaries", "drafts"] {
             let result = sql
                 .run(
-                    &format!("SELECT id,row_kind FROM {name} WHERE row_kind=0"),
+                    &format!("SELECT id FROM {name}"),
                     vec![],
                 )
                 .await
                 .unwrap();
-            assert_eq!(result.columns, ["id", "row_kind"]);
+            assert_eq!(result.columns, ["id"]);
             assert!(result.rows.is_empty());
         }
         drop(sql);
@@ -1554,10 +1533,10 @@ fn identity_fixture() -> Typed {
     let definition = r#"{
         "format":6, "publisher": "PUBLISHER",
         "application": "identity-descriptor", "tables": [
-            {"name": "items", "class": "mergeable", "columns": [
+            {"name": "items", "class": "replayed", "columns": [
                 {"name": "key", "type": "text", "not_null": true},
                 {"name": "title", "type": "text", "not_null": true}], "primary_key": ["key"]},
-            {"name": "salaries", "class": "mergeable", "columns": [
+            {"name": "salaries", "class": "replayed", "columns": [
                 {"name": "amount", "type": "integer", "not_null": true}], "primary_key": ["id"]},
             {"name": "drafts", "class": "local_only", "columns": [
                 {"name": "body", "type": "text"}], "primary_key": ["id"]}
@@ -1724,45 +1703,38 @@ async fn identity_reservations_follow_savepoints_and_one_node_signer_form_one_bu
     let reader = sql(&peer, &[fixture.items, fixture.salaries]).await;
     assert_eq!(
         reader
-            .run("SELECT id,row_kind FROM items ORDER BY id", vec![])
+            .run("SELECT id FROM items ORDER BY id", vec![])
             .await
             .unwrap()
             .rows,
         vec![
-            vec![SqlValue::Integer(item.integer()), SqlValue::Integer(0)],
-            vec![SqlValue::Integer(unused.integer()), SqlValue::Integer(0)]
+            vec![SqlValue::Integer(item.integer())],
+            vec![SqlValue::Integer(unused.integer())]
         ]
     );
     assert_eq!(
         reader
-            .run("SELECT id,row_kind FROM salaries", vec![])
+            .run("SELECT id FROM salaries", vec![])
             .await
             .unwrap()
             .rows,
-        vec![vec![
-            SqlValue::Integer(salary.integer()),
-            SqlValue::Integer(0)
-        ]]
+        vec![vec![SqlValue::Integer(salary.integer())]]
     );
     for (statement, values) in [
         (
             "UPDATE items SET id=? WHERE key='z'",
             vec![SqlValue::Integer(item.integer() + 10)],
         ),
-        ("UPDATE items SET row_kind=1 WHERE key='z'", vec![]),
     ] {
         assert!(writer.run(statement, values).await.is_err());
     }
     assert_eq!(
         writer
-            .run("SELECT id,row_kind FROM items WHERE key='z'", vec![])
+            .run("SELECT id FROM items WHERE key='z'", vec![])
             .await
             .unwrap()
             .rows,
-        vec![vec![
-            SqlValue::Integer(item.integer()),
-            SqlValue::Integer(0)
-        ]]
+        vec![vec![SqlValue::Integer(item.integer())]]
     );
 }
 
@@ -1853,306 +1825,6 @@ async fn failed_identity_commit_releases_its_sequence_and_forged_frame_author_is
         peer.receive(frame.clone()).await.unwrap(),
         ReceiveStatus::Applied
     );
-    // A new authenticated log operation cannot reuse a creation sequence,
-    // even at another natural key.
-    let operation = frame.operation().unwrap();
-    let app = fixture.app();
-    let table = app.table(&fixture.items.table).unwrap();
-    let values = vec![
-        SqlValue::Text("reused".into()),
-        SqlValue::Text("bad".into()),
-        SqlValue::Integer(id.integer()),
-        SqlValue::Integer(0),
-    ];
-    let change = rocky_core::RowChange {
-        scope: fixture.items,
-        row: app
-            .row_id(fixture.items.domain.domain, table, &values)
-            .unwrap(),
-        before: None,
-        after: Some(app.fields(table, &values).unwrap()),
-    };
-    let reused = crate::wire::author(
-        &key,
-        operation.header.extensions.clone(),
-        frame.chain().unwrap().clone(),
-        &fixture.key(fixture.items).key,
-        (
-            operation.header.seq_num + 1,
-            Some(operation.hash),
-            operation.header.timestamp + 1,
-        ),
-        vec![],
-        &crate::wire::RowPayload::compact(
-            &crate::wire::RowPayload::witness(
-                crate::wire::RowPayload::rows(&[change]).unwrap(),
-                vec![],
-            )
-            .unwrap(),
-            &app.manifest(),
-            fixture.items,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(peer.receive(reused).await.unwrap(), ReceiveStatus::Rejected);
-    let signed = compacted_base(&peer, &fixture.publisher, fixture.items).await;
-    assert_eq!(signed.statement.format, 17);
-    assert_eq!(signed.statement.identities[0].sequence, 1);
-}
-
-#[tokio::test]
-async fn natural_key_relink_converges_and_old_identity_edits_never_touch_replacement() {
-    let publisher = PrivateKey::new();
-    let definition = r#"{"format":6,"publisher":"PUBLISHER","application":"pair_identity","tables":[
-        {"name":"items","class":"mergeable","columns":[{"name":"left","type":"text","not_null":true},{"name":"right","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}],"primary_key":["left","right"]},
-        {"name":"salaries","class":"mergeable","columns":[{"name":"amount","type":"integer","not_null":true}],"primary_key":["id"]}
-    ]}"#.replace("PUBLISHER", &publisher.public_key().to_string());
-    let schema = rocky_core::SchemaDefinition::parse(definition.as_bytes())
-        .unwrap()
-        .build()
-        .unwrap();
-    let fixture = Typed::with_schema(publisher, schema);
-    let directory = tempfile::tempdir().unwrap();
-    let nodes = [PrivateKey::new(), PrivateKey::new(), PrivateKey::new()];
-    let mut replicas = Vec::new();
-    for (index, node) in nodes.iter().enumerate() {
-        let replica = fixture
-            .open_number(
-                &directory.path().join(format!("{index}.sqlite")),
-                node,
-                fixture.full(),
-                &[fixture.items, fixture.salaries],
-                41 + index as u32,
-            )
-            .await;
-        replicas.push(replica);
-    }
-    let a = sql(&replicas[0], &[fixture.items]).await;
-    let b = sql(&replicas[1], &[fixture.items]).await;
-    a.run("BEGIN", vec![]).await.unwrap();
-    let first = a.next_id("items").await.unwrap();
-    a.run(
-        "INSERT INTO items(left,right,title,id) VALUES('list','item','original',?)",
-        vec![SqlValue::Integer(first.integer())],
-    )
-    .await
-    .unwrap();
-    let original = a.commit([130; 32]).await.unwrap().committed.unwrap().frames;
-    for peer in &replicas[1..] {
-        for frame in &original {
-            peer.receive(frame.clone()).await.unwrap();
-        }
-    }
-    let late = b
-        .run(
-            "UPDATE items SET title='late' WHERE left='list' AND right='item'",
-            vec![],
-        )
-        .await
-        .unwrap()
-        .committed
-        .unwrap()
-        .frames;
-    // Unlink and relink in one transaction names two different incarnations.
-    a.run("BEGIN", vec![]).await.unwrap();
-    a.run(
-        "DELETE FROM items WHERE left='list' AND right='item'",
-        vec![],
-    )
-    .await
-    .unwrap();
-    let second = a.next_id("items").await.unwrap();
-    a.run(
-        "INSERT INTO items(left,right,title,id) VALUES('list','item','replacement',?)",
-        vec![SqlValue::Integer(second.integer())],
-    )
-    .await
-    .unwrap();
-    let replacement = a.commit([131; 32]).await.unwrap().committed.unwrap().frames;
-    // Concurrent delete names the first id, never the replacement.
-    let deleted = b
-        .run(
-            "DELETE FROM items WHERE left='list' AND right='item'",
-            vec![],
-        )
-        .await
-        .unwrap()
-        .committed
-        .unwrap()
-        .frames;
-    for peer in &replicas {
-        for frames in [&replacement, &deleted, &late] {
-            for frame in frames.iter().rev() {
-                peer.receive(frame.clone()).await.unwrap();
-            }
-        }
-    }
-    for peer in &replicas {
-        let rows = sql(peer, &[fixture.items])
-            .await
-            .run(
-                "SELECT id,title,row_kind FROM items WHERE row_kind=0",
-                vec![],
-            )
-            .await
-            .unwrap()
-            .rows;
-        assert_eq!(
-            rows,
-            vec![vec![
-                SqlValue::Integer(second.integer()),
-                text("replacement"),
-                SqlValue::Integer(0)
-            ]]
-        );
-        let checkpoint = compacted_base(peer, &fixture.publisher, fixture.items).await;
-        assert_eq!(
-            checkpoint
-                .statement
-                .identities
-                .iter()
-                .find(|mark| mark.author == 41)
-                .unwrap()
-                .sequence,
-            2
-        );
-    }
-    // A fresh replica bootstraps incarnations and permanent marks, including tombstones.
-    let fresh_node = PrivateKey::new();
-    let fresh = fixture
-        .open(
-            &directory.path().join("fresh.sqlite"),
-            &fresh_node,
-            fixture.full(),
-            &[fixture.items, fixture.salaries],
-        )
-        .await;
-    let signed = compacted_base(&replicas[0], &fixture.publisher, fixture.items).await;
-    let checkpoint_id = signed.id().unwrap();
-    link_up(&replicas[0], &fresh, fixture.items.domain).await;
-    fresh.begin_rebootstrap(signed).await.unwrap();
-    let credentials = fixture.credentials(&fresh_node, fixture.full());
-    let mut after = None;
-    loop {
-        let page = replicas[0]
-            .checkpoint_page(
-                fresh_node.public_key(),
-                &credentials,
-                fixture.items,
-                checkpoint_id,
-                after,
-                crate::MAX_SECURE_FRAME,
-            )
-            .await
-            .unwrap();
-        let next = page.next;
-        fresh.stage_checkpoint_page(page).await.unwrap();
-        if next.is_none() {
-            break;
-        }
-        after = next;
-    }
-    fresh.finish_rebootstrap(fixture.items).await.unwrap();
-    // The salaries scope's state at the seal is the source's verified base.
-    let imported = crate::tests::import_needed_bases(
-        &replicas[0],
-        &fresh,
-        &fresh_node,
-        &credentials,
-        fixture.items.domain,
-    )
-    .await;
-    assert_eq!(
-        imported
-            .iter()
-            .map(|signed| signed.statement.scope)
-            .collect::<Vec<_>>(),
-        vec![fixture.salaries]
-    );
-    assert_eq!(
-        imported[0].id().unwrap(),
-        replicas[0]
-            .checkpoint(fixture.salaries)
-            .await
-            .unwrap()
-            .id()
-            .unwrap()
-    );
-    assert_eq!(
-        sql(&fresh, &[fixture.items])
-            .await
-            .run("SELECT id,title FROM items", vec![])
-            .await
-            .unwrap()
-            .rows,
-        vec![vec![
-            SqlValue::Integer(second.integer()),
-            text("replacement")
-        ]]
-    );
-}
-
-#[tokio::test]
-async fn multi_frame_relinks_verify_the_final_sql_projection() {
-    let fixture = identity_fixture();
-    let directory = tempfile::tempdir().unwrap();
-    let node = PrivateKey::new();
-    let replica = fixture
-        .open_number(
-            &directory.path().join("many.sqlite"),
-            &node,
-            fixture.full(),
-            &[fixture.items, fixture.salaries],
-            55,
-        )
-        .await;
-    let writer = sql(&replica, &[fixture.items]).await;
-    writer.run("BEGIN", vec![]).await.unwrap();
-    for n in 0..20 {
-        let id = writer.next_id("items").await.unwrap();
-        writer
-            .run(
-                "INSERT INTO items(key,title,id) VALUES(?,'old',?)",
-                vec![text(&n.to_string()), SqlValue::Integer(id.integer())],
-            )
-            .await
-            .unwrap();
-    }
-    writer.run("COMMIT", vec![]).await.unwrap();
-    writer.run("BEGIN", vec![]).await.unwrap();
-    writer.run("DELETE FROM items", vec![]).await.unwrap();
-    for n in 0..20 {
-        let id = writer.next_id("items").await.unwrap();
-        writer
-            .run(
-                "INSERT INTO items(key,title,id) VALUES(?,'new',?)",
-                vec![text(&n.to_string()), SqlValue::Integer(id.integer())],
-            )
-            .await
-            .unwrap();
-    }
-    let frames = writer
-        .run("COMMIT", vec![])
-        .await
-        .unwrap()
-        .committed
-        .unwrap()
-        .frames;
-    assert!(frames.len() > 1);
-    compacted_base(&replica, &fixture.publisher, fixture.items).await;
-    replica.rebuild_projection(fixture.items).await.unwrap();
-    assert_eq!(
-        writer
-            .run(
-                "SELECT COUNT(*) FROM items WHERE title='new' AND row_kind=0",
-                vec![]
-            )
-            .await
-            .unwrap()
-            .rows,
-        vec![vec![SqlValue::Integer(20)]]
-    );
 }
 
 #[tokio::test]
@@ -2177,131 +1849,21 @@ async fn local_identity_columns_refuse_reserved_kinds_and_mutation() {
         .await
         .unwrap();
     for (statement, values) in [
-        ("UPDATE drafts SET row_kind=1", vec![]),
         (
             "UPDATE drafts SET id=?",
             vec![SqlValue::Integer(id.integer() + 1)],
         ),
         ("INSERT INTO drafts(id,body) VALUES(0,'virtual')", vec![]),
-        (
-            "INSERT INTO drafts(id,body,row_kind) VALUES(?,'puppet',2)",
-            vec![SqlValue::Integer(id.integer() + 2)],
-        ),
     ] {
         assert!(writer.run(statement, values).await.is_err());
     }
     assert_eq!(
         writer
-            .run("SELECT id,row_kind FROM drafts", vec![])
+            .run("SELECT id FROM drafts", vec![])
             .await
             .unwrap()
             .rows,
-        vec![vec![SqlValue::Integer(id.integer()), SqlValue::Integer(0)]]
-    );
-}
-
-#[tokio::test]
-async fn incarnation_key_index_reopens_and_tracks_rebuild_and_eviction() {
-    let fixture = identity_fixture();
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("indexed.sqlite");
-    let node = PrivateKey::new();
-    let replica = fixture
-        .open_number(
-            &path,
-            &node,
-            fixture.full(),
-            &[fixture.items, fixture.salaries],
-            71,
-        )
-        .await;
-    let writer = sql(&replica, &[fixture.items]).await;
-    for title in ["old", "replacement"] {
-        writer.run("BEGIN", vec![]).await.unwrap();
-        writer.run("DELETE FROM items", vec![]).await.unwrap();
-        let id = writer.next_id("items").await.unwrap();
-        writer
-            .run(
-                "INSERT INTO items(key,title,id) VALUES('key',?,?)",
-                vec![text(title), SqlValue::Integer(id.integer())],
-            )
-            .await
-            .unwrap();
-        writer.run("COMMIT", vec![]).await.unwrap();
-    }
-    {
-        let inner = replica.inner.lock(crate::replica::Class::Background).await;
-        let indexed = collect_rows(
-            inner
-                .conn
-                .query("SELECT key FROM secure_row_keys", ())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(indexed.len(), 2, "tombstones remain indexed");
-        assert_eq!(
-            indexed[0], indexed[1],
-            "both incarnations share the business key"
-        );
-        let plan = collect_rows(inner.conn.query(
-            "EXPLAIN QUERY PLAN SELECT r.row,r.fields FROM secure_row_keys k JOIN secure_rows r ON r.scope=k.scope AND r.row=k.row WHERE k.scope=(SELECT id FROM secure_scope_state WHERE scope=?) AND k.key=? AND k.row>? ORDER BY k.row LIMIT 256",
-            [encode(&fixture.items).unwrap(), vec![0; 16], Vec::new()],
-        ).await.unwrap()).await.unwrap();
-        assert!(plan.iter().any(|row| row.iter().any(|value| matches!(value, SqlValue::Text(detail) if detail.contains("secure_row_keys_key") && detail.contains("scope=? AND key=? AND row>?")))), "{plan:?}");
-    }
-    drop(writer);
-    drop(replica);
-    let reopened = fixture
-        .open_number(
-            &path,
-            &node,
-            fixture.full(),
-            &[fixture.items, fixture.salaries],
-            71,
-        )
-        .await;
-    reopened.rebuild_projection(fixture.items).await.unwrap();
-    assert_eq!(
-        sql(&reopened, &[fixture.items])
-            .await
-            .run("SELECT title FROM items", vec![])
-            .await
-            .unwrap()
-            .rows,
-        vec![vec![text("replacement")]]
-    );
-    let inner = reopened.inner.lock(crate::replica::Class::Background).await;
-    let indexed = collect_rows(
-        inner
-            .conn
-            .query("SELECT key FROM secure_row_keys", ())
-            .await
-            .unwrap(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(indexed.len(), 2);
-    inner
-        .conn
-        .execute(
-            "DELETE FROM secure_row_records WHERE scope=?",
-            [encode(&fixture.items).unwrap()],
-        )
-        .await
-        .unwrap();
-    assert!(
-        collect_rows(
-            inner
-                .conn
-                .query("SELECT key FROM secure_row_keys", ())
-                .await
-                .unwrap()
-        )
-        .await
-        .unwrap()
-        .is_empty()
+        vec![vec![SqlValue::Integer(id.integer())]]
     );
 }
 
@@ -2411,9 +1973,11 @@ async fn two_nodes_of_one_principal_write_every_table_and_refuse_number_changes(
     }
     assert_ne!(ids[0].0, ids[1].0);
     assert_ne!(ids[0].1, ids[1].1);
+    // The second's writes follow the outcome records it published for the
+    // first's transaction, which the first never receives.
     assert_eq!(
         select(
-            &sql(&first, &[fixture.items]).await,
+            &sql(&second, &[fixture.items]).await,
             "SELECT count(*) FROM items"
         )
         .await,
@@ -2467,7 +2031,7 @@ async fn two_nodes_of_one_principal_write_every_table_and_refuse_number_changes(
 #[tokio::test]
 async fn cursor_readiness_and_snapshot_do_not_wait_for_the_writer_lease() {
     use crate::cursor::CursorLimits;
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let replica = t
         .open(
@@ -2502,7 +2066,7 @@ async fn cursor_readiness_and_snapshot_do_not_wait_for_the_writer_lease() {
 
 #[tokio::test]
 async fn ordinary_sql_commits_do_not_restart_held_history_scans() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let replica = t
         .open(
@@ -2536,7 +2100,7 @@ async fn ordinary_sql_commits_do_not_restart_held_history_scans() {
 #[cfg(feature = "qualification")]
 #[tokio::test]
 async fn sql_begin_and_writing_autocommit_are_interactive() {
-    let t = Typed::new(UpdatePolicy::Changed);
+    let t = Typed::new();
     let directory = TempDir::new().unwrap();
     let replica = t
         .open(
@@ -2579,7 +2143,7 @@ async fn sql_begin_and_writing_autocommit_are_interactive() {
 async fn a_cursor_racing_a_commit_reads_once_readers_are_refreshed() {
     use crate::cursor::CursorLimits;
     let directory = TempDir::new().unwrap();
-    let fixture = Typed::new(UpdatePolicy::Changed);
+    let fixture = Typed::new();
     let replica = fixture
         .open(
             &directory.path().join("race.db"),

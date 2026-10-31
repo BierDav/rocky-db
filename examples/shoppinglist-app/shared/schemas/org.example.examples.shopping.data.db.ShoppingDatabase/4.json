@@ -6,7 +6,7 @@
     "entities": [
       {
         "tableName": "lists",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `title` TEXT NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `title` TEXT NOT NULL, PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -19,12 +19,6 @@
             "columnName": "title",
             "affinity": "TEXT",
             "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
-            "affinity": "INTEGER",
-            "notNull": true
           }
         ],
         "primaryKey": {
@@ -36,7 +30,7 @@
       },
       {
         "tableName": "categories",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `id` INTEGER NOT NULL, `name` TEXT NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`list`, `id`), FOREIGN KEY(`list`) REFERENCES `lists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `id` INTEGER NOT NULL, `name` TEXT NOT NULL, PRIMARY KEY(`list`, `id`), FOREIGN KEY(`list`) REFERENCES `lists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
         "fields": [
           {
             "fieldPath": "list",
@@ -54,12 +48,6 @@
             "fieldPath": "name",
             "columnName": "name",
             "affinity": "TEXT",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
-            "affinity": "INTEGER",
             "notNull": true
           }
         ],
@@ -86,7 +74,7 @@
       },
       {
         "tableName": "items",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `key` TEXT NOT NULL, `title` TEXT NOT NULL, `completed` INTEGER NOT NULL, `category` INTEGER, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`list`, `key`), FOREIGN KEY(`list`) REFERENCES `lists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY(`list`, `category`) REFERENCES `categories`(`list`, `id`) ON UPDATE NO ACTION ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`list` INTEGER NOT NULL, `key` TEXT NOT NULL, `title` TEXT NOT NULL, `completed` INTEGER NOT NULL, `category` INTEGER, `id` INTEGER NOT NULL, PRIMARY KEY(`list`, `key`), FOREIGN KEY(`list`) REFERENCES `lists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY(`list`, `category`) REFERENCES `categories`(`list`, `id`) ON UPDATE NO ACTION ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED)",
         "fields": [
           {
             "fieldPath": "list",
@@ -120,12 +108,6 @@
           {
             "fieldPath": "id",
             "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
             "affinity": "INTEGER",
             "notNull": true
           }
@@ -198,7 +180,7 @@
       },
       {
         "tableName": "devices",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`node` TEXT NOT NULL, `name` TEXT NOT NULL, `kind` TEXT NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`node`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`node` TEXT NOT NULL, `name` TEXT NOT NULL, `kind` TEXT NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`node`))",
         "fields": [
           {
             "fieldPath": "node",
@@ -223,12 +205,6 @@
             "columnName": "id",
             "affinity": "INTEGER",
             "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
-            "affinity": "INTEGER",
-            "notNull": true
           }
         ],
         "primaryKey": {
@@ -251,7 +227,7 @@
       },
       {
         "tableName": "keys",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`recipient` TEXT NOT NULL, `list` INTEGER NOT NULL, `epoch` INTEGER NOT NULL, `envelope` BLOB NOT NULL, `id` INTEGER NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`recipient`, `list`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`recipient` TEXT NOT NULL, `list` INTEGER NOT NULL, `epoch` INTEGER NOT NULL, `envelope` BLOB NOT NULL, `id` INTEGER NOT NULL, PRIMARY KEY(`recipient`, `list`))",
         "fields": [
           {
             "fieldPath": "recipient",
@@ -280,12 +256,6 @@
           {
             "fieldPath": "id",
             "columnName": "id",
-            "affinity": "INTEGER",
-            "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
             "affinity": "INTEGER",
             "notNull": true
           }

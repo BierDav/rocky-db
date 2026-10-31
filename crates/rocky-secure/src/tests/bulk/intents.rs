@@ -25,7 +25,6 @@ pub(super) async fn staged(n: usize) -> Staged {
 
 pub(super) async fn staged_tags(n: usize, labels: usize) -> Staged {
     let mut l = Lineage::new();
-    l.replayed = true;
     l.partitioned = labels > 0;
     let dir = TempDir::new().unwrap();
     let key = PrivateKey::new();

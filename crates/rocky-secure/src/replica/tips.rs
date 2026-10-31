@@ -3,8 +3,8 @@ use super::*;
 pub(super) mod refresh;
 use rocky_core::Scope;
 use rocky_credentials::{
-    SealFinality, SignedBookmarkMove, SignedCarry, SignedCheckpointRecord, SignedGenesisLine,
-    SignedSeal, SignedTipOpening, TipGraph,
+    SealFinality, SignedBookmarkMove, SignedCheckpointRecord, SignedGenesisLine, SignedSeal,
+    SignedTipOpening, TipGraph,
 };
 
 /// Largest stored or exchanged tip statement: a finality record.
@@ -33,13 +33,6 @@ pub(super) fn graph_statements(graph: &TipGraph) -> Vec<TipStatement> {
                 .cloned()
                 .map(|record| TipStatement::Checkpoint(Box::new(record))),
         )
-        .chain(
-            graph
-                .carries
-                .iter()
-                .cloned()
-                .map(|record| TipStatement::Carry(Box::new(record))),
-        )
         .collect()
 }
 
@@ -60,8 +53,6 @@ pub enum TipStatement {
     GenesisLine(SignedGenesisLine),
     Finality(SealFinality),
     Checkpoint(Box<SignedCheckpointRecord>),
-    /// Where a carried coordinated write committed.
-    Carry(Box<SignedCarry>),
 }
 impl TipStatement {
     pub fn id(&self) -> Result<Commitment, Error> {
@@ -78,7 +69,6 @@ impl TipStatement {
             Self::GenesisLine(s) => s.id(),
             Self::Finality(s) => s.id(),
             Self::Checkpoint(s) => s.id(),
-            Self::Carry(s) => s.id(),
         }
         .map_err(credential)
     }
@@ -90,7 +80,6 @@ impl TipStatement {
             Self::GenesisLine(s) => s.statement.scope,
             Self::Finality(s) => s.scope,
             Self::Checkpoint(s) => s.statement.scope,
-            Self::Carry(s) => s.statement.scope,
         }
     }
     pub fn append(&self, graph: &mut TipGraph) {
@@ -101,7 +90,6 @@ impl TipStatement {
             Self::GenesisLine(s) => graph.genesis_lines.push(s.clone()),
             Self::Finality(s) => graph.finalities.push(s.clone()),
             Self::Checkpoint(s) => graph.checkpoints.push((**s).clone()),
-            Self::Carry(s) => graph.carries.push((**s).clone()),
         }
     }
     pub(in crate::replica) fn verify(
@@ -124,7 +112,6 @@ impl TipStatement {
             // Acknowledgments are checked against the signers' validity
             // when admitted; a stored record keeps counting until revoked.
             (Self::Finality(s), current) => graph.verify_finality(s, publisher, current),
-            (Self::Carry(s), current) => graph.verify_carry(s, publisher, current),
         }
         .map_err(credential)
     }
@@ -204,12 +191,8 @@ impl<A: RowApplication> Inner<A> {
             .cloned()
             .ok_or_else(|| denied("domain has no installed tip graph"))
     }
-    /// Where a stored or received frame belongs. A write the owner's
-    /// recovery abandoned is held for its author.
+    /// Where a stored or received frame belongs.
     pub(crate) fn frame_reach(&self, frame: &EncryptedFrame) -> Result<FrameReach, Error> {
-        if self.abandoned_write(frame)? {
-            return Ok(FrameReach::Held);
-        }
         let operation = frame.operation_ref()?;
         let extension = &operation.header.extensions;
         self.frame_reach_at(
@@ -844,13 +827,11 @@ impl<A: RowApplication> Inner<A> {
                 Some(seal) => path.contains(&seal),
                 None => true,
             };
-            // A scope that pruned nothing and released no existence records
-            // replays its own frames at a seal of the new path; another
-            // imports a checkpoint the graph lists at one.
+            // A scope that pruned nothing replays its own frames at a seal
+            // of the new path; another imports a checkpoint the graph lists
+            // at one.
             based &= on_path
-                || (self.scope_key(scope).is_ok()
-                    && !self.has_pruned_prefix(scope).await?
-                    && !self.existence_released(scope, &path).await?)
+                || (self.scope_key(scope).is_ok() && !self.has_pruned_prefix(scope).await?)
                 || !self.listed_at(graph, scope, &path)?.is_empty();
         }
         if based || self.held_seal(domain, start).await?.is_some() {
@@ -1046,7 +1027,7 @@ impl<A: RowApplication> Inner<A> {
     pub(super) async fn rebuild_tip_workspace(&mut self, domain: Scope) -> Result<(), Error> {
         self.index_inherited_held(domain).await?;
         // Finalized seals off the new path are undone by the rebuild.
-        self.revalidate_finalized(domain, false).await?;
+        let reopened = self.revalidate_finalized(domain, false).await?;
         let path = self
             .path_seals(domain)?
             .iter()
@@ -1079,13 +1060,19 @@ impl<A: RowApplication> Inner<A> {
         let rewind = self.rewind_seal(domain).await?;
         #[cfg(test)]
         let rewind = rewind.filter(|_| !self.rebuild_switches);
+        // A schema switch compiles every member again.
+        let mut replay = reopened || self.schema_switch_intent().await?.is_some();
+        let mut replayed = Vec::new();
         for (scope, id) in self.domain_scopes(domain).await? {
             if lost && self.base_off_path(scope, id).await? {
                 continue;
             }
-            // A replayed scope whose transactions all stay on the path, as
-            // across a migration's close, keeps its rows.
-            if self.replayed_scope(scope) && self.replayed_on_path(id).await? {
+            // Replayed scopes replay together once. One whose transactions
+            // all stay on the path, as across a migration's close, keeps its
+            // rows.
+            if self.replayed_scope(scope) {
+                replay |= !self.replayed_on_path(id).await?;
+                replayed.push((scope, id));
                 continue;
             }
             // Restoring a kept seal's rows replays only what followed it.
@@ -1099,17 +1086,7 @@ impl<A: RowApplication> Inner<A> {
                 {
                     self.rewound += 1;
                 }
-                let touched = self
-                    .rewind_rows(scope, id, at, i64::MAX, true, ledger)
-                    .await?;
-                let frontier = self
-                    .graph_for(domain)?
-                    .seal_by_id(rewind.seal)
-                    .map_err(credential)?
-                    .statement
-                    .frontier
-                    .clone();
-                self.rebuild_existence_beyond(scope, &frontier, &touched)
+                self.rewind_rows(scope, id, at, i64::MAX, true, ledger)
                     .await?;
                 continue;
             }
@@ -1158,8 +1135,6 @@ impl<A: RowApplication> Inner<A> {
             self.tip_base = false;
             rebuilt?;
             if kept {
-                self.rebuild_tip_existence(scope).await?;
-                self.rebuild_constraints(Some(scope), None).await?;
                 continue;
             }
             for table in [
@@ -1172,8 +1147,22 @@ impl<A: RowApplication> Inner<A> {
                     .execute(format!("DELETE FROM {table} WHERE scope=?"), [id])
                     .await?;
             }
-            self.rebuild_tip_existence(scope).await?;
-            self.rebuild_constraints(Some(scope), None).await?;
+        }
+        eprintln!("DBG rebuild replay={replay} reopened={reopened} replayed={replayed:?}");
+        if replay {
+            // A kept seal's rows serve when every replayed scope may start
+            // there.
+            let mut kept = rewind.as_ref();
+            for (scope, id) in &replayed {
+                if kept.is_some() && !self.rewinds(*scope, *id).await? {
+                    kept = None;
+                }
+            }
+            #[cfg(test)]
+            if kept.is_some() {
+                self.rewound += replayed.len();
+            }
+            self.replay_from(now()?, kept).await?;
         }
         // A scope that still misses coverage the path's pulled state gives,
         // pruned prefix or not, installs it now.
@@ -1291,7 +1280,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
         self.check_statements(statements).await?;
         let batch = self.journal_tips(statements, false).await?;
         let coordinated = self
-            .coordinate_tip_statements(statements, &coordinated::NoPeers, false, false)
+            .coordinate_tip_statements(statements, false, false)
             .await?;
         self.admit_pending_tips(&coordinated.kept, Some(batch), &coordinated.deferred)
             .await
@@ -1375,9 +1364,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 &graphs[&statement.scope()],
                 Some((&inner.config.revocations, now()?)),
             )?;
-            if let TipStatement::Carry(carry) = statement {
-                inner.check_carry(carry).await?;
-            }
         }
         for (_, statement) in &new {
             if let TipStatement::Bookmark(movement) = statement
@@ -1433,22 +1419,8 @@ impl<A: RowApplication> EncryptedReplica<A> {
             if let Some((scope, name)) = old_followed.clone() {
                 inner.follow_resolved(scope, &name).await?;
             }
-            // Frames a carry record places move with it.
-            for (_, statement) in &new {
-                if let TipStatement::Carry(carry) = statement {
-                    inner.index_carry(carry).await?;
-                }
-            }
             // A finalized seal that lost a race is undone.
             if let Some((scope, _)) = old_followed.clone() {
-                // Writes the owner's recovery abandoned roll back, also once
-                // a carry record places a write in an abandoned range.
-                if new.iter().any(|(_, statement)| {
-                    matches!(statement, TipStatement::Seal(seal) if seal.statement.recovery.is_some())
-                        || matches!(statement, TipStatement::Carry(carry) if carry.statement.scope == scope)
-                }) {
-                    inner.roll_back_abandoned(scope).await?;
-                }
                 if !inner.seal_rebootstraps(scope).await?.is_empty()
                     && let Some(seal) =
                         history::bookmark_seal(inner.graph_for(scope)?, inner.workspace.tip)?
@@ -1678,24 +1650,13 @@ impl<A: RowApplication> EncryptedReplica<A> {
     }
     /// Admits this node's own statements. With a composed log, a seal or a
     /// move off an open tip first commits its digest as the tip's terminal
-    /// log entry, and an opening configures its tip's minimum; a lost entry
-    /// fails with `sealed` and nothing is published.
+    /// log entry; a lost entry fails with `sealed` and nothing is published.
+    /// With a composed log the batch is journaled, flushed, before its seals
+    /// reach the coordinator, and kept after a reply that may have been lost,
+    /// so `settle_tip_statements` sends the same bytes again.
     pub async fn publish_tip_statements(
         &self,
         statements: &[TipStatement],
-    ) -> Result<usize, Error> {
-        self.publish_tip_statements_through(statements, &coordinated::NoPeers)
-            .await
-    }
-    /// As `publish_tip_statements`; a node outside the in-sync set of a tip
-    /// it seals catches up and joins through `peers` first. With a composed
-    /// log the batch is journaled, flushed, before its seals reach the
-    /// coordinator, and kept after a reply that may have been lost, so
-    /// `settle_tip_statements` sends the same bytes again.
-    pub async fn publish_tip_statements_through(
-        &self,
-        statements: &[TipStatement],
-        peers: &dyn EntryPeers,
     ) -> Result<usize, Error> {
         let journaled = match self.domain_log().is_some()
             && statements
@@ -1712,10 +1673,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
             .lock(crate::replica::Class::Background)
             .await
             .publication_fault(1)?;
-        let coordinated = match self
-            .coordinate_tip_statements(statements, peers, true, true)
-            .await
-        {
+        let coordinated = match self.coordinate_tip_statements(statements, true, true).await {
             Ok(coordinated) => coordinated,
             Err(error) => {
                 let unconfirmed = match &error {
@@ -1724,7 +1682,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 };
                 return Err(match unconfirmed {
                     Some(unconfirmed) => {
-                        coordinated::abandoned::refusal(unconfirmed.code, &unconfirmed.message)
+                        coordinated::refusal(unconfirmed.code, &unconfirmed.message)
                     }
                     None => error,
                 });
@@ -1755,7 +1713,6 @@ pub(super) struct StoredHeader {
     pub(super) scope: ResourceScope,
     pub(super) author: Option<u32>,
     pub(super) author_sequence: u64,
-    pub(super) existence: u32,
 }
 
 #[cfg(test)]
@@ -1813,7 +1770,6 @@ impl<A: RowApplication> Inner<A> {
             scope: e.scope,
             author: e.author,
             author_sequence: e.author_sequence,
-            existence: e.existence,
         };
         self.frontier_headers
             .lock()
@@ -1867,5 +1823,29 @@ impl FramePath {
             PathEnd::Hidden => Ok(false),
             PathEnd::Cyclic => Err(denied("cyclic tip graph")),
         }
+    }
+}
+
+impl<A: RowApplication> Inner<A> {
+    #[cfg(test)]
+    pub(in crate::replica) fn publication_fault(&mut self, step: u8) -> Result<(), Error> {
+        if self.publication_fault == Some(step) {
+            self.publication_fault = None;
+            return Err(Error::InjectedFailure);
+        }
+        Ok(())
+    }
+    #[cfg(not(test))]
+    pub(in crate::replica) fn publication_fault(&mut self, _step: u8) -> Result<(), Error> {
+        Ok(())
+    }
+}
+impl<A: RowApplication> EncryptedReplica<A> {
+    #[cfg(test)]
+    pub(crate) async fn fail_publication_after(&self, step: u8) {
+        self.inner
+            .lock(crate::replica::Class::Background)
+            .await
+            .publication_fault = Some(step);
     }
 }

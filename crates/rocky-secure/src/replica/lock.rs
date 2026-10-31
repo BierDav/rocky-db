@@ -179,8 +179,6 @@ impl<T> ReplicaLock<T> {
                     units: Vec::new(),
                     #[cfg(any(test, feature = "qualification"))]
                     normal_rows: super::group::APPLICATION_ROWS,
-                    #[cfg(any(test, feature = "qualification"))]
-                    input_rows: 1,
                 },
             }
         }
@@ -232,7 +230,7 @@ pub(crate) struct Guard<G> {
     guard: G,
     _timing: Hold,
     #[cfg(any(test, feature = "qualification"))]
-    work_start: [u64; 18],
+    work_start: [u64; 17],
 }
 struct Hold {
     site: &'static Location<'static>,
@@ -249,14 +247,11 @@ struct Hold {
     units: Vec<(&'static str, u64)>,
     #[cfg(any(test, feature = "qualification"))]
     normal_rows: u64,
-    #[cfg(any(test, feature = "qualification"))]
-    input_rows: u64,
 }
 #[cfg(any(test, feature = "qualification"))]
 impl<G> Guard<G> {
-    pub(crate) fn row_work(&mut self, bound: u64, inputs: u64) {
+    pub(crate) fn row_work(&mut self, bound: u64) {
         self._timing.normal_rows = bound;
-        self._timing.input_rows = inputs;
     }
 }
 #[cfg(any(test, feature = "qualification"))]
@@ -275,7 +270,6 @@ impl<G> Drop for Guard<G> {
             "replayed_frame",
             "base_row",
             "checkpoint_row",
-            "constraint_dependent_row",
             "maintenance_record",
             "held_refresh_record",
             "held_refresh_frame",
@@ -331,7 +325,7 @@ impl Drop for Hold {
             (self.wait, hold),
             self.connection,
             &self.units,
-            (self.normal_rows, self.input_rows),
+            self.normal_rows,
         );
     }
 }
@@ -356,7 +350,7 @@ mod qualification {
     #[derive(Default)]
     struct Recording {
         data: std::sync::Mutex<Option<Measurements>>,
-        work: [std::sync::atomic::AtomicU64; 18],
+        work: [std::sync::atomic::AtomicU64; 17],
     }
     pub(crate) enum WorkUnit {
         #[cfg(feature = "qualification")]
@@ -364,21 +358,20 @@ mod qualification {
         BaseRow = 1,
         #[cfg(feature = "qualification")]
         CheckpointRow = 2,
-        DependentRow = 3,
-        MaintenanceRecord = 4,
-        HeldRefreshRecord = 5,
-        HeldRefreshFrame = 6,
-        HeldMemberFrame = 7,
-        HeldMemberRow = 8,
-        HeldTokenRecord = 9,
-        HeldPageRecord = 10,
-        ReceivedInputRow = 11,
-        HeldListingRow = 12,
-        MigrationStorageRecord = 13,
-        PruneCandidate = 14,
-        ReclaimedPage = 15,
-        DomainHeader = 16,
-        ScanFallback = 17,
+        MaintenanceRecord = 3,
+        HeldRefreshRecord = 4,
+        HeldRefreshFrame = 5,
+        HeldMemberFrame = 6,
+        HeldMemberRow = 7,
+        HeldTokenRecord = 8,
+        HeldPageRecord = 9,
+        ReceivedInputRow = 10,
+        HeldListingRow = 11,
+        MigrationStorageRecord = 12,
+        PruneCandidate = 13,
+        ReclaimedPage = 14,
+        DomainHeader = 15,
+        ScanFallback = 16,
     }
 
     #[derive(Default, Debug)]
@@ -394,10 +387,7 @@ mod qualification {
     pub struct HolderMeasurements {
         pub wait_us: Vec<u64>,
         pub hold_us: Vec<u64>,
-        /// Oversized dependent fan-out: (induced typed rows, full hold us).
-        /// These acquisitions are excluded from the ordinary hold histogram.
-        pub dependent_fanout_us: Vec<(u64, u64)>,
-        /// Existing indivisible-request exception, separate from induced fan-out.
+        /// Indivisible requests, excluded from the ordinary hold histogram.
         pub oversized_request_us: Vec<u64>,
         /// (work count, full acquisition hold in microseconds).
         pub units: BTreeMap<String, Vec<(u64, u64)>>,
@@ -423,7 +413,7 @@ mod qualification {
                 measurements.interactive_steps.push(steps);
             }
         }
-        pub(crate) fn work_snapshot(&self) -> [u64; 18] {
+        pub(crate) fn work_snapshot(&self) -> [u64; 17] {
             std::array::from_fn(|index| {
                 self.0.work[index].load(std::sync::atomic::Ordering::Relaxed)
             })
@@ -461,7 +451,7 @@ mod qualification {
             (wait, hold): (Duration, Duration),
             connection: Option<u64>,
             units: &[(&str, u64)],
-            (normal_rows, input_rows): (u64, u64),
+            normal_rows: u64,
         ) {
             if let Some(measurements) = self
                 .0
@@ -475,22 +465,13 @@ mod qualification {
                     .entry((site.to_string(), format!("{class:?}")))
                     .or_default();
                 holder.wait_us.push(wait.as_micros() as u64);
-                let dependent = units
-                    .iter()
-                    .filter(|(unit, _)| *unit == "constraint_dependent_row")
-                    .map(|(_, count)| count)
-                    .sum::<u64>();
                 let oversized = units.iter().any(|(unit, count)| {
                     (*unit == "oversized_request" && *count > 0)
                         || (*unit == "held_member_row"
                             && *count > super::super::group::APPLICATION_ROWS)
                         || (*unit == "received_input_row" && *count > normal_rows)
                 });
-                if dependent > 0 && dependent.saturating_add(input_rows) > normal_rows {
-                    holder
-                        .dependent_fanout_us
-                        .push((dependent, hold.as_micros() as u64));
-                } else if oversized {
+                if oversized {
                     holder.oversized_request_us.push(hold.as_micros() as u64);
                 } else {
                     holder.hold_us.push(hold.as_micros() as u64);
@@ -619,7 +600,6 @@ mod tests {
         let mut guard = mutex.lock(Class::Background).await;
         guard._timing.acquired -= Duration::from_millis(2);
         measurements.work(WorkUnit::BaseRow, 7);
-        measurements.work(WorkUnit::DependentRow, 4);
         drop(guard);
         let line = line!() + 1;
         let future = mutex.lock_owned(Class::Interactive);
@@ -636,9 +616,7 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].0, 7);
         assert!(samples[0].1 >= 2000);
-        assert!(background.hold_us.is_empty());
-        assert_eq!(background.dependent_fanout_us.len(), 1);
-        assert_eq!(background.dependent_fanout_us[0].0, 4);
+        assert_eq!(background.hold_us.len(), 1);
         let interactive = snapshot
             .holders
             .iter()
@@ -646,7 +624,6 @@ mod tests {
             .unwrap();
         assert!(interactive.0.0.contains(&format!("lock.rs:{line}:")));
         assert_eq!(interactive.1.hold_us.len(), 1);
-        assert!(interactive.1.dependent_fanout_us.is_empty());
         assert!(measurements.take().holders.is_empty());
     }
     #[tokio::test]
@@ -665,7 +642,6 @@ mod tests {
         assert_eq!(holder.wait_us.len(), 2);
         assert_eq!(holder.hold_us.len(), 1);
         assert_eq!(holder.oversized_request_us.len(), 1);
-        assert!(holder.dependent_fanout_us.is_empty());
     }
 
     fn order() -> (

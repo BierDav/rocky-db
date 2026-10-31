@@ -54,16 +54,6 @@ class RockyClient(private val transport: Transport) {
             put("partition_values", partitionValues)
         },
     ).getValue("id").jsonPrimitive.content
-    suspend fun moveRow(handle: JsonArray, table: String, id: String, from: JsonArray, to: JsonArray, changes: JsonArray = JsonArray(emptyList())): JsonObject = call(
-        request("move_row") {
-            put("handle", handle)
-            put("table", table)
-            put("id", id)
-            put("from", from)
-            put("to", to)
-            put("changes", changes)
-        },
-    )
     val partitions: Partitions get() = Partitions(this)
     val tips: Tips get() = Tips(this)
     suspend fun sql(statement: String, values: JsonArray = JsonArray(emptyList())): JsonObject = call(

@@ -311,7 +311,7 @@ async fn a_branch_writes_under_its_own_node_and_keeps_it_across_reopen() -> Resu
     assert!(tips(&a, "drop", json!({"tip": main_tip})).await.is_err());
     // Dropping would lose writes no other device holds yet.
     let unsent = message(tips(&a, "drop", json!({"tip": dev})).await.unwrap_err());
-    assert!(unsent.contains("evidence"), "{unsent}");
+    assert!(unsent.contains("acknowledged custody"), "{unsent}");
     let nodes = ok(&a, "inspect", json!({})).await["nodes"].clone();
     assert!(
         nodes[0]["kept_tips"]
@@ -324,7 +324,7 @@ async fn a_branch_writes_under_its_own_node_and_keeps_it_across_reopen() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn moving_main_back_closes_its_tip_and_holds_the_abandoned_writes() -> Result<(), Failure> {
+async fn moving_main_back_closes_its_tip_and_withdraws_the_abandoned_writes() -> Result<(), Failure> {
     let root = tempfile::tempdir()?;
     let a = Device::create(root.path(), None)?;
     let genesis = main(&a).await["tip"].as_str().ok_or("tip")?.to_owned();
@@ -345,7 +345,9 @@ async fn moving_main_back_closes_its_tip_and_holds_the_abandoned_writes() -> Res
         "close"
     );
     assert_eq!(a.titles().await, ["kept"]);
-    assert_eq!(a.ok(json!({"type": "held_changes"})).await["count"], 1);
+    // Intents have no rows to re-author: the abandoned write goes with its
+    // line.
+    assert_eq!(a.ok(json!({"type": "held_changes"})).await["count"], 0);
     a.add(3, "rewritten").await;
     assert_eq!(a.titles().await, ["kept", "rewritten"]);
     Ok(())
@@ -884,7 +886,7 @@ mod trusted {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_trusted_identity_moves_main_back_and_the_abandoned_writes_are_held()
+    async fn a_trusted_identity_moves_main_back_and_the_abandoned_writes_are_withdrawn()
     -> Result<(), Failure> {
         let house = household(2).await?;
         let owner = &house.owner;
@@ -918,7 +920,7 @@ mod trusted {
             assert_eq!(ok(device, "status", json!({})).await["tip"], back);
             assert_eq!(device.titles().await, ["before"]);
             let held = device.ok(json!({"type": "held_changes"})).await;
-            assert!(held["count"].as_u64() >= Some(1), "{held}");
+            assert_eq!(held["count"], 0, "{held}");
         }
         Ok(())
     }
@@ -1141,10 +1143,10 @@ mod races {
             );
             assert_eq!(seal_by_id(&inspection, &forward)["authority"], "trusted");
         }
-        // The forward write is held on every device that holds it.
+        // The forward write went with its line: intents hold nothing.
         for device in [trusted, owner] {
             let held = device.ok(json!({"type": "held_changes"})).await;
-            assert!(held["count"].as_u64() >= Some(1), "{held}");
+            assert_eq!(held["count"], 0, "{held}");
         }
         Ok(())
     }
@@ -1180,7 +1182,7 @@ mod races {
 
         // Revoking the winner's trusted grant leaves its seal and move out of
         // resolution: every device follows the other continuation, and the
-        // write on the revoked one returns as a held change.
+        // write on the revoked one goes with it.
         owner
             .ok(json!({"type": "revoke", "trust": house.grants[winner]["capability"]}))
             .await;
@@ -1199,7 +1201,7 @@ mod races {
             assert_eq!(seal_by_id(&inspection, &next)["tip"], tip);
         }
         let held = member.ok(json!({"type": "held_changes"})).await;
-        assert_eq!(held["count"], 1, "{held}");
+        assert_eq!(held["count"], 0, "{held}");
         Ok(())
     }
 }
@@ -1341,6 +1343,15 @@ async fn an_issuer_automatically_acquires_the_target_seal_when_main_changes_line
         b.sync().await.expect("automatic target-state acquisition");
     }
     assert_eq!(ok(&b, "status", json!({})).await["tip"], branch);
+    {
+        let file = rusqlite::Connection::open_with_flags(b_dir.join("rocky.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        for sql in ["SELECT scope,position,hex(substr(hash,1,4)) FROM secure_applied", "SELECT scope,era,sealed,hex(substr(hash,1,4)),dropped FROM secure_replayed", "SELECT scope,position FROM secure_checkpoints", "SELECT id FROM secure_scope_state", "SELECT scope,count(*) FROM secure_replayed_base GROUP BY scope", "SELECT depth,hex(substr(seal,1,4)) FROM secure_finalized", "SELECT scope, depth, position FROM secure_seal_bounds"] {
+            let mut st = file.prepare(sql).unwrap();
+            let n = st.column_count();
+            let rows: Vec<Vec<String>> = st.query_map([], |r| Ok((0..n).map(|i| format!("{:?}", r.get_ref(i).unwrap())).collect())).unwrap().map(|r| r.unwrap()).collect();
+            eprintln!("DBG {sql}: {rows:?}");
+        }
+    }
     assert_eq!(b.titles().await, ["inherited"]);
     b.add(3, "issuer continues").await;
     for _ in 0..2 {

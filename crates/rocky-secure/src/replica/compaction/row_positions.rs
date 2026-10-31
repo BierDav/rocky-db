@@ -129,6 +129,10 @@ impl<A: RowApplication> Inner<A> {
         frame: &EncryptedFrame,
         payload: &RowPayload,
     ) -> Result<(BTreeSet<Commitment>, Vec<checkpoint::IdentityMark>), Error> {
+        // An intent writes no row images.
+        if payload.writes().is_empty() {
+            return Ok(Default::default());
+        }
         let manifest = self.manifest_of_tip(frame.operation_ref()?.header.extensions.tip)?;
         let owned;
         let application: &dyn RowApplication = if manifest == self.manifest {

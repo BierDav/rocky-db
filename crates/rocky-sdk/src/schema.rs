@@ -13,8 +13,6 @@ pub struct Schema {
     pub views: Vec<rocky_core::LogicalView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertions: Vec<rocky_core::LogicalAssertion>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub update_policy: Option<rocky_core::UpdatePolicy>,
     /// SQL the first issuer to sign the schema's generation runs once, after
     /// signing it; see `docs/runtime/generations.md#migrations`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -106,12 +104,7 @@ impl Schema {
                 .find_map(|step| match step {
                     MigrationStep::Insert { insert, .. }
                         if !self.tables.iter().any(|table| {
-                            table.name == *insert
-                                && matches!(
-                                    table.class,
-                                    rocky_core::TableClass::Mergeable
-                                        | rocky_core::TableClass::Replayed
-                                )
+                            table.name == *insert && table.class == rocky_core::TableClass::Replayed
                         }) =>
                     {
                         Some(insert)
@@ -120,7 +113,7 @@ impl Schema {
                 })
             {
                 return Err(format!(
-                    "a migration inserts into {table}, which is no mergeable or replayed table"
+                    "a migration inserts into {table}, which is no replayed table"
                 )
                 .into());
             }
@@ -156,22 +149,19 @@ impl Schema {
             })
             .collect()
     }
-    /// Each table follows one mergeable table that follows none.
+    /// Each table follows one replayed table that follows none.
     fn validate_granted_like(&self) -> Result<(), Failure> {
-        let mergeable = |name: &str| {
+        let replayed = |name: &str| {
             self.tables
                 .iter()
-                .any(|table| table.name == name && table.class == rocky_core::TableClass::Mergeable)
+                .any(|table| table.name == name && table.class == rocky_core::TableClass::Replayed)
         };
         let followers = self.granted_like();
         for (table, like) in &followers {
-            if table == like
-                || !mergeable(table)
-                || !mergeable(like)
-                || followers.contains_key(like)
+            if table == like || !replayed(table) || !replayed(like) || followers.contains_key(like)
             {
                 return Err(format!(
-                    "{table} cannot be granted like {like}: both must be distinct mergeable tables, and {like} granted like none"
+                    "{table} cannot be granted like {like}: both must be distinct replayed tables, and {like} granted like none"
                 )
                 .into());
             }
@@ -183,9 +173,6 @@ impl Schema {
             format: self.format,
             publisher: data_encoding::HEXLOWER.encode(&publisher),
             application: self.application.clone(),
-            update_policy: self
-                .update_policy
-                .unwrap_or(rocky_core::UpdatePolicy::Changed),
             views: self.views.clone(),
             assertions: self.assertions.clone(),
             tables: self.tables.clone(),
@@ -210,7 +197,6 @@ impl Schema {
             tables: Vec::new(),
             views: Vec::new(),
             assertions: Vec::new(),
-            update_policy: None,
             migrations: Vec::new(),
         })
     }
@@ -233,23 +219,15 @@ impl SchemaBuilder {
         self.0.assertions.push(assertion);
         self
     }
-    #[must_use]
-    pub fn update_policy(mut self, policy: rocky_core::UpdatePolicy) -> Self {
-        self.0.update_policy = Some(policy);
-        self
-    }
     pub fn build(self) -> Result<Schema, Failure> {
         Schema::parse(&serde_json::to_string(&self.0)?)
     }
 }
 
-/// A typed table has Rocky-managed `id` and `row_kind` columns. Use
+/// A typed table has a Rocky-managed `id` column. Use
 /// `primary_key` to declare a natural key instead.
 pub struct Table(rocky_core::TableDefinition);
 impl Table {
-    pub fn mergeable(name: impl Into<String>) -> Self {
-        Self::of(name, rocky_core::TableClass::Mergeable)
-    }
     /// Replicates each transaction's statements; replicas replay them in
     /// canonical order and drop a transaction whose replay fails.
     pub fn replayed(name: impl Into<String>) -> Self {
@@ -260,7 +238,6 @@ impl Table {
             name: name.into(),
             granted_like: None,
             class,
-            coordinated: false,
             columns: Vec::new(),
             checks: Vec::new(),
             primary_key: vec!["id".into()],
@@ -268,7 +245,6 @@ impl Table {
             partition_group: None,
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
-            existence_log: false,
         })
     }
     #[must_use]

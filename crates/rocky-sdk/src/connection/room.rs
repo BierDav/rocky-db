@@ -528,7 +528,7 @@ impl Housekeeping {
 }
 
 /// Refuses an entity Room would let assign row ids, or one without the
-/// `id` and `row_kind` fields every Rocky table has. `columns` follow the
+/// `id` field every Rocky table has. `columns` follow the
 /// opening parenthesis of Room's `CREATE TABLE`.
 fn entity(table: &str, columns: &[&str]) -> Result<(), Failure> {
     if columns
@@ -559,16 +559,12 @@ fn entity(table: &str, columns: &[&str]) -> Result<(), Failure> {
         }
         starts = false;
     }
-    for field in ["id", "row_kind"] {
-        if !declared.iter().any(|name| name.eq_ignore_ascii_case(field)) {
-            return Err(failure(
-                code::ERROR,
-                format!(
-                    "Room entity {table} must declare Rocky's id and row_kind fields; it lacks {field}"
-                ),
-            )
-            .into());
-        }
+    if !declared.iter().any(|name| name.eq_ignore_ascii_case("id")) {
+        return Err(failure(
+            code::ERROR,
+            format!("Room entity {table} must declare Rocky's id field"),
+        )
+        .into());
     }
     Ok(())
 }

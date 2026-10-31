@@ -184,15 +184,6 @@ impl<A: RowApplication> Inner<A> {
 }
 impl<A: RowApplication> EncryptedReplica<A> {
     #[cfg(test)]
-    pub(crate) async fn checkpoint_header_verifications(&self) -> u64 {
-        self.inner
-            .lock(crate::replica::Class::Background)
-            .await
-            .crypto
-            .header_verifications
-            .load(Ordering::Relaxed)
-    }
-    #[cfg(test)]
     pub(crate) async fn crypto_stats(&self) -> (u64, u64) {
         let inner = self.inner.lock(crate::replica::Class::Background).await;
         (
@@ -278,7 +269,6 @@ mod tests {
                 row_format: crate::wire::ROW_FORMAT,
                 births: vec![],
                 partition: None,
-                existence: 0,
             },
         };
         header.sign(&key);

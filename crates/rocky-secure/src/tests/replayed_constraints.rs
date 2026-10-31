@@ -917,21 +917,6 @@ async fn foreign_keys_drop_orphans_and_cascades_rewind_with_their_transaction() 
     assert_eq!(expected.rows["members"].len(), 1);
     assert!(expected.rows["lines"].is_empty() && expected.rows["orders"].is_empty());
     assert_eq!(expected.dropped(), 3, "{expected:?}");
-    // No replayed path reaches the mergeable constraint resolver.
-    for device in devices.iter().chain([&receiver]) {
-        let inner = device
-            .replica
-            .inner
-            .lock(crate::replica::Class::Background)
-            .await;
-        assert!(!inner.resolves_constraints());
-        drop(inner);
-        assert_eq!(
-            device.replica.lock_measurements().work_snapshot()
-                [crate::replica::lock::WorkUnit::DependentRow as usize],
-            0
-        );
-    }
     // A transaction whose delete action reaches another of its members
     // could replay in another order: it is refused.
     let error = devices[0]
@@ -1122,37 +1107,4 @@ async fn statements_per_assertion_are_recorded() {
     .unwrap();
     println!("P5 replayed_row_records/max_undo_bytes {sizes:?}");
     assert_eq!(sizes[0][0], SqlValue::Integer(0));
-    drop(inner);
-    // The register record the same row costs a mergeable table.
-    let json = serde_json::json!({
-        "format": 6,
-        "application": "register-size",
-        "tables": [{"name": "ranges", "class": "mergeable",
-                    "columns": [{"name": "lo", "type": "integer", "not_null": true},
-                                {"name": "hi", "type": "integer", "not_null": true},
-                                {"name": "width", "type": "integer"}],
-                    "primary_key": ["id"]}]
-    });
-    let mergeable = Constrained::with(json, |_| {});
-    let device = mergeable.open(&root.path().join("register.db")).await;
-    device
-        .commit(
-            &mergeable,
-            &["INSERT INTO ranges(lo,hi,width,id) VALUES(1,2,3,#id)"],
-        )
-        .await
-        .unwrap();
-    let inner = device
-        .replica
-        .inner
-        .lock(crate::replica::Class::Background)
-        .await;
-    let register = crate::storage::rows(
-        &inner.conn,
-        "SELECT COUNT(*), MAX(length(fields)) FROM secure_rows",
-    )
-    .await
-    .unwrap();
-    println!("P5 register_records/max_record_bytes {register:?}");
-    assert_eq!(register[0][0], SqlValue::Integer(1));
 }

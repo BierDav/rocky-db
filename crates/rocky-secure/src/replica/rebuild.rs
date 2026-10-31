@@ -47,8 +47,12 @@ impl<A: RowApplication> Inner<A> {
     /// its verified checkpoint rows and a replay of the operations after
     /// them, in application order. Nothing but one batch is held in memory.
     pub(super) async fn rebuild_rows(&self, scope: ResourceScope) -> Result<(), Error> {
-        self.restore_rows(scope, i64::MAX).await?;
-        self.reproject(scope).await?;
+        if self.replayed_scope(scope) {
+            self.replay_from_frames(now()?).await?;
+        } else {
+            self.restore_rows(scope, i64::MAX).await?;
+            self.reproject(scope).await?;
+        }
         self.conn
             .execute(
                 "UPDATE secure_metadata SET revision=revision+1 WHERE id=1",

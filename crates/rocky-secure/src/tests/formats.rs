@@ -193,7 +193,7 @@ async fn unsupported_frames_leave_operation_projection_and_revision_unchanged() 
     )
     .await
     .unwrap();
-    for version in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15] {
+    for version in (0..crate::wire::ROW_FORMAT).chain([crate::wire::ROW_FORMAT + 1]) {
         let mut operation = frame.operation().unwrap();
         operation.header.extensions.row_format = version;
         operation.header.sign(&node);
@@ -268,7 +268,6 @@ async fn unsupported_payload_formats_refuse_before_custody_writes() {
         row_format: crate::wire::ROW_FORMAT,
         births: Vec::new(),
         partition: None,
-        existence: 0,
     };
     for (envelope_version, body_version, message) in [
         (0, 5, "unsupported creation witness format"),

@@ -215,8 +215,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
         let mut inner = self.inner.lock(crate::replica::Class::Background).await;
         let time = now()?;
         let scope = key.scope;
-        // Rows anchor only to parents whose partition this replica can open.
-        let opens = !inner.opening_keys().any(|held| held.scope == scope);
         if let Some(held) = inner.opening_key(key.scope, key.generation) {
             return if held.key == key.key {
                 Ok(())
@@ -268,23 +266,6 @@ impl<A: RowApplication> EncryptedReplica<A> {
         inner.bump_authority();
         drop(inner);
         self.settle().await?;
-        let mut inner = self.inner.lock(crate::replica::Class::Background).await;
-        // A key installed after the projection was built, as at open, anchors
-        // the children of this partition that were hidden without it.
-        if opens
-            && inner
-                .workspace
-                .typed
-                .as_ref()
-                .and_then(|typed| typed.constraints.as_ref())
-                .and_then(|constraints| constraints.node(scope))
-                .is_some()
-        {
-            transaction!(inner, |inner| Box::pin(
-                inner.rebuild_constraints(Some(scope), None)
-            )
-            .await)?;
-        }
         Ok(())
     }
     /// Drops an earlier key epoch from memory once no retained operation

@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "bf25a459f007c5f9005c4103e8ebf738",
+    "identityHash": "4fe76917bbc22cb4e892167988f6e563",
     "entities": [
       {
         "tableName": "parents",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `title` TEXT NOT NULL, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `title` TEXT NOT NULL, PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -19,12 +19,6 @@
             "columnName": "title",
             "affinity": "TEXT",
             "notNull": true
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
-            "affinity": "INTEGER",
-            "notNull": true
           }
         ],
         "primaryKey": {
@@ -36,7 +30,7 @@
       },
       {
         "tableName": "children",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `code` TEXT NOT NULL, `label` TEXT, `parent` INTEGER NOT NULL, `optional` INTEGER, `row_kind` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`parent`) REFERENCES `parents`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY(`optional`) REFERENCES `parents`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `code` TEXT NOT NULL, `label` TEXT, `parent` INTEGER NOT NULL, `optional` INTEGER, PRIMARY KEY(`id`), FOREIGN KEY(`parent`) REFERENCES `parents`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY(`optional`) REFERENCES `parents`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED)",
         "fields": [
           {
             "fieldPath": "id",
@@ -65,12 +59,6 @@
             "fieldPath": "optional",
             "columnName": "optional",
             "affinity": "INTEGER"
-          },
-          {
-            "fieldPath": "rowKind",
-            "columnName": "row_kind",
-            "affinity": "INTEGER",
-            "notNull": true
           }
         ],
         "primaryKey": {
@@ -145,7 +133,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'bf25a459f007c5f9005c4103e8ebf738')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '4fe76917bbc22cb4e892167988f6e563')"
     ]
   }
 }

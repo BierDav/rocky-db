@@ -1,6 +1,6 @@
 use super::*;
 use rocky_core::{
-    DomainId, PartitionSelection, PartitionSelector, PartitionTuple, PartitionValue, RowIdentity,
+    DomainId, PartitionSelection, PartitionSelector, PartitionTuple, PartitionValue,
     SchemaDefinition, SqlValue, TypedRows,
 };
 use rocky_credentials::{AuthorRange, Authority, PartitionGrant};
@@ -27,7 +27,7 @@ async fn database_bytes(replica: &EncryptedReplica<TypedRows>) -> i64 {
     pages * size
 }
 
-// Same row/existence/pruned_prefix sequence as rocky-sdk::sync::rows, over loopback TCP.
+// Same row/pruned_prefix sequence as rocky-sdk::sync::rows, over loopback TCP.
 async fn sync(
     writer: &EncryptedReplica<TypedRows>,
     reader: &EncryptedReplica<TypedRows>,
@@ -86,11 +86,6 @@ async fn sync(
                     break;
                 }
             }
-            if !exhausted {
-                for scope in reader.existence_scopes().await.unwrap() {
-                    session.sync_existence(reader, scope).await.unwrap();
-                }
-            }
             session.close().await.unwrap();
             (changed, exhausted)
         };
@@ -114,7 +109,7 @@ async fn assert_rows(replica: &EncryptedReplica<TypedRows>, names: &[&str], part
     for name in names {
         let rows = crate::storage::rows(
             &inner.conn,
-            &format!("SELECT count(*) FROM {name} WHERE row_kind=0"),
+            &format!("SELECT count(*) FROM {name}"),
         )
         .await
         .unwrap();
@@ -194,19 +189,10 @@ async fn measure(tables: usize, partitions: i64) {
     let register = started.elapsed();
     let metadata = (database_bytes(&writer).await - empty) as f64 / partitions as f64;
     let started = Instant::now();
-    writer
-        .author_bundle([0; 32], vec![f.write("products", 0)], vec![])
-        .await
-        .unwrap();
+    f.insert(&writer, 0, &["products"], [0; 32]).await;
     for partition in 1..=partitions {
-        writer
-            .author_bundle(
-                rocky_core::commitment("erp-bundle", &partition.to_be_bytes()),
-                names.iter().map(|name| f.write(name, partition)).collect(),
-                vec![],
-            )
-            .await
-            .unwrap();
+        let handle = rocky_core::commitment("erp-bundle", &partition.to_be_bytes());
+        f.insert(&writer, partition, &names, handle).await;
     }
     writer.flush().await.unwrap();
     let author = started.elapsed();
@@ -245,6 +231,9 @@ async fn measure(tables: usize, partitions: i64) {
     let started = Instant::now();
     assert_eq!(sync(&writer, &reader, &scopes).await.len(), scopes.len());
     let catch_up = started.elapsed();
+    // The reader, a writer of every partition, publishes an outcome record
+    // of each multi-table transaction it replayed; the next sync carries them.
+    assert!(!sync(&writer, &reader, &scopes).await.is_empty());
     let started = Instant::now();
     assert!(sync(&writer, &reader, &scopes).await.is_empty());
     let idle = started.elapsed();
@@ -345,8 +334,9 @@ async fn measure(tables: usize, partitions: i64) {
                 _ => None,
             })
             .unwrap_or(0);
-        assert_eq!(
-            count, 1,
+        // Its intent, and the outcome records replicas published for it.
+        assert!(
+            count >= 1,
             "actual authored and retained history of {scope:?}"
         );
         assert_eq!(report.operations, count);

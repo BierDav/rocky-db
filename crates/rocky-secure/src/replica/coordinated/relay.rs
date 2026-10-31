@@ -65,11 +65,7 @@ impl<A: RowApplication> Inner<A> {
 impl<A: RowApplication> EncryptedReplica<A> {
     /// Journals only the signed close before attempting its ordinary source terminal.
     /// No opening, move, schema, or migration frames are admitted by this API.
-    pub async fn relay_staged_close(
-        &self,
-        bytes: &[u8],
-        peers: &dyn EntryPeers,
-    ) -> Result<StagedCloseStatus, Error> {
+    pub async fn relay_staged_close(&self, bytes: &[u8]) -> Result<StagedCloseStatus, Error> {
         let seal = SignedSeal::from_bytes(bytes).map_err(credential)?;
         let id = seal.id().map_err(credential)?;
         {
@@ -175,19 +171,9 @@ impl<A: RowApplication> EncryptedReplica<A> {
         if head.terminal.is_some() || (dispatched && head.epoch == 0) {
             return self.staged_close_finality(bytes).await;
         }
-        // This path retains the source-following and applied-state checks.
-        // An empty source uses the coordinator's existing exception.
-        if head.commit > 0
-            && self
-                .join_to_seal(log, coordinator.as_ref(), peers)
-                .await
-                .is_err()
-        {
-            return Ok(StagedCloseStatus::Pending);
-        }
         {
             let mut inner = self.inner.lock(crate::replica::Class::Background).await;
-            // Recheck authority after catch-up, before marking dispatch durable.
+            // Recheck authority before marking dispatch durable.
             inner.relay_graph(&seal).await?;
             transaction!(inner, |inner| {
                 inner

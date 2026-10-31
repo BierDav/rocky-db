@@ -141,13 +141,11 @@ impl LogicalSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AppId, DomainId, MeshId, Profile, SchemaChange, SchemaDefinition, Unsupported, classify,
-    };
+    use crate::{AppId, DomainId, MeshId, Profile, SchemaChange, SchemaDefinition, classify};
     fn definition() -> SchemaDefinition {
         serde_json::from_value(serde_json::json!({"format":6,"publisher":"11".repeat(32),"application":"groups","tables":[
-            {"name":"lists","class":"mergeable","columns":[{"name":"title","type":"text"}],"primary_key":["id"],"partition_by":["id"],"partition_group":"list"},
-            {"name":"items","class":"mergeable","columns":[{"name":"list","type":"integer","not_null":true},{"name":"key","type":"text","not_null":true}],"primary_key":["list","key"],"partition_by":["list"],"partition_group":"list"}
+            {"name":"lists","class":"replayed","columns":[{"name":"title","type":"text"}],"primary_key":["id"],"partition_by":["id"],"partition_group":"list"},
+            {"name":"items","class":"replayed","columns":[{"name":"list","type":"integer","not_null":true},{"name":"key","type":"text","not_null":true}],"primary_key":["list","key"],"partition_by":["list"],"partition_group":"list"}
         ]})).unwrap()
     }
     fn domain() -> Scope {
@@ -160,7 +158,6 @@ mod tests {
     #[test]
     fn different_column_identities_share_group_address_and_install() {
         let schema = definition().build().unwrap();
-        schema.supported_on(Profile::Trusted).unwrap();
         schema.supported_on(Profile::Secure).unwrap();
         crate::TypedRows::new(schema.clone(), Vec::new()).unwrap();
         let a = schema
@@ -311,24 +308,23 @@ mod tests {
         assert!(def.build().is_err());
     }
     #[test]
-    fn generation_refuses_group_changes_but_new_tables_can_join() {
+    fn group_changes_and_new_tables_are_replicated_changes() {
         let old = definition().build().unwrap();
-        for name in [None, Some("renamed".into())] {
-            let mut def = definition();
-            for table in &mut def.tables {
-                table.partition_group = name.clone();
-            }
-            assert!(matches!(
-                classify(&old, &def.build().unwrap()),
-                Err(Unsupported::ChangedKey(_))
-            ));
+        let mut def = definition();
+        for table in &mut def.tables {
+            table.partition_group = Some("renamed".into());
         }
+        assert_eq!(
+            classify(&old, &def.build().unwrap()),
+            Ok(SchemaChange::Replicated)
+        );
         let mut def = definition();
         let mut child = def.tables[1].clone();
         child.name = "categories".into();
         def.tables.push(child);
-        assert!(
-            matches!(classify(&old,&def.build().unwrap()),Ok(SchemaChange::Additive { tables, .. }) if tables.contains("categories"))
+        assert_eq!(
+            classify(&old, &def.build().unwrap()),
+            Ok(SchemaChange::Replicated)
         );
     }
     #[test]

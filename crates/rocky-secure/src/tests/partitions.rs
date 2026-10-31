@@ -1,6 +1,6 @@
 use super::*;
 use rocky_core::{
-    DomainId, PartitionSelection, PartitionSelector, PartitionTuple, PartitionValue, RowIdentity,
+    DomainId, PartitionSelection, PartitionSelector, PartitionTuple, PartitionValue,
     SchemaDefinition, SqlValue, TypedRows,
 };
 use rocky_credentials::{AuthorRange, Authority, PartitionGrant};
@@ -24,13 +24,13 @@ impl Fixture {
         Self::build_with(constrained, PrivateKey::new())
     }
     fn build_with(constrained: bool, publisher: PrivateKey) -> Self {
-        Self::build_class(constrained, publisher, "mergeable")
+        Self::build_class(constrained, publisher, "replayed")
     }
     fn build_class(constrained: bool, publisher: PrivateKey, class: &str) -> Self {
         let mut definition = serde_json::json!({"format":6,"publisher":publisher.public_key().as_bytes().iter().map(|byte|format!("{byte:02x}")).collect::<String>(),"application":"partition-test","tables":[{"name":"items","class":class,"columns":[{"name":"list","type":"text","not_null":true},{"name":"key","type":"text","not_null":true},{"name":"amount","type":"integer","not_null":true}],"primary_key":["list","key"],"partition_by":["list"]}]});
         if constrained {
             definition["tables"][0]["columns"].as_array_mut().unwrap().push(serde_json::json!({"name":"title","type":"text","not_null":true,"collation":"nocase"}));
-            definition["tables"][0]["indexes"] = serde_json::json!([{"name":"items_title","columns":[{"name":"list","descending":false},{"name":"title","descending":false}],"unique":true,"on_conflict":"latest_wins"}]);
+            definition["tables"][0]["indexes"] = serde_json::json!([{"name":"items_title","columns":[{"name":"list","descending":false},{"name":"title","descending":false}],"unique":true}]);
         }
         let mut schema = SchemaDefinition::parse(&serde_json::to_vec(&definition).unwrap())
             .unwrap()
@@ -38,7 +38,7 @@ impl Fixture {
             .unwrap();
         schema.views.push(rocky_core::LogicalView {
             name: "partial_items".into(),
-            create_sql: "CREATE VIEW partial_items AS SELECT * FROM items WHERE row_kind=0".into(),
+            create_sql: "CREATE VIEW partial_items AS SELECT * FROM items WHERE amount>=0".into(),
         });
         schema.views.push(rocky_core::LogicalView {
             name: "nested_items".into(),
@@ -196,49 +196,59 @@ impl Fixture {
             .await
             .unwrap();
     }
-    fn write(&self, name: &str, sequence: u32, amount: i64) -> RowWrite {
-        let app = self.app();
-        let table = app.tables().next().unwrap();
-        let mut values = vec![
-            SqlValue::Text(name.into()),
-            SqlValue::Text(format!("key{sequence}")),
-            SqlValue::Integer(amount),
-            SqlValue::Integer(RowIdentity::new(1, sequence).unwrap().integer()),
-            SqlValue::Integer(0),
-        ];
-        if self
-            .schema
-            .table("items")
-            .unwrap()
-            .column("title")
-            .is_some()
-        {
-            values.insert(3, SqlValue::Text("Milk".into()));
-        }
-        RowWrite::changed(RowChange {
-            scope: self.scope(name),
-            row: app.row_id(self.domain.domain, table, &values).unwrap(),
-            before: None,
-            after: Some(app.fields(table, &values).unwrap()),
-        })
-    }
-    fn titled(&self, name: &str, sequence: u32, author: u32, title: &str) -> RowWrite {
-        let mut write = self.write(name, sequence, 10);
-        let app = self.app();
-        let table = app.tables().next().unwrap();
-        let mut values = app
-            .values(table, write.change.after.as_ref().unwrap())
-            .unwrap();
-        values[1] = SqlValue::Text(format!("key{sequence}-author{author}"));
-        values[3] = SqlValue::Text(title.into());
-        values[4] = SqlValue::Integer(RowIdentity::new(author, sequence).unwrap().integer());
-        write.change.row = app.row_id(self.domain.domain, table, &values).unwrap();
-        write.change.after = Some(app.fields(table, &values).unwrap());
-        write
-    }
 }
 mod admission;
 mod replayed;
+
+async fn sql_on(
+    f: &Fixture,
+    replica: &EncryptedReplica<TypedRows>,
+    names: &[&str],
+) -> crate::SecureSql<TypedRows> {
+    replica
+        .session(names.iter().map(|name| f.scope(name)).collect())
+        .await
+        .unwrap()
+        .sql(Default::default())
+        .await
+        .unwrap()
+}
+
+/// Inserts `(list, key, amount)` rows in one transaction.
+async fn insert(
+    f: &Fixture,
+    replica: &EncryptedReplica<TypedRows>,
+    names: &[&str],
+    rows: &[(&str, &str, i64)],
+    handle: u8,
+) -> Vec<EncryptedFrame> {
+    let sql = sql_on(f, replica, names).await;
+    sql.run("BEGIN", vec![]).await.unwrap();
+    for (list, key, amount) in rows {
+        let id = sql
+            .next_id_partition("items", &[SqlValue::Text((*list).into())])
+            .await
+            .unwrap()
+            .integer();
+        sql.run(
+            "INSERT INTO items(list,key,amount,id) VALUES(?,?,?,?)",
+            vec![
+                SqlValue::Text((*list).into()),
+                SqlValue::Text((*key).into()),
+                SqlValue::Integer(*amount),
+                SqlValue::Integer(id),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    sql.commit([handle; 32])
+        .await
+        .unwrap()
+        .committed
+        .unwrap()
+        .frames
+}
 
 fn all() -> Vec<Right> {
     vec![
@@ -271,10 +281,8 @@ async fn a_future_import_does_not_make_verified_empty_partition_history_missing(
         .await
         .unwrap();
     f.key(&replica, "A", [1; 32]).await;
-    let frame = replica
-        .author_bundle([1; 32], vec![f.write("A", 1, 10)], vec![])
+    let frame = insert(&f, &replica, &["A"], &[("A", "one", 10)], 1)
         .await
-        .unwrap()
         .remove(0);
     seal_main(&replica, &f.publisher, f.domain).await;
     replica.finalize_path(f.domain).await.unwrap();
@@ -315,7 +323,7 @@ async fn a_future_import_does_not_make_verified_empty_partition_history_missing(
         .unwrap();
     let sql = session.sql(Default::default()).await.unwrap();
     assert_eq!(
-        sql.run("SELECT count(*) FROM items WHERE row_kind=0", vec![])
+        sql.run("SELECT count(*) FROM items", vec![])
             .await
             .unwrap()
             .rows[0][0],
@@ -350,10 +358,7 @@ async fn a_future_import_does_not_make_verified_empty_partition_history_missing(
             .is_some()
     );
     f.key(&replica, "C", [3; 32]).await;
-    replica
-        .author_bundle([2; 32], vec![f.write("C", 2, 20)], vec![])
-        .await
-        .unwrap();
+    insert(&f, &replica, &["C"], &[("C", "two", 20)], 2).await;
     seal_main(&replica, &f.publisher, f.domain).await;
     exchange_graphs(&replica, &missing, f.domain).await;
     f.key(&missing, "B", [2; 32]).await;
@@ -408,7 +413,7 @@ async fn unrelated_partition_recovery_does_not_block_constant_queries() {
         SqlValue::Integer(42)
     );
     for query in [
-        "SELECT * FROM items WHERE row_kind=0",
+        "SELECT * FROM items",
         "SELECT * FROM nested_items",
     ] {
         assert!(sql.run(query, vec![]).await.is_err(), "{query}");
@@ -448,15 +453,11 @@ async fn partition_frames_keys_custody_sql_and_checkpoints_are_isolated() {
         )
         .await;
 
-    let fa = a
-        .author_bundle([1; 32], vec![f.write("A", 1, 10)], vec![])
+    let fa = insert(&f, &a, &["A"], &[("A", "one", 10)], 1)
         .await
-        .unwrap()
         .remove(0);
-    let fb = a
-        .author_bundle([2; 32], vec![f.write("B", 2, 20)], vec![])
+    let fb = insert(&f, &a, &["B"], &[("B", "two", 20)], 2)
         .await
-        .unwrap()
         .remove(0);
     assert_eq!(
         fa.operation().unwrap().header.extensions.row_format,
@@ -492,11 +493,6 @@ async fn partition_frames_keys_custody_sql_and_checkpoints_are_isolated() {
         .sql(crate::sql::SqlOptions::default())
         .await
         .unwrap();
-    assert!(
-        sql.run("SELECT SUM(amount) FROM items", vec![])
-            .await
-            .is_err()
-    );
     assert_eq!(
         sql.run(
             "SELECT SUM(amount) FROM items WHERE list=?",
@@ -516,7 +512,7 @@ async fn partition_frames_keys_custody_sql_and_checkpoints_are_isolated() {
         .is_err()
     );
     assert_eq!(
-        sql.run("SELECT SUM(amount) FROM items WHERE row_kind=0", vec![])
+        sql.run("SELECT SUM(amount) FROM items", vec![])
             .await
             .unwrap()
             .rows[0][0],
@@ -528,16 +524,6 @@ async fn partition_frames_keys_custody_sql_and_checkpoints_are_isolated() {
             .unwrap()
             .rows[0][0],
         SqlValue::Integer(10)
-    );
-    assert!(
-        sql.run("SELECT * FROM items WHERE row_kind=1", vec![])
-            .await
-            .is_err()
-    );
-    assert!(
-        sql.run("SELECT * FROM items WHERE list='A' OR amount=10", vec![])
-            .await
-            .is_err()
     );
     let full = a
         .session([f.scope("A"), f.scope("B")].into())
@@ -670,7 +656,7 @@ async fn partition_frames_keys_custody_sql_and_checkpoints_are_isolated() {
         .unwrap();
     assert_eq!(
         restored_sql
-            .run("SELECT SUM(amount) FROM items WHERE row_kind=0", vec![])
+            .run("SELECT SUM(amount) FROM items", vec![])
             .await
             .unwrap()
             .rows[0][0],
@@ -713,7 +699,7 @@ async fn partition_frames_keys_custody_sql_and_checkpoints_are_isolated() {
         .unwrap();
     assert_eq!(
         remaining
-            .run("SELECT SUM(amount) FROM items WHERE row_kind=0", vec![])
+            .run("SELECT SUM(amount) FROM items", vec![])
             .await
             .unwrap()
             .rows[0][0],
@@ -727,275 +713,14 @@ async fn partition_frames_keys_custody_sql_and_checkpoints_are_isolated() {
     );
     assert_eq!(cp.statement.format, 17);
     assert_eq!(cp.statement.partition, Some(f.tuple("A")));
-    // An authenticated row sealed with B's key still cannot claim B's partition for an A row.
-    let mut wrong = f.write("A", 2, 5);
-    wrong.change.scope = f.scope("B");
-    assert!(a.author_bundle([3; 32], vec![wrong], vec![]).await.is_err());
     reader.rebuild_projection(f.scope("A")).await.unwrap();
     assert_eq!(
-        sql.run("SELECT count(*) FROM items WHERE row_kind=0", vec![])
+        sql.run("SELECT count(*) FROM items", vec![])
             .await
             .unwrap()
             .rows[0][0],
         SqlValue::Integer(1)
     );
-}
-
-async fn constraint_state(
-    replica: &EncryptedReplica<TypedRows>,
-    partition: &str,
-) -> Vec<Vec<SqlValue>> {
-    let inner = replica.inner.lock(crate::replica::Class::Background).await;
-    crate::storage::collect_rows(inner.conn.query(
-        "SELECT c.id,c.rocky_live,c.rocky_stamps,NOT EXISTS(SELECT 1 FROM items i WHERE i.list=c.list AND i.id=c.id) FROM secure_candidates_items c WHERE c.list=? ORDER BY c.id",
-        [partition.to_string()],
-    ).await.unwrap()).await.unwrap()
-}
-
-#[tokio::test]
-async fn partitioned_latest_wins_isolated_identity_rebuild_eviction_and_reopen() {
-    let root = tempfile::tempdir().unwrap();
-    let f = Fixture::constrained();
-    let path = root.path().join("a.sqlite");
-    let node = PrivateKey::new();
-    let a = f
-        .open(
-            &path,
-            node.clone(),
-            f.grant(None, &all()),
-            Some((PrivateKey::new(), 1)),
-        )
-        .await;
-    let b = f
-        .open(
-            &root.path().join("b.sqlite"),
-            PrivateKey::new(),
-            f.grant(None, &all()),
-            Some((PrivateKey::new(), 2)),
-        )
-        .await;
-    for replica in [&a, &b] {
-        f.key(replica, "A", [1; 32]).await;
-        f.key(replica, "B", [2; 32]).await;
-    }
-    let early = a
-        .author_bundle(
-            [1; 32],
-            vec![f.titled("A", 1, 1, "Milk"), f.titled("B", 2, 1, "Milk")],
-            vec![],
-        )
-        .await
-        .unwrap();
-    let clock = b
-        .author_bundle(
-            [2; 32],
-            vec![f.titled("A", 1, 2, "other"), f.titled("B", 2, 2, "other")],
-            vec![],
-        )
-        .await
-        .unwrap();
-    let late = b
-        .author_bundle(
-            [3; 32],
-            vec![f.titled("A", 3, 2, "MILK"), f.titled("B", 4, 2, "MILK")],
-            vec![],
-        )
-        .await
-        .unwrap();
-    for frame in clock.iter().chain(late.iter()) {
-        a.receive(frame.clone()).await.unwrap();
-    }
-    for frame in early.iter().rev() {
-        b.receive(frame.clone()).await.unwrap();
-    }
-    assert_eq!(
-        constraint_state(&a, "A").await,
-        constraint_state(&b, "A").await
-    );
-    assert_eq!(
-        constraint_state(&a, "B").await,
-        constraint_state(&b, "B").await
-    );
-    for name in ["A", "B"] {
-        let sql = a
-            .session([f.scope(name)].into())
-            .await
-            .unwrap()
-            .sql(Default::default())
-            .await
-            .unwrap();
-        let visible = sql
-            .run(
-                "SELECT id FROM items WHERE list=? AND title='milk'",
-                vec![SqlValue::Text(name.into())],
-            )
-            .await
-            .unwrap()
-            .rows;
-        assert_eq!(
-            visible,
-            vec![vec![SqlValue::Integer(
-                RowIdentity::new(2, if name == "A" { 3 } else { 4 })
-                    .unwrap()
-                    .integer()
-            )]]
-        );
-        let state = constraint_state(&a, name).await;
-        assert_eq!(
-            state
-                .iter()
-                .filter(|row| row[3] == SqlValue::Integer(1))
-                .count(),
-            1,
-            "{name}: {state:?}"
-        );
-    }
-    let before_a = constraint_state(&a, "A").await;
-    let before_b = constraint_state(&a, "B").await;
-    {
-        let mut inner = a.inner.lock(crate::replica::Class::Background).await;
-        transaction!(inner, |inner| inner.clear_typed(f.scope("A")).await).unwrap();
-    }
-    assert!(constraint_state(&a, "A").await.is_empty());
-    assert_eq!(constraint_state(&a, "B").await, before_b);
-    a.rebuild_projection(f.scope("A")).await.unwrap();
-    assert_eq!(constraint_state(&a, "A").await, before_a);
-    assert_eq!(constraint_state(&a, "B").await, before_b);
-    let partial = f
-        .open(
-            &root.path().join("partial.sqlite"),
-            PrivateKey::new(),
-            f.grant(Some(&["A"]), &[Right::Read]),
-            None,
-        )
-        .await;
-    f.key(&partial, "A", [1; 32]).await;
-    for frame in early
-        .iter()
-        .chain(clock.iter())
-        .chain(late.iter())
-        .filter(|frame| frame.scope().unwrap() == f.scope("A"))
-    {
-        partial.receive(frame.clone()).await.unwrap();
-    }
-    assert_eq!(constraint_state(&partial, "A").await, before_a);
-    assert!(constraint_state(&partial, "B").await.is_empty());
-    for frame in early
-        .iter()
-        .filter(|frame| frame.scope().unwrap() == f.scope("B"))
-    {
-        assert!(partial.receive(frame.clone()).await.is_err());
-    }
-    partial.rebuild_projection(f.scope("A")).await.unwrap();
-    assert_eq!(constraint_state(&partial, "A").await, before_a);
-    let (full_node, full_credentials) = {
-        let inner = b.inner.lock(crate::replica::Class::Background).await;
-        (
-            inner.config.node.public_key(),
-            inner.config.credentials.clone(),
-        )
-    };
-    a.set_role(crate::RoleConfig {
-        role: crate::ReplicaRole::Partial,
-        full_nodes: [rocky_credentials::PeerId::of(full_node)].into(),
-        custody: 1,
-    })
-    .await
-    .unwrap();
-    a.subscribe(f.scope("A")).await.unwrap();
-    a.subscribe(f.scope("B")).await.unwrap();
-    a.acknowledge_frontier(
-        full_node,
-        &full_credentials,
-        &b.frontier(f.scope("A")).await.unwrap(),
-    )
-    .await
-    .unwrap();
-    a.unsubscribe(f.scope("A")).await.unwrap();
-    a.evict(f.scope("A")).await.unwrap();
-    assert!(constraint_state(&a, "A").await.is_empty());
-    assert_eq!(constraint_state(&a, "B").await, before_b);
-    a.rebuild_projection(f.scope("A")).await.unwrap();
-    assert_eq!(constraint_state(&a, "B").await, before_b);
-    drop(a);
-    let reopened = f.open(&path, node, f.grant(None, &all()), None).await;
-    assert_eq!(constraint_state(&reopened, "B").await, before_b);
-    assert!(constraint_state(&reopened, "A").await.is_empty());
-}
-
-#[tokio::test]
-async fn partitioned_equal_stamps_break_ties_by_partition_and_id() {
-    let root = tempfile::tempdir().unwrap();
-    let f = Fixture::constrained();
-    let a = f
-        .open(
-            &root.path().join("a.sqlite"),
-            PrivateKey::new(),
-            f.grant(None, &all()),
-            Some((PrivateKey::new(), 1)),
-        )
-        .await;
-    for name in ["A", "B"] {
-        f.key(&a, name, [if name == "A" { 1 } else { 2 }; 32]).await;
-    }
-    a.author_bundle(
-        [1; 32],
-        vec![
-            f.titled("A", 1, 1, "milk"),
-            f.titled("A", 2, 1, "MILK"),
-            f.titled("B", 3, 1, "milk"),
-            f.titled("B", 4, 1, "MILK"),
-        ],
-        vec![],
-    )
-    .await
-    .unwrap();
-    for name in ["A", "B"] {
-        let state = constraint_state(&a, name).await;
-        assert_eq!(state.len(), 2);
-        assert_eq!(state[0][3], SqlValue::Integer(1));
-        assert_eq!(state[1][3], SqlValue::Integer(0));
-        a.rebuild_projection(f.scope(name)).await.unwrap();
-        assert_eq!(constraint_state(&a, name).await, state);
-    }
-}
-
-#[tokio::test]
-async fn partitioned_open_refuses_dropped_or_changed_constraint_indexes() {
-    for index in [
-        "items_title",
-        "items_identity",
-        "secure_candidates_items_id",
-        "secure_candidates_items_u0",
-    ] {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("a.sqlite");
-        let f = Fixture::constrained();
-        let a = f
-            .open(&path, PrivateKey::new(), f.grant(None, &all()), None)
-            .await;
-        let config = {
-            let inner = a.inner.lock(crate::replica::Class::Background).await;
-            SecureConfig {
-                publisher: inner.config.publisher,
-                manifest: inner.config.manifest.clone(),
-                revocations: inner.config.revocations.clone(),
-                node: inner.config.node.clone(),
-                credentials: inner.config.credentials.clone(),
-                keys: vec![],
-            }
-        };
-        drop(a);
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(&format!("DROP INDEX \"{index}\""), [])
-            .unwrap();
-        drop(conn);
-        let result = EncryptedReplica::open(&path, f.app(), config).await;
-        assert!(
-            matches!(result,Err(Error::Incompatible(message)) if message.contains("constraint index")),
-            "{index}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -1028,14 +753,20 @@ async fn partitioned_sql_refuses_local_duplicates_and_keeps_other_partition_atom
             .unwrap()
             .integer();
         sql.run(
-            "INSERT INTO items(list,key,amount,title,id,row_kind) VALUES(?, 'one',10,'milk',?,0)",
+            "INSERT INTO items(list,key,amount,title,id) VALUES(?, 'one',10,'milk',?)",
             vec![SqlValue::Text(name.into()), SqlValue::Integer(id)],
         )
         .await
         .unwrap();
     }
     sql.commit([1; 32]).await.unwrap();
-    let before_b = constraint_state(&a, "B").await;
+    let b_rows = async || {
+        sql.run("SELECT * FROM items WHERE list='B'", vec![])
+            .await
+            .unwrap()
+            .rows
+    };
+    let before_b = b_rows().await;
     sql.run("BEGIN", vec![]).await.unwrap();
     let id = sql
         .next_id_partition("items", &[SqlValue::Text("A".into())])
@@ -1044,7 +775,7 @@ async fn partitioned_sql_refuses_local_duplicates_and_keeps_other_partition_atom
         .integer();
     assert!(matches!(
         sql.run(
-            "INSERT INTO items(list,key,amount,title,id,row_kind) VALUES('A','two',10,'MILK',?,0)",
+            "INSERT INTO items(list,key,amount,title,id) VALUES('A','two',10,'MILK',?)",
             vec![SqlValue::Integer(id)]
         )
         .await,
@@ -1054,13 +785,13 @@ async fn partitioned_sql_refuses_local_duplicates_and_keeps_other_partition_atom
         }))
     ));
     sql.run("ROLLBACK", vec![]).await.unwrap();
-    assert_eq!(constraint_state(&a, "B").await, before_b);
+    assert_eq!(b_rows().await, before_b);
     sql.run("BEGIN", vec![]).await.unwrap();
     sql.run("UPDATE items SET title='bread' WHERE list='A'", vec![])
         .await
         .unwrap();
     sql.commit([2; 32]).await.unwrap();
-    assert_eq!(constraint_state(&a, "B").await, before_b);
+    assert_eq!(b_rows().await, before_b);
 }
 
 #[tokio::test]
@@ -1087,16 +818,18 @@ async fn an_unproved_partition_requires_custody_without_disclosing_its_header_or
     f.key(&writer, "A", [1; 32]).await;
     f.key(&writer, "secret-partition", [2; 32]).await;
     f.key(&reader, "A", [1; 32]).await;
-    let visible = writer
-        .author_bundle([1; 32], vec![f.write("A", 1, 10)], vec![])
+    let visible = insert(&f, &writer, &["A"], &[("A", "one", 10)], 1)
         .await
-        .unwrap()
         .remove(0);
-    let hidden = writer
-        .author_bundle([2; 32], vec![f.write("secret-partition", 2, 20)], vec![])
-        .await
-        .unwrap()
-        .remove(0);
+    let hidden = insert(
+        &f,
+        &writer,
+        &["secret-partition"],
+        &[("secret-partition", "two", 20)],
+        2,
+    )
+    .await
+    .remove(0);
     assert_eq!(
         reader.receive(visible).await.unwrap(),
         ReceiveStatus::Applied
@@ -1130,35 +863,6 @@ async fn an_unproved_partition_requires_custody_without_disclosing_its_header_or
     // This variant carries neither signed headers nor credential chains or tuples.
     assert!(matches!(page, crate::PlacementPage::CustodyRequired));
     assert_eq!(reader.receive_placements(*request, page).await.unwrap(), 0);
-    struct NoPeers;
-    impl crate::EntryPeers for NoPeers {
-        fn store<'a>(
-            &'a self,
-            _: PublicKey,
-            _: &'a crate::CoordinatedEntry,
-        ) -> crate::PeerFuture<'a, ()> {
-            panic!("readiness must fail before entry storage")
-        }
-        fn committed(
-            &self,
-            _: rocky_core::TipLog,
-            _: u64,
-        ) -> crate::PeerFuture<'_, Vec<crate::CommittedEntry>> {
-            panic!("readiness must fail before catch-up")
-        }
-    }
-    let log = rocky_coordinator::coordinated::MemoryLog::new();
-    log.configure(f.domain, 1).unwrap();
-    let followed = rocky_core::TipLog {
-        scope: f.domain,
-        tip: reader.followed_tip().await,
-    };
-    assert!(matches!(
-        reader
-            .coordinated_slot(followed, &log.client(reader_key.public_key()), &NoPeers)
-            .await,
-        Err(crate::CoordinatedError::CustodyRequired)
-    ));
     let inner = reader.inner.lock(crate::replica::Class::Background).await;
     assert!(
         crate::storage::rows(&inner.conn, "SELECT 1 FROM secure_placements")
@@ -1192,22 +896,11 @@ async fn reads_across_held_partitions_agree_inside_and_after_transactions() {
     for (index, name) in names.iter().enumerate() {
         f.key(&writer, name, [index as u8 + 1; 32]).await;
     }
-    let bundle = |first: u32| {
-        names
-            .iter()
-            .zip(first..)
-            .map(|(name, sequence)| f.write(name, sequence, 1))
-            .collect::<Vec<_>>()
-    };
-    // The first bundle materializes each partition's state.
-    writer
-        .author_bundle([1; 32], bundle(1), vec![])
-        .await
-        .unwrap();
-    writer
-        .author_bundle([2; 32], bundle(65), vec![])
-        .await
-        .unwrap();
+    let scopes: Vec<_> = names.iter().map(String::as_str).collect();
+    for (handle, key) in [(1, "one"), (2, "two")] {
+        let rows: Vec<_> = scopes.iter().map(|name| (*name, key, 1)).collect();
+        insert(&f, &writer, &scopes, &rows, handle).await;
+    }
 
     let sql = writer
         .session(names.iter().map(|name| f.scope(name)).collect())
@@ -1216,7 +909,7 @@ async fn reads_across_held_partitions_agree_inside_and_after_transactions() {
         .sql(crate::sql::SqlOptions::default())
         .await
         .unwrap();
-    let count = "SELECT count(*) FROM items WHERE row_kind=0";
+    let count = "SELECT count(*) FROM items";
     sql.run("BEGIN", vec![]).await.unwrap();
     for _ in 0..4 {
         assert_eq!(

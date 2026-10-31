@@ -14,8 +14,6 @@ required-features = ["bindgen"]
 
 [features]
 qualification = ["rocky-sdk/qualification"]
-# Test-only capture of committed SQL transaction shapes (`scripts/intent-shapes`).
-intent-shapes = ["rocky-sdk/intent-shapes"]
 default = ["iroh"]
 bindgen = ["uniffi/cli", "dep:uniffi_bindgen", "dep:askama", "dep:anyhow", "dep:camino", "dep:heck", "dep:toml", "dep:uniffi_meta", "dep:textwrap"]
 # The starter's iroh transport and `NativeEndpoint`. Without it the

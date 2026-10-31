@@ -25,7 +25,6 @@ fn items(held: &[&str], waiting: &[&str]) -> BTreeMap<String, TablePartitions> {
             complete: false,
             held: tuples(held),
             waiting: tuples(waiting),
-            support: false,
         },
     )]
     .into()

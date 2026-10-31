@@ -81,10 +81,6 @@ async fn kept_rows_and_newly_signed_statement_bytes_survive_live_admission_growt
         .await
         .unwrap();
     let signed = resigned_bytes(&lineage, &keeper, &keys[2], sealed).await;
-    assert_eq!(
-        scalar(&keeper, "SELECT count(*) FROM secure_admission_entries").await,
-        1
-    );
     crate::tests::exchange_graphs(&keeper, &writer, lineage.domain).await;
     insert(&writer, "two", "live").await;
     let frames = crate::tests::stored_frames(
@@ -95,10 +91,6 @@ async fn kept_rows_and_newly_signed_statement_bytes_survive_live_admission_growt
     for frame in frames {
         keeper.receive(frame).await.unwrap();
     }
-    assert_eq!(
-        scalar(&keeper, "SELECT count(*) FROM secure_admission_entries").await,
-        2
-    );
     assert_eq!(
         scalar(&keeper, "SELECT max(sequence) FROM secure_identity_own").await,
         2
@@ -115,9 +107,5 @@ async fn kept_rows_and_newly_signed_statement_bytes_survive_live_admission_growt
     assert_eq!(
         resigned_bytes(&lineage, &keeper, &keys[2], sealed).await,
         signed
-    );
-    assert_eq!(
-        scalar(&keeper, "SELECT count(*) FROM secure_admission_entries").await,
-        2
     );
 }

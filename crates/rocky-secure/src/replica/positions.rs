@@ -4,12 +4,11 @@ use rocky_core::Scope;
 use rocky_credentials::SignedSeal;
 
 pub(super) const SCHEMA: &[&str] = &[
-    "CREATE TABLE secure_position_sources(hash BLOB NOT NULL,kind INTEGER NOT NULL,scope BLOB NOT NULL,author INTEGER NOT NULL,sequence INTEGER NOT NULL,signer BLOB NOT NULL,tip BLOB NOT NULL,log_sequence INTEGER NOT NULL,pending INTEGER NOT NULL,applied INTEGER NOT NULL,existence INTEGER NOT NULL,PRIMARY KEY(hash,kind)) WITHOUT ROWID",
+    "CREATE TABLE secure_position_sources(hash BLOB NOT NULL,kind INTEGER NOT NULL,scope BLOB NOT NULL,author INTEGER NOT NULL,sequence INTEGER NOT NULL,signer BLOB NOT NULL,tip BLOB NOT NULL,log_sequence INTEGER NOT NULL,pending INTEGER NOT NULL,applied INTEGER NOT NULL,PRIMARY KEY(hash,kind)) WITHOUT ROWID",
     "CREATE INDEX secure_position_sources_seal ON secure_position_sources(scope,tip,author,sequence,kind,hash)",
     "CREATE INDEX secure_position_sources_domain ON secure_position_sources(scope,author,sequence,kind,pending)",
     "CREATE INDEX secure_position_sources_log ON secure_position_sources(scope,signer,tip,author,applied,log_sequence)",
     "CREATE TABLE secure_position_ranges(scope BLOB NOT NULL,author INTEGER NOT NULL,kind INTEGER NOT NULL,pending INTEGER NOT NULL,start INTEGER NOT NULL,end INTEGER NOT NULL,CHECK(start<=end),PRIMARY KEY(scope,author,kind,pending,start)) WITHOUT ROWID",
-    "CREATE TABLE secure_existence_counts(scope BLOB NOT NULL,author INTEGER NOT NULL,sequence INTEGER NOT NULL,count INTEGER NOT NULL,settled_count INTEGER NOT NULL,PRIMARY KEY(scope,author,sequence)) WITHOUT ROWID",
     "CREATE TABLE secure_log_ranges(scope BLOB NOT NULL,author BLOB NOT NULL,tip BLOB NOT NULL,applied INTEGER NOT NULL,domain_author INTEGER NOT NULL,delta INTEGER NOT NULL,start INTEGER NOT NULL,end INTEGER NOT NULL,CHECK(start<=end),PRIMARY KEY(scope,author,tip,applied,domain_author,delta,start)) WITHOUT ROWID",
 ];
 
@@ -21,15 +20,9 @@ pub(super) fn triggers() -> Vec<String> {
             let mut body = String::new();
             if event != "INSERT" {
                 body.push_str(&range_write(log, true));
-                if !log {
-                    body.push_str("DELETE FROM secure_existence_counts WHERE scope=OLD.scope AND author=OLD.author AND sequence=OLD.sequence; INSERT INTO secure_existence_counts SELECT scope,author,sequence,max(existence),max(CASE WHEN pending=0 THEN existence ELSE 0 END) FROM secure_position_sources WHERE scope=OLD.scope AND author=OLD.author AND sequence=OLD.sequence AND kind<>2 AND existence>0 AND NOT(hash=OLD.hash AND kind=OLD.kind) GROUP BY scope,author,sequence;");
-                }
             }
             if event != "DELETE" {
                 body.push_str(&range_write(log, false));
-                if !log {
-                    body.push_str("INSERT INTO secure_existence_counts SELECT NEW.scope,NEW.author,NEW.sequence,NEW.existence,CASE WHEN NEW.pending=0 THEN NEW.existence ELSE 0 END WHERE NEW.kind<>2 AND NEW.existence>0 ON CONFLICT(scope,author,sequence) DO UPDATE SET count=max(count,excluded.count),settled_count=max(settled_count,excluded.settled_count);");
-                }
             }
             let prefix = if log {
                 "secure_position_logs"
@@ -62,7 +55,7 @@ pub(super) async fn check_schema(conn: &ScopedConnection) -> Result<(), Error> {
     let mut actual = BTreeMap::new();
     for row in rows(
         conn,
-        "SELECT name,sql FROM sqlite_schema WHERE name GLOB 'secure_position*' OR name IN ('secure_existence_counts','secure_log_ranges')",
+        "SELECT name,sql FROM sqlite_schema WHERE name GLOB 'secure_position*' OR name='secure_log_ranges'",
     )
     .await?
     {
@@ -176,7 +169,7 @@ pub(crate) async fn insert(
         i64::try_from(header.seq_num).map_err(|_| denied("log sequence overflow"))?;
     // OR IGNORE here would also suppress a trigger's range merge on conflict.
     conn.execute(
-        "INSERT INTO secure_position_sources VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hash,kind) DO NOTHING",
+        "INSERT INTO secure_position_sources VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hash,kind) DO NOTHING",
         bindings(vec![
             SqlValue::Blob(header.hash().as_bytes().to_vec()),
             SqlValue::Integer(kind),
@@ -188,7 +181,6 @@ pub(crate) async fn insert(
             SqlValue::Integer(log_sequence),
             SqlValue::Integer(i64::from(pending)),
             SqlValue::Integer(i64::from(applied)),
-            SqlValue::Integer(i64::from(e.existence)),
         ]),
     )
     .await?;
@@ -241,7 +233,6 @@ impl<A: RowApplication> Inner<A> {
         domain: Scope,
         scopes: &[(ResourceScope, Option<i64>)],
         held_scopes: &BTreeSet<ResourceScope>,
-        _logged: &BTreeSet<ResourceScope>,
     ) -> Result<Positions, Error> {
         let ready: BTreeSet<_> = scopes.iter().map(|(scope, _)| *scope).collect();
         let mut held = BTreeMap::<u32, Runs>::new();
@@ -284,58 +275,18 @@ impl<A: RowApplication> Inner<A> {
         #[cfg(test)]
         {
             let _oracle = self.position_oracles.start();
-            let logged = _logged;
-            let mut counted = BTreeMap::<(ResourceScope, u32), BTreeMap<u64, u64>>::new();
-            for scope in logged {
-                if scope.domain != domain {
-                    continue;
-                }
-                let column = if ready.contains(scope) && self.has_scope_key(*scope) {
-                    "settled_count"
-                } else {
-                    "count"
-                };
-                for row in collect_rows(self.conn.query(format!("SELECT author,sequence,{column} FROM secure_existence_counts WHERE scope=? AND {column}>0"), [encode(scope)?]).await?).await? {
-                let [SqlValue::Integer(author),SqlValue::Integer(sequence),SqlValue::Integer(count)] = row.as_slice() else { return Err(Error::Corrupt("existence count".into())); };
-                counted.entry((*scope,*author as u32)).or_default().insert(*sequence as u64,*count as u64);
-            }
-            }
             let scan = self
-                .scan_held_positions(domain, scopes, held_scopes, logged)
+                .scan_held_positions(domain, scopes, held_scopes)
                 .await?;
             let expanded = (
                 result.0.iter().map(|(a, r)| (*a, r.expand())).collect(),
                 result.1.clone(),
-                counted,
             );
             if expanded != scan {
                 return Err(Error::Corrupt("position index differs from headers".into()));
             }
         }
         Ok(result)
-    }
-
-    pub(super) async fn position_existence_sum(
-        &self,
-        scope: ResourceScope,
-        author: u32,
-        from: u64,
-        to: u64,
-        ready: bool,
-    ) -> Result<u64, Error> {
-        if from > i64::MAX as u64 {
-            return Ok(0);
-        }
-        let column = if ready && self.has_scope_key(scope) {
-            "settled_count"
-        } else {
-            "count"
-        };
-        let result=collect_rows(self.conn.query(format!("SELECT coalesce(sum({column}),0) FROM secure_existence_counts WHERE scope=? AND author=? AND sequence>=? AND sequence<=?"),bindings(vec![SqlValue::Blob(encode(&scope)?),SqlValue::Integer(i64::from(author)),SqlValue::Integer(i64::try_from(from).unwrap_or(i64::MAX)),SqlValue::Integer(i64::try_from(to).unwrap_or(i64::MAX))])).await?).await?;
-        match result.first().map(Vec::as_slice) {
-            Some([SqlValue::Integer(sum)]) if *sum >= 0 => Ok(*sum as u64),
-            _ => Err(Error::Corrupt("existence sum".into())),
-        }
     }
 
     pub(in crate::replica) async fn deferred_at(
@@ -461,7 +412,7 @@ impl<A: RowApplication> Inner<A> {
             let e=&header.extensions;
             let author=e.author.ok_or_else(|| Error::Corrupt("position source author".into()))?;
             sources.insert((hash.clone(),*kind),vec![
-                SqlValue::Blob(hash.clone()),SqlValue::Integer(*kind),SqlValue::Blob(encode(&e.scope)?),SqlValue::Integer(i64::from(author)),SqlValue::Integer(i64::try_from(e.author_sequence).map_err(|_| Error::Corrupt("position source sequence".into()))?),SqlValue::Blob(header.public_key.as_bytes().to_vec()),SqlValue::Blob(e.tip.0.to_vec()),SqlValue::Integer(i64::try_from(header.seq_num).map_err(|_| Error::Corrupt("position source log sequence".into()))?),SqlValue::Integer(i64::from(status=="pending")),SqlValue::Integer(i64::from(matches!(status.as_str(),"applied"|"held"|"abandoned"))),SqlValue::Integer(i64::from(e.existence)),
+                SqlValue::Blob(hash.clone()),SqlValue::Integer(*kind),SqlValue::Blob(encode(&e.scope)?),SqlValue::Integer(i64::from(author)),SqlValue::Integer(i64::try_from(e.author_sequence).map_err(|_| Error::Corrupt("position source sequence".into()))?),SqlValue::Blob(header.public_key.as_bytes().to_vec()),SqlValue::Blob(e.tip.0.to_vec()),SqlValue::Integer(i64::try_from(header.seq_num).map_err(|_| Error::Corrupt("position source log sequence".into()))?),SqlValue::Integer(i64::from(status=="pending")),SqlValue::Integer(i64::from(matches!(status.as_str(),"applied"|"held"|"abandoned"))),
             ]);
         }
         let actual = rows(
@@ -476,7 +427,6 @@ impl<A: RowApplication> Inner<A> {
         }
         let mut domain = BTreeMap::<Vec<IndexValue>, Runs>::new();
         let mut logs = BTreeMap::<Vec<IndexValue>, Runs>::new();
-        let mut counts = BTreeMap::<Vec<IndexValue>, (i64, i64)>::new();
         for source in sources.values() {
             let [
                 _,
@@ -489,7 +439,6 @@ impl<A: RowApplication> Inner<A> {
                 SqlValue::Integer(log_sequence),
                 SqlValue::Integer(pending),
                 applied,
-                SqlValue::Integer(existence),
             ] = source.as_slice()
             else {
                 return Err(Error::Corrupt("position source".into()));
@@ -514,21 +463,6 @@ impl<A: RowApplication> Inner<A> {
                 ])?)
                 .or_default()
                 .insert(*log_sequence as u64, *log_sequence as u64);
-                if *existence > 0 {
-                    counts
-                        .entry(index_key(&[
-                            scope.clone(),
-                            author.clone(),
-                            SqlValue::Integer(*sequence),
-                        ])?)
-                        .and_modify(|n| {
-                            n.0 = n.0.max(*existence);
-                            if *pending == 0 {
-                                n.1 = n.1.max(*existence);
-                            }
-                        })
-                        .or_insert((*existence, if *pending == 0 { *existence } else { 0 }));
-                }
             }
         }
         for (table, width, expected) in [
@@ -553,25 +487,6 @@ impl<A: RowApplication> Inner<A> {
             if actual != expected {
                 return Err(Error::Corrupt(format!("{table} differs from headers")));
             }
-        }
-        let mut actual = BTreeMap::new();
-        for row in rows(&self.conn, "SELECT * FROM secure_existence_counts").await? {
-            let [
-                _,
-                _,
-                _,
-                SqlValue::Integer(count),
-                SqlValue::Integer(settled),
-            ] = row.as_slice()
-            else {
-                return Err(Error::Corrupt("existence audit count".into()));
-            };
-            actual.insert(index_key(&row[..3])?, (*count, *settled));
-        }
-        if actual != counts {
-            return Err(Error::Corrupt(
-                "existence counts differ from headers".into(),
-            ));
         }
         Ok(())
     }

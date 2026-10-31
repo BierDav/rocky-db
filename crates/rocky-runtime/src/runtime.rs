@@ -104,8 +104,6 @@ pub struct DomainPlacement {
 }
 pub struct Runtime<A: StoredApplication> {
     domains: std::collections::HashMap<Scope, Replica<A>>,
-    /// The bindings this process opened, by name.
-    databases: std::collections::HashMap<String, crate::Database<A>>,
     /// One file writer per file; each owns the domains of its file.
     threads: Vec<JoinHandle<()>>,
 }
@@ -138,33 +136,15 @@ where
         placement: Vec<DomainPlacement>,
         options: RuntimeOptions,
     ) -> Result<Self, Error> {
-        Self::open_layout(path, installations, options, Some((placement, Vec::new()))).await
-    }
-    /// `open_placed` with database bindings. Each binding is recorded in the
-    /// catalog before use and needs all its domains installed here and
-    /// assigned to one file slot; `database` then opens it. Recorded bindings
-    /// that are not passed stay recorded and closed. A binding whose tables
-    /// changed must carry the next generation.
-    pub async fn open_bound(
-        path: impl AsRef<Path>,
-        installations: Vec<DomainInstallation<A>>,
-        placement: Vec<DomainPlacement>,
-        bindings: Vec<rocky_core::DatabaseBinding>,
-        options: RuntimeOptions,
-    ) -> Result<Self, Error> {
-        Self::open_layout(path, installations, options, Some((placement, bindings))).await
+        Self::open_layout(path, installations, options, Some(placement)).await
     }
     async fn open_layout(
         path: impl AsRef<Path>,
         mut installations: Vec<DomainInstallation<A>>,
         options: RuntimeOptions,
-        placement: Option<(Vec<DomainPlacement>, Vec<rocky_core::DatabaseBinding>)>,
+        placement: Option<Vec<DomainPlacement>>,
     ) -> Result<Self, Error> {
         options.validate()?;
-        let (placement, bindings) = match placement {
-            Some((placement, bindings)) => (Some(placement), bindings),
-            None => (None, Vec::new()),
-        };
         let max_files = if placement.is_some() {
             MAX_PLACED_FILES
         } else {
@@ -221,29 +201,6 @@ where
             let bytes = worker::identity_bytes(domain.identity, &domain.app, &domain.config);
             binding.extend((bytes.len() as u32).to_le_bytes());
             binding.extend(bytes);
-        }
-        // A binding cannot stand for a domain that is absent or has no SQL tables.
-        let mut stamps = Vec::new();
-        for binding in &bindings {
-            let invalid = |error: rocky_core::BindingError| Error::Incompatible(error.to_string());
-            binding.validate().map_err(invalid)?;
-            for table in &binding.tables {
-                let installed = scopes.iter().position(|scope| *scope == table.scope);
-                let Some(app) = installed.map(|index| &installations[index].app) else {
-                    return Err(Error::Incompatible(format!(
-                        "database binding {} names a domain that is not installed here",
-                        binding.name
-                    )));
-                };
-                let schema = app.logical_schema().filter(|_| app.sql_writes().is_some());
-                if schema.is_none_or(|schema| schema.table(&table.table).is_none()) {
-                    return Err(Error::Incompatible(format!(
-                        "database binding {} names {}, which its domain does not have",
-                        binding.name, table.table
-                    )));
-                }
-            }
-            stamps.push(binding.identity().map_err(invalid)?);
         }
         let path = path.as_ref().to_path_buf();
         // Fewer domains than files use only as many files as domains.
@@ -324,14 +281,7 @@ where
             channels.push((receiver, worker::Notifications { revisions, changes }));
         }
         let (installations, files) = if let Some(placement) = placement {
-            crate::placement::install(
-                path,
-                options.files,
-                placement,
-                bindings.clone(),
-                installations,
-            )
-            .await?
+            crate::placement::install(path, options.files, placement, installations).await?
         } else {
             let (installations, files) =
                 crate::layout::install(path, options.files, used, binding, installations).await?;
@@ -444,28 +394,7 @@ where
             return Err(error);
         }
         let domains: std::collections::HashMap<_, _> = domains.into_iter().collect();
-        let databases = bindings
-            .into_iter()
-            .zip(stamps)
-            .map(|(binding, stamp)| {
-                let scopes = binding.scopes();
-                let members = scopes.iter().map(|scope| domains[scope].clone()).collect();
-                let name = binding.name.clone();
-                (name, crate::Database::new(binding, stamp, members))
-            })
-            .collect();
-        Ok(Self {
-            domains,
-            databases,
-            threads,
-        })
-    }
-    /// A binding passed to `open_bound`, by name.
-    pub fn database(&self, name: &str) -> Result<crate::Database<A>, Error> {
-        self.databases
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Error::Incompatible(format!("database binding {name} is not open here")))
+        Ok(Self { domains, threads })
     }
     pub fn domain(&self, scope: Scope) -> Result<Replica<A>, Error> {
         self.domains

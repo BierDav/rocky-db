@@ -62,38 +62,6 @@ async fn readiness_inspection_never_materializes_an_unknown_scope() {
     b.seal_rebootstraps(lineage.domain).await.unwrap();
     b.seal_pull_scopes(lineage.domain, seal).await.unwrap();
     b.unlisted_checkpoints(lineage.domain).await.unwrap();
-    // Inherited coordinated readiness checks the same frontier, read-only.
-    let log = rocky_coordinator::coordinated::MemoryLog::new();
-    log.configure(lineage.domain, 1).unwrap();
-    struct NoPeers;
-    impl crate::EntryPeers for NoPeers {
-        fn store<'a>(
-            &'a self,
-            _: PublicKey,
-            _: &'a crate::CoordinatedEntry,
-        ) -> crate::PeerFuture<'a, ()> {
-            panic!("readiness must precede storage")
-        }
-        fn committed(
-            &self,
-            _: rocky_core::TipLog,
-            _: u64,
-        ) -> crate::PeerFuture<'_, Vec<crate::CommittedEntry>> {
-            panic!("readiness must precede catch-up")
-        }
-    }
-    assert!(
-        b.coordinated_slot(
-            rocky_core::TipLog {
-                scope: lineage.domain,
-                tip: b.followed_tip().await
-            },
-            &log.client(keys[1].public_key()),
-            &NoPeers
-        )
-        .await
-        .is_err()
-    );
     assert_eq!(snapshot(&b).await, before);
 }
 
@@ -453,67 +421,58 @@ async fn a_late_key_with_pending_payload_cannot_sign_an_empty_base() {
 
 #[tokio::test]
 async fn an_interrupted_schema_switch_does_not_finalize_future_scope_state() {
-    for stage in [
-        crate::replica::migrate::PlanStage::Create,
-        crate::replica::migrate::PlanStage::Fill,
-        crate::replica::migrate::PlanStage::Switch,
-    ] {
-        let lineage = Lineage::new();
-        let dir = TempDir::new().unwrap();
-        let key = PrivateKey::new();
-        let path = dir.path().join("a.db");
-        let a = lineage.open(&path, &key, 3, None).await.unwrap();
-        follow_main(&lineage, &a).await;
-        insert(&a, "one", "one").await;
-        identity_insert(
-            &session(&a).await,
-            "INSERT INTO tags(key,label) VALUES('tag','removed')",
-            vec![],
-        )
+    let lineage = Lineage::new();
+    let dir = TempDir::new().unwrap();
+    let key = PrivateKey::new();
+    let path = dir.path().join("a.db");
+    let a = lineage.open(&path, &key, 3, None).await.unwrap();
+    follow_main(&lineage, &a).await;
+    insert(&a, "one", "one").await;
+    identity_insert(
+        &session(&a).await,
+        "INSERT INTO tags(key,label) VALUES('tag','removed')",
+        vec![],
+    )
+    .await
+    .unwrap();
+    let statements = lineage.publish(&a, 4).await.unwrap();
+    a.fail_next_plan_switch().await;
+    let result = lineage
+        .follow(&a, lineage.config(4, &key), 4, &statements)
+        .await;
+    assert!(matches!(result, Err(Error::InjectedFailure)), "{result:?}");
+    let before = snapshot(&a).await;
+    let finalized = scalar(&a, "SELECT count(*) FROM secure_finalized").await;
+    a.finalize_path(lineage.domain).await.unwrap();
+    assert_eq!(
+        scalar(&a, "SELECT count(*) FROM secure_finalized").await,
+        finalized
+    );
+    assert_eq!(snapshot(&a).await, before);
+    drop(a);
+    let bytes = std::fs::read(&path).unwrap();
+    let refused = lineage.reopen(&path, &key, 3, 4).await.err().unwrap();
+    assert!(
+        refused
+            .to_string()
+            .contains("installed application differs"),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let a = lineage.reopen(&path, &key, 3, 3).await.unwrap();
+    for name in ["items", "tags"] {
+        a.audit(lineage.scope(name)).await.unwrap();
+    }
+    assert!(a.projection_plan().await.unwrap().is_some());
+    lineage
+        .follow(&a, lineage.config(4, &key), 4, &statements)
         .await
         .unwrap();
-        let statements = lineage.publish(&a, 4).await.unwrap();
-        a.inject_plan_fault(stage, 0).await;
-        let result = lineage
-            .follow(&a, lineage.config(4, &key), 4, &statements)
-            .await;
-        assert!(
-            matches!(result, Err(Error::InjectedFailure)),
-            "{stage:?}: {result:?}"
-        );
-        let before = snapshot(&a).await;
-        let finalized = scalar(&a, "SELECT count(*) FROM secure_finalized").await;
-        a.finalize_path(lineage.domain).await.unwrap();
-        assert_eq!(
-            scalar(&a, "SELECT count(*) FROM secure_finalized").await,
-            finalized
-        );
-        assert_eq!(snapshot(&a).await, before);
-        drop(a);
-        let bytes = std::fs::read(&path).unwrap();
-        let refused = lineage.reopen(&path, &key, 3, 4).await.err().unwrap();
-        assert!(
-            refused
-                .to_string()
-                .contains("installed application differs"),
-            "{refused}"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        let a = lineage.reopen(&path, &key, 3, 3).await.unwrap();
-        for name in ["items", "tags"] {
-            a.audit(lineage.scope(name)).await.unwrap();
-        }
-        assert!(a.projection_plan().await.unwrap().is_some());
-        lineage
-            .follow(&a, lineage.config(4, &key), 4, &statements)
-            .await
-            .unwrap();
-        assert!(a.projection_plan().await.unwrap().is_none());
-        assert_eq!(scalar(&a, "SELECT count(*) FROM items").await, 1);
-        drop(a);
-        let a = lineage.reopen(&path, &key, 3, 4).await.unwrap();
-        a.audit(lineage.scope("items")).await.unwrap();
-    }
+    assert!(a.projection_plan().await.unwrap().is_none());
+    assert_eq!(scalar(&a, "SELECT count(*) FROM items").await, 1);
+    drop(a);
+    let a = lineage.reopen(&path, &key, 3, 4).await.unwrap();
+    a.audit(lineage.scope("items")).await.unwrap();
 }
 
 #[tokio::test]

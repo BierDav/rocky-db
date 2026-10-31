@@ -6,12 +6,12 @@ import org.example.examples.shopping.data.db.entity.ShoppingList
 
 @Dao
 interface ListDao {
-    /** The held lists: `row_kind = 0` asks for a partial result, since a device need not hold every list. */
-    @Query("SELECT * FROM lists WHERE row_kind = 0 ORDER BY id")
+    /** The held lists; a device need not hold every list. */
+    @Query("SELECT * FROM lists ORDER BY id")
     fun observeAll(): Flow<List<ShoppingList>>
 
     /** The held lists once, for a read-only view of a seal. */
-    @Query("SELECT * FROM lists WHERE row_kind = 0 ORDER BY id")
+    @Query("SELECT * FROM lists ORDER BY id")
     suspend fun all(): List<ShoppingList>
 
     @Insert suspend fun insert(list: ShoppingList)

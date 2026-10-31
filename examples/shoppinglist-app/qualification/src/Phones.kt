@@ -140,10 +140,10 @@ internal fun phones(peer: File, evidence: File) {
             a.send("move" to "Milk", "to" to "Weekend")
             relay(a, b)
             relay(b, a)
-            val converged = mapOf("Weekend" to listOf("Eggs", "Milk [x]"), "Weekly" to listOf("Bread"))
+            val converged = mapOf("Weekend" to listOf("Eggs", "Milk"), "Weekly" to listOf("Bread"))
             check(a.dump() == converged) { "A: ${a.dump()}" }
             check(b.dump() == converged) { "B: ${b.dump()}" }
-            notes += "${elapsed()} ms: one Bread survived; the moved Milk kept B's offline tick on both devices"
+            notes += "${elapsed()} ms: one Bread survived; the moved Milk left B's earlier offline tick behind on both devices"
             // The member scans A's contact and delegates an already held list; no registry access is used.
             check(b.send("share" to "Weekly", "recipientContact" to contacts.getValue(a).second, "online" to "true", "sync" to "1").any { it == "share ${contacts.getValue(a).first}" })
             notes += "${elapsed()} ms: member B shared Weekly with scanned contact A"

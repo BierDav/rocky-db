@@ -4,7 +4,7 @@ use rocky_sdk::{Affinity, Column, Configuration, Failure, Schema, Table, params}
 async fn main() -> Result<(), Failure> {
     let schema = Schema::builder("notes", 1)
         .table(
-            Table::mergeable("notes")
+            Table::replayed("notes")
                 .column(Column::new("body", Affinity::Text).required())
                 .column(
                     Column::new("done", Affinity::Integer)

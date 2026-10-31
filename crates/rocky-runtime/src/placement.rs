@@ -1,111 +1,23 @@
-//! Placement catalog: append-only assignments of domains to file slots and
-//! the database bindings whose domains must share one. File ownership
-//! remains independent of domain routing. A domain moves only through
+//! Placement catalog: append-only assignments of domains to file slots.
+//! File ownership remains independent of domain routing. A domain moves only through
 //! `crate::relocation`.
 use crate::{
     DomainInstallation, DomainPlacement, Error, database::DatabaseOwner, layout,
     scoped_connection::ScopedConnection, sqlite, storage, worker,
 };
-use rocky_core::{DatabaseBinding, Scope, SqlValue, StoredApplication};
+use rocky_core::{Scope, SqlValue, StoredApplication};
 use std::{collections::BTreeMap, path::PathBuf};
 
 type Opened = (usize, (DatabaseOwner, sqlite::Connection));
 pub(crate) fn key(scope: Scope) -> Vec<u8> {
     [scope.mesh.0, scope.app.0, scope.domain.0].concat()
 }
-pub(crate) const BINDINGS: &str = "CREATE TABLE IF NOT EXISTS rocky_bindings(name TEXT PRIMARY KEY,generation INTEGER NOT NULL,identity BLOB NOT NULL,body BLOB NOT NULL) WITHOUT ROWID";
 pub(crate) const MIGRATIONS: &str = "CREATE TABLE IF NOT EXISTS rocky_migrations(scope BLOB PRIMARY KEY,source INTEGER NOT NULL,target INTEGER NOT NULL,phase INTEGER NOT NULL) WITHOUT ROWID";
 
-/// The slot holding every domain of `binding`. A binding promises one local
-/// transaction over its tables, which exists only inside one file.
-pub(crate) fn colocated(
-    binding: &DatabaseBinding,
-    assignments: &BTreeMap<Vec<u8>, usize>,
-) -> Result<usize, Error> {
-    let mut slot = None;
-    for scope in binding.scopes() {
-        let file = *assignments.get(&key(scope)).ok_or_else(|| {
-            Error::Incompatible(format!(
-                "database binding {} names an unassigned domain",
-                binding.name
-            ))
-        })?;
-        match slot {
-            None => slot = Some(file),
-            Some(first) if first != file => {
-                return Err(Error::Incompatible(format!(
-                    "database binding {} spans file slots {first} and {file}: transactions and \
-                     queries across files are a blocked capability; co-locate its domains with \
-                     migrate_placement",
-                    binding.name
-                )));
-            }
-            Some(_) => {}
-        }
-    }
-    slot.ok_or_else(|| Error::Incompatible("database binding without tables".into()))
-}
-/// Checks `bindings` against the recorded ones and returns the rows to store.
-/// A changed binding must carry the next generation.
-async fn admit_bindings(
-    catalog: &ScopedConnection,
-    recorded: bool,
-    bindings: &[DatabaseBinding],
-    assignments: &BTreeMap<Vec<u8>, usize>,
-) -> Result<Vec<Vec<sqlite::Value>>, Error> {
-    let invalid = |error: rocky_core::BindingError| Error::Incompatible(error.to_string());
-    let mut known = BTreeMap::new();
-    if recorded {
-        for row in storage::rows(
-            catalog,
-            "SELECT name,generation,identity FROM rocky_bindings",
-        )
-        .await?
-        {
-            match row.as_slice() {
-                [
-                    SqlValue::Text(name),
-                    SqlValue::Integer(generation),
-                    SqlValue::Blob(identity),
-                ] => known.insert(name.clone(), (*generation as u64, identity.clone())),
-                _ => return Err(Error::Corrupt("recorded database binding".into())),
-            };
-        }
-    }
-    let mut rows = Vec::new();
-    let mut names = std::collections::BTreeSet::new();
-    for binding in bindings {
-        let body = binding.canonical().map_err(invalid)?;
-        let identity = binding.identity().map_err(invalid)?.to_vec();
-        if !names.insert(&binding.name) {
-            return Err(Error::Conflict);
-        }
-        colocated(binding, assignments)?;
-        match known.get(&binding.name) {
-            Some((_, saved)) if *saved == identity => continue,
-            Some((generation, _)) if generation.checked_add(1) != Some(binding.generation) => {
-                return Err(Error::Incompatible(format!(
-                    "database binding {} changed without the next generation {}",
-                    binding.name,
-                    generation.saturating_add(1)
-                )));
-            }
-            _ => {}
-        }
-        rows.push(sqlite::params![
-            binding.name.clone(),
-            binding.generation as i64,
-            identity,
-            body
-        ]);
-    }
-    Ok(rows)
-}
 pub(crate) async fn install<A>(
     path: PathBuf,
     files: usize,
     placement: Vec<DomainPlacement>,
-    bindings: Vec<DatabaseBinding>,
     installations: Vec<DomainInstallation<A>>,
 ) -> Result<(Vec<DomainInstallation<A>>, Vec<Opened>), Error>
 where
@@ -121,7 +33,7 @@ where
                 .build()
                 .map_err(Error::Io)
                 .and_then(|runtime| {
-                    runtime.block_on(prepare(path, files, placement, bindings, &installations))
+                    runtime.block_on(prepare(path, files, placement, &installations))
                 });
             let _ = done.send(outcome.map(|files| (installations, files)));
         })
@@ -132,7 +44,6 @@ async fn prepare<A: StoredApplication>(
     path: PathBuf,
     files: usize,
     placement: Vec<DomainPlacement>,
-    bindings: Vec<DatabaseBinding>,
     installations: &[DomainInstallation<A>],
 ) -> Result<Vec<Opened>, Error> {
     let mut catalog_path = path.as_os_str().to_owned();
@@ -216,7 +127,6 @@ async fn prepare<A: StoredApplication>(
             "a placement migration is pending; finish it with migrate_placement".into(),
         ));
     }
-    let bindings = admit_bindings(&catalog, has("rocky_bindings"), &bindings, &assignments).await?;
     // Validate every selected identity and acquire every required file before writes.
     let mut selected: BTreeMap<usize, Vec<&DomainInstallation<A>>> = BTreeMap::new();
     for domain in installations {
@@ -311,12 +221,8 @@ async fn prepare<A: StoredApplication>(
         catalog.execute("CREATE TABLE IF NOT EXISTS rocky_placement(id INTEGER PRIMARY KEY CHECK(id=1),identity BLOB NOT NULL,files INTEGER NOT NULL)", ()).await?;
         catalog.execute("CREATE TABLE IF NOT EXISTS rocky_assignments(scope BLOB PRIMARY KEY,file INTEGER NOT NULL,identity BLOB,ready INTEGER NOT NULL)", ()).await?;
         catalog.execute("INSERT OR IGNORE INTO rocky_placement VALUES(1,?,?)", sqlite::params![id, files as i64]).await?;
-        catalog.execute(BINDINGS, ()).await?;
         catalog.execute(MIGRATIONS, ()).await?;
         for item in &placement { catalog.execute("INSERT OR IGNORE INTO rocky_assignments VALUES(?,?,NULL,0)", sqlite::params![key(item.scope), item.file as i64]).await?; }
-        for binding in bindings {
-            catalog.execute("INSERT OR REPLACE INTO rocky_bindings VALUES(?,?,?,?)", binding).await?;
-        }
         for domain in installations {
             catalog.execute("UPDATE rocky_assignments SET identity=? WHERE scope=?", sqlite::params![worker::identity_bytes(domain.identity, &domain.app, &domain.config), key(domain.identity.scope)]).await?;
         }

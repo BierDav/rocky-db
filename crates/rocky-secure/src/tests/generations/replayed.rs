@@ -14,10 +14,7 @@ async fn outcomes(replica: &EncryptedReplica<TypedRows>) -> Vec<Vec<SqlValue>> {
 
 #[tokio::test]
 async fn a_late_write_of_a_removed_column_drops_as_schema_in_the_successor() {
-    let lineage = Lineage {
-        replayed: true,
-        ..Lineage::new()
-    };
+    let lineage = Lineage::new();
     let dir = TempDir::new().unwrap();
     let (alice_key, carol_key) = (PrivateKey::new(), PrivateKey::new());
     let alice = lineage
@@ -46,7 +43,7 @@ async fn a_late_write_of_a_removed_column_drops_as_schema_in_the_successor() {
     )
     .await
     .unwrap();
-    super::held::sync(&alice, &carol, &carol_key, &lineage, 3, items).await;
+    super::sync(&alice, &carol, &carol_key, &lineage, 3, items).await;
     // Offline from the owner, carol writes the column the successor removes,
     // then a column it keeps.
     write(&carol, "UPDATE items SET note='late' WHERE key='0001'").await;
@@ -64,7 +61,7 @@ async fn a_late_write_of_a_removed_column_drops_as_schema_in_the_successor() {
         );
         replica.finalize_path(lineage.domain).await.unwrap();
     }
-    super::held::sync(&carol, &alice, &alice_key, &lineage, 4, items).await;
+    super::sync(&carol, &alice, &alice_key, &lineage, 4, items).await;
     for replica in [&alice, &carol] {
         assert!(replica.held_changes().await.unwrap().is_empty());
         assert_eq!(

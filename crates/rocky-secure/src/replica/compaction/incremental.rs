@@ -50,15 +50,6 @@ impl<A: RowApplication> Inner<A> {
         }
         self.store_scope_state(id, sets.rows, sets.tombstones, &sets.digest, applied)
             .await?;
-        match &new {
-            Some(new) => self.project(scope, old.as_ref(), new).await?,
-            None => {
-                if let Some(mut old) = old {
-                    old.deleted = true;
-                    self.project(scope, None, &old).await?;
-                }
-            }
-        }
         Ok(())
     }
 
@@ -81,7 +72,6 @@ impl<A: RowApplication> Inner<A> {
         if selected.is_empty() {
             return Ok(());
         }
-        self.restart_plan(scope).await?;
         self.conn
             .execute("DELETE FROM secure_checkpoint_scratch WHERE scope=?", [id])
             .await?;

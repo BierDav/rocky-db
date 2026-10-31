@@ -11,7 +11,7 @@ impl Fixture {
     pub(crate) fn new(tables: usize) -> Self {
         let publisher = PrivateKey::new();
         let mut members = vec![
-            serde_json::json!({"name":"customers","class":"mergeable","columns":[{"name":"customer","type":"integer","not_null":true},{"name":"title","type":"text"}],"primary_key":["customer","id"],"partition_by":["customer"],"partition_group":"erp"}),
+            serde_json::json!({"name":"customers","class":"replayed","columns":[{"name":"customer","type":"integer","not_null":true},{"name":"title","type":"text"}],"primary_key":["customer","id"],"partition_by":["customer"],"partition_group":"erp"}),
         ];
         for (name, parent) in [
             ("orders", "customers"),
@@ -21,17 +21,9 @@ impl Fixture {
         .into_iter()
         .take(tables - 1)
         {
-            let mut table = serde_json::json!({"name":name,"class":"mergeable","columns":[{"name":"customer","type":"integer","not_null":true},{"name":"parent","type":"integer","not_null":true},{"name":"title","type":"text"}],"primary_key":["customer","id"],"partition_by":["customer"],"partition_group":"erp","foreign_keys":[{"columns":["customer","parent"],"table":parent,"on_delete":"cascade"}]});
-            if name == "order_lines" {
-                table["columns"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(serde_json::json!({"name":"product","type":"integer","not_null":true}));
-                table["foreign_keys"].as_array_mut().unwrap().push(serde_json::json!({"columns":["product"],"table":"products","on_delete":"cascade"}));
-            }
-            members.push(table);
+            members.push(serde_json::json!({"name":name,"class":"replayed","columns":[{"name":"customer","type":"integer","not_null":true},{"name":"parent","type":"integer","not_null":true},{"name":"title","type":"text"}],"primary_key":["customer","id"],"partition_by":["customer"],"partition_group":"erp","foreign_keys":[{"columns":["customer","parent"],"table":parent,"on_delete":"cascade"}]}));
         }
-        members.push(serde_json::json!({"name":"products","class":"mergeable","columns":[{"name":"title","type":"text"}],"primary_key":["id"],"existence_log":true}));
+        members.push(serde_json::json!({"name":"products","class":"replayed","columns":[{"name":"title","type":"text"}],"primary_key":["id"]}));
         let definition = serde_json::json!({"format":6,"publisher":publisher.public_key().to_string(),"application":"erp-measurement","tables":members});
         let schema = SchemaDefinition::parse(&serde_json::to_vec(&definition).unwrap())
             .unwrap()
@@ -264,32 +256,63 @@ impl Fixture {
             .unwrap(),
         )
     }
-    pub(crate) fn write(&self, name: &str, partition: i64) -> RowWrite {
-        let app = self.app();
-        let table = app.tables().find(|table| table.sql_name == name).unwrap();
-        // Partitioned tables continue one creation log per author and table.
-        let sequence = u32::try_from(partition.max(1)).unwrap();
-        let id = RowIdentity::new(1, sequence).unwrap().integer();
-        let mut values = if name == "products" {
-            vec![SqlValue::Text("Product".into())]
-        } else {
-            vec![SqlValue::Integer(partition)]
-        };
-        if !matches!(name, "customers" | "products") {
-            values.push(SqlValue::Integer(id));
+    /// Inserts one row into each of `tables` in one SQL transaction; the
+    /// rows of a partition reference the previous table's row.
+    pub(crate) async fn insert(
+        &self,
+        replica: &EncryptedReplica<TypedRows>,
+        partition: i64,
+        tables: &[&str],
+        handle: [u8; 32],
+    ) -> Vec<EncryptedFrame> {
+        let sql = replica
+            .session(
+                tables
+                    .iter()
+                    .map(|name| self.scope(name, partition))
+                    .collect(),
+            )
+            .await
+            .unwrap()
+            .sql(Default::default())
+            .await
+            .unwrap();
+        sql.run("BEGIN", vec![]).await.unwrap();
+        let mut parent = None;
+        for name in tables {
+            let (statement, mut values) = if *name == "products" {
+                let id = sql.next_id(name).await.unwrap();
+                (
+                    "INSERT INTO products(title,id) VALUES(?,?)".to_string(),
+                    vec![
+                        SqlValue::Text("Product".into()),
+                        SqlValue::Integer(id.integer()),
+                    ],
+                )
+            } else {
+                let partition = SqlValue::Integer(partition);
+                let id = sql
+                    .next_id_partition(name, std::slice::from_ref(&partition))
+                    .await
+                    .unwrap()
+                    .integer();
+                let statement = match parent {
+                    None => format!("INSERT INTO {name}(customer,title,id) VALUES(?,?,?)"),
+                    Some(_) => {
+                        format!("INSERT INTO {name}(customer,parent,title,id) VALUES(?,?,?,?)")
+                    }
+                };
+                let mut values = vec![partition];
+                values.extend(parent.map(SqlValue::Integer));
+                values.push(SqlValue::Text((*name).into()));
+                values.push(SqlValue::Integer(id));
+                parent = Some(id);
+                (statement, values)
+            };
+            sql.run(&statement, std::mem::take(&mut values))
+                .await
+                .unwrap();
         }
-        if name != "products" {
-            values.push(SqlValue::Text(name.into()));
-        }
-        if name == "order_lines" {
-            values.push(SqlValue::Integer(RowIdentity::new(1, 1).unwrap().integer()));
-        }
-        values.extend([SqlValue::Integer(id), SqlValue::Integer(0)]);
-        RowWrite::changed(RowChange {
-            scope: self.scope(name, partition),
-            row: app.row_id(self.domain.domain, table, &values).unwrap(),
-            before: None,
-            after: Some(app.fields(table, &values).unwrap()),
-        })
+        sql.commit(handle).await.unwrap().committed.unwrap().frames
     }
 }

@@ -3,12 +3,11 @@
 //! the copy's switch, then the cleanup; an interrupted migration resumes
 //! from whichever of the three it reached. The source stays authoritative
 //! until the catalog assigns the domain to its target.
-//! See `docs/runtime/database-bindings.md`.
 use crate::{
     DomainPlacement, Error, database::DatabaseOwner, layout, placement,
     scoped_connection::ScopedConnection, sqlite, storage,
 };
-use rocky_core::{AppId, DatabaseBinding, DomainId, MeshId, Scope, SqlValue};
+use rocky_core::{AppId, DomainId, MeshId, Scope, SqlValue};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -28,8 +27,8 @@ fn reached(_step: usize) {
 
 /// Moves each named domain to its new file slot and returns the complete
 /// recorded assignment set. No runtime may have the catalog's affected files
-/// open. Domains of one database binding move together. Without moves it
-/// finishes an interrupted migration and reports the recorded set.
+/// open. Without moves it finishes an interrupted migration and reports the
+/// recorded set.
 pub async fn migrate_placement(
     path: impl AsRef<Path>,
     moves: Vec<DomainPlacement>,
@@ -98,7 +97,6 @@ async fn run(path: &Path, moves: Vec<DomainPlacement>) -> Result<Vec<DomainPlace
     catalog.execute("PRAGMA synchronous=FULL", ()).await?;
     catalog.execute("PRAGMA fullfsync=ON", ()).await?;
     write(&catalog, async |catalog| {
-        catalog.execute(placement::BINDINGS, ()).await?;
         catalog.execute(placement::MIGRATIONS, ()).await?;
         Ok(())
     })
@@ -234,8 +232,7 @@ async fn assignments(catalog: &ScopedConnection) -> Result<Assignments, Error> {
         })
         .collect()
 }
-/// Validates the moves against the recorded assignments and bindings and
-/// records them. A domain that was never installed has no data and is
+/// Validates the moves against the recorded assignments and records them. A domain that was never installed has no data and is
 /// reassigned at once.
 async fn plan(
     catalog: &ScopedConnection,
@@ -245,10 +242,6 @@ async fn plan(
     moves: &[DomainPlacement],
 ) -> Result<(), Error> {
     let recorded = assignments(catalog).await?;
-    let mut after: BTreeMap<Vec<u8>, usize> = recorded
-        .iter()
-        .map(|(scope, (file, _, _))| (scope.clone(), *file))
-        .collect();
     let mut moving: Vec<(Vec<u8>, usize, usize, bool)> = Vec::new();
     for item in moves {
         let key = placement::key(item.scope);
@@ -266,17 +259,8 @@ async fn plan(
             ));
         }
         if file != item.file {
-            after.insert(key.clone(), item.file);
             moving.push((key, file, item.file, ready));
         }
-    }
-    for row in storage::rows(catalog, "SELECT body FROM rocky_bindings").await? {
-        let binding = match row.as_slice() {
-            [SqlValue::Blob(body)] => DatabaseBinding::parse(body).ok(),
-            _ => None,
-        };
-        let binding = binding.ok_or_else(|| Error::Corrupt("recorded database binding".into()))?;
-        placement::colocated(&binding, &after)?;
     }
     // Nothing is recorded while a runtime holds a file or a target is foreign.
     for (_, source, target, ready) in &moving {

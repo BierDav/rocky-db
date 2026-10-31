@@ -1678,41 +1678,6 @@ async fn verify_entry_with(
 }
 
 #[cfg(test)]
-impl<A: RowApplication> EncryptedReplica<A> {
-    pub(crate) async fn change_claim_after_frame_verification_for_test(
-        &self,
-        scope: ResourceScope,
-        identities: [rocky_core::RowIdentity; 2],
-    ) -> Result<(), Error> {
-        let mut inner = self.inner.lock(crate::replica::Class::Background).await;
-        transaction!(inner, |inner| {
-            let (allocation, _) = inner.bound_allocation(scope).await?;
-            let mut verified = FrameClaims::default();
-            let first = inner
-                .claims_on_frame(allocation, identities[0], &mut verified)
-                .await?;
-            if first.len() != 1 || verified.entries.len() != 1 {
-                return Err(corrupt("test frame has no single original claim"));
-            }
-            inner
-                .conn
-                .execute(
-                    "UPDATE secure_admission_claims SET ordinal=31 WHERE allocation=? AND identity=?",
-                    bindings(vec![
-                        SqlValue::Integer(allocation),
-                        SqlValue::Integer(identities[1].integer()),
-                    ]),
-                )
-                .await?;
-            inner
-                .claims_on_frame(allocation, identities[1], &mut verified)
-                .await?;
-            Ok(())
-        })
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

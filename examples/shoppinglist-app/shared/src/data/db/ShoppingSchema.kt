@@ -4,21 +4,18 @@ import kotlinx.coroutines.runBlocking
 import org.example.examples.shopping.resources.Res
 import rocky.*
 
-/** The packaged Room export supplies columns, keys, references and indexes; the overlay adds Rocky policy. */
+/** The packaged Room export supplies columns, keys, references and indexes; the overlay adds what Rocky needs. Every table is replayed. */
 val ShoppingSchema: Schema by lazy {
     runBlocking {
         schemaFromRoom("shopping", Res.readBytes("files/ShoppingDatabase.json").decodeToString(), shoppingRoomOverlay)
     }
 }
 
-/** What a Room export cannot hold: the group, the title policy, the coordinator and the trusted-only tables. */
+/** What a Room export cannot hold: the group, the coordinator and the trusted-only tables. */
 val shoppingRoomOverlay: SchemaBuilder.() -> Unit = {
     table("lists") { partitionBy("id", group = "list") }
     table("categories") { partitionBy("list", group = "list") }
-    table("items") {
-        partitionBy("list", group = "list")
-        onConflict("index_items_list_title", Conflict.LatestWins)
-    }
+    table("items") { partitionBy("list", group = "list") }
     table("item_categories") {
         partitionBy("list", group = "list")
         grantedLike = "items"

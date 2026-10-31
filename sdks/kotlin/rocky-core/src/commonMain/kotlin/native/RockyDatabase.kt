@@ -1,6 +1,8 @@
 package rocky
 
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
@@ -31,6 +33,9 @@ sealed interface RockyTransactionOutcome {
     /** Its writes are gone: `constraint`, `admission`, `schema` or `engine`; [sealed] makes the drop final. */
     data class Dropped(val reason: String, val sealed: Boolean) : RockyTransactionOutcome
 }
+
+/** A transaction replay dropped: its [token], as [RockyDatabase.transactionOutcome] takes it, and its outcome. */
+class RockyDrop(val token: ByteArray, val outcome: RockyTransactionOutcome.Dropped)
 
 /** Database ownership is independent of sessions and of an optional network. */
 class RockyDatabase private constructor(
@@ -110,6 +115,23 @@ class RockyDatabase private constructor(
             null -> null
             is NativeTransactionOutcome.Applied -> RockyTransactionOutcome.Applied
             is NativeTransactionOutcome.Dropped -> RockyTransactionOutcome.Dropped(outcome.reason, outcome.sealed)
+        }
+    }
+
+    /**
+     * Each transaction a replay drops on this device, this device's or another's, after the local commit that removed
+     * its writes. Applications tell the user; nothing is retried for them.
+     */
+    fun drops(): Flow<RockyDrop> = flow {
+        val events = driverTableEvents()
+        try {
+            while (true) {
+                for (token in nativeCall { events.next() }.dropped) {
+                    (transactionOutcome(token) as? RockyTransactionOutcome.Dropped)?.let { emit(RockyDrop(token, it)) }
+                }
+            }
+        } finally {
+            events.destroy()
         }
     }
 

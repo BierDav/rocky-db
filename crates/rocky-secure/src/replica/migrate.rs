@@ -1,49 +1,33 @@
-//! Projection plans: a typed schema change rebuilds its tables as shadows
-//! from the stored rows, in bounded transactions, and switches them in one
-//! verified transaction. See `docs/runtime/generations.md`.
-use super::typed::{SHADOW, Typed, physical, quoted, statements};
+//! Projection plans: a typed schema change is recorded, then recreates its
+//! replayed tables from the installed rows in one transaction. A plan
+//! interrupted before its switch finishes when the replica opens again.
+use super::typed::{Typed, quoted};
 use super::*;
-use crate::scoped_connection::Names;
 use rocky_core::{LogicalSchema, SchemaChange, Scope, TableClass};
 
 pub(super) const SCHEMA: &[&str] = &[
-    // `position` is -1 before the shadow tables exist, then the mergeable
-    // table being filled after `cursor`, then their count once all are.
-    "CREATE TABLE IF NOT EXISTS secure_projection_plan(id INTEGER PRIMARY KEY CHECK(id=1),descriptor BLOB NOT NULL,domain BLOB NOT NULL,readers BLOB NOT NULL,position INTEGER NOT NULL,cursor BLOB NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS secure_projection_plan(id INTEGER PRIMARY KEY CHECK(id=1),descriptor BLOB NOT NULL,domain BLOB NOT NULL,readers BLOB NOT NULL)",
 ];
-/// Stored rows copied into a shadow table per transaction.
-pub const PLAN_ROWS: usize = 256;
 
-/// Where a projection plan stands.
+/// A pending projection plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionPlan {
     /// The fingerprint of the schema being installed.
     pub schema: Commitment,
-    /// Mergeable tables filled so far, of `tables`.
-    pub filled: usize,
     pub tables: usize,
-}
-/// A step of a projection plan where tests interrupt it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PlanStage {
-    Create,
-    Fill,
-    Switch,
 }
 
 struct Record {
     schema: LogicalSchema,
     domain: Scope,
     readers: BTreeMap<String, Commitment>,
-    position: i64,
-    cursor: Vec<u8>,
 }
 
 impl<A: RowApplication> Inner<A> {
     async fn plan_record(&self) -> Result<Option<Record>, Error> {
         let stored = rows(
             &self.conn,
-            "SELECT descriptor,domain,readers,position,cursor FROM secure_projection_plan WHERE id=1",
+            "SELECT descriptor,domain,readers FROM secure_projection_plan WHERE id=1",
         )
         .await?;
         let Some(row) = stored.first() else {
@@ -53,8 +37,6 @@ impl<A: RowApplication> Inner<A> {
             SqlValue::Blob(descriptor),
             SqlValue::Blob(domain),
             SqlValue::Blob(readers),
-            SqlValue::Integer(position),
-            SqlValue::Blob(cursor),
         ] = row.as_slice()
         else {
             return Err(Error::Corrupt("projection plan record".into()));
@@ -64,8 +46,6 @@ impl<A: RowApplication> Inner<A> {
                 .map_err(|_| Error::Corrupt("projection plan descriptor".into()))?,
             domain: decode(domain)?,
             readers: decode(readers)?,
-            position: *position,
-            cursor: cursor.clone(),
         }))
     }
     /// The installed typed descriptor, domain and readers.
@@ -148,7 +128,7 @@ impl<A: RowApplication> Inner<A> {
         {
             SchemaChange::Unchanged if !rebuild => return Ok(()),
             SchemaChange::Unchanged => {}
-            SchemaChange::Local | SchemaChange::Additive { .. } => {}
+            SchemaChange::Local | SchemaChange::Replicated => {}
         }
         // Local tables hold application data no stored row restores: they
         // stay in place.
@@ -167,12 +147,9 @@ impl<A: RowApplication> Inner<A> {
                 )));
             }
         }
-        if !constrained(&installed, schema, domain, readers)? {
-            Typed::shadow(schema.clone(), domain, readers)?;
-        }
         self.conn
             .execute(
-                "INSERT INTO secure_projection_plan VALUES(1,?,?,?,-1,X'')",
+                "INSERT INTO secure_projection_plan VALUES(1,?,?,?)",
                 bindings(vec![
                     SqlValue::Blob(descriptor),
                     SqlValue::Blob(encode(&domain)?),
@@ -209,33 +186,17 @@ impl<A: RowApplication> Inner<A> {
         }
         self.conn
             .execute(
-                "INSERT INTO secure_projection_plan SELECT 1,descriptor,domain,readers,-1,X'' FROM secure_typed WHERE id=1",
+                "INSERT INTO secure_projection_plan SELECT 1,descriptor,domain,readers FROM secure_typed WHERE id=1",
                 (),
             )
             .await?;
         Ok(())
     }
-    /// Drops the pending plan and its shadow tables inside the caller's
-    /// transaction.
+    /// Drops the pending plan inside the caller's transaction.
     pub(super) async fn discard_plan(&mut self) -> Result<(), Error> {
-        let Some(record) = self.plan_record().await? else {
-            return Ok(());
-        };
-        for table in record.schema.mergeable() {
-            self.conn
-                .execute(
-                    format!(
-                        "DROP TABLE IF EXISTS {}",
-                        quoted(&physical(&table.sql_name, true))
-                    ),
-                    (),
-                )
-                .await?;
-        }
         self.conn
             .execute("DELETE FROM secure_projection_plan", ())
             .await?;
-        self.workspace.shadow = None;
         Ok(())
     }
     /// The pending plan's progress.
@@ -243,51 +204,21 @@ impl<A: RowApplication> Inner<A> {
         let Some(record) = self.plan_record().await? else {
             return Ok(None);
         };
-        let tables = record.schema.mergeable().count();
         Ok(Some(ProjectionPlan {
             schema: record
                 .schema
                 .fingerprint()
                 .map_err(|error| Error::Corrupt(error.to_string()))?,
-            filled: usize::try_from(record.position.max(0))
-                .unwrap_or_default()
-                .min(tables),
-            tables,
+            tables: record.schema.typed().count(),
         }))
     }
-    /// A bulk change of a scope's stored rows: its shadow fills again.
-    pub(super) async fn restart_plan(&self, scope: ResourceScope) -> Result<(), Error> {
-        let Some(shadow) = &self.workspace.shadow else {
-            return Ok(());
-        };
-        let Some(index) = shadow.tables.iter().position(|table| table.scope == scope) else {
-            return Ok(());
-        };
-        let table = &shadow.tables[index];
-        self.conn
-            .execute(
-                format!(
-                    "DELETE FROM {}",
-                    quoted(&physical(&table.table.sql_name, true))
-                ),
-                (),
-            )
-            .await?;
-        self.conn
-            .execute(
-                "UPDATE secure_projection_plan SET position=?,cursor=X'' WHERE position>?",
-                [index as i64, index as i64],
-            )
-            .await?;
-        Ok(())
-    }
-    /// Runs one step of the pending plan in its own transaction. Returns
-    /// whether a plan remains.
-    pub(super) async fn plan_step(&mut self) -> Result<bool, Error> {
+    /// Switches to the pending plan's tables in one transaction.
+    pub(super) async fn finish_plan(&mut self) -> Result<(), Error> {
         let Some(record) = self.plan_record().await? else {
-            return Ok(false);
+            return Ok(());
         };
-        if let Some((scope, _, _, target)) = self.schema_switch_intent().await?
+        let intent = self.schema_switch_intent().await?;
+        if let Some((scope, _, _, target)) = intent
             && self
                 .graph_for(scope)?
                 .schema_any(target)
@@ -298,110 +229,20 @@ impl<A: RowApplication> Inner<A> {
                 "a staged schema switch resumes only with its target schema",
             ));
         }
+        // Values of fields some tip on the switch's path lacks are gone.
+        let path = match intent {
+            Some((scope, ..)) => self.staged_row_fields(scope).await?,
+            None => None,
+        };
         let installed = self
             .installed_typed()
             .await?
             .ok_or_else(|| Error::Corrupt("a projection plan without typed tables".into()))?
             .0;
-        if constrained(&installed, &record.schema, record.domain, &record.readers)? {
-            self.switch_constrained(&record, &installed).await?;
-            return Ok(false);
+        #[cfg(test)]
+        if std::mem::take(&mut self.plan_fault) {
+            return Err(Error::InjectedFailure);
         }
-        let shadow = Arc::new(
-            self.authorized_projection(Typed::shadow(
-                record.schema.clone(),
-                record.domain,
-                &record.readers,
-            )?)
-            .await?,
-        );
-        let tables = shadow.tables.len() as i64;
-        let switched = transaction!(self, |inner| {
-            match record.position {
-                -1 => {
-                    inner.plan_fault(PlanStage::Create)?;
-                    let names = Names::new(Some(SHADOW), &statements(&record.schema));
-                    for table in &shadow.tables {
-                        let name = &table.table.sql_name;
-                        inner
-                            .conn
-                            .execute(
-                                format!("DROP TABLE IF EXISTS {}", quoted(&physical(name, true))),
-                                (),
-                            )
-                            .await?;
-                        let logical = record
-                            .schema
-                            .table(name)
-                            .ok_or_else(|| Error::Corrupt(format!("{name} has no statement")))?;
-                        inner
-                            .conn
-                            .execute(names.sql(&logical.create_sql), ())
-                            .await?;
-                    }
-                    inner
-                        .conn
-                        .execute("UPDATE secure_projection_plan SET position=0", ())
-                        .await?;
-                    Ok(false)
-                }
-                position if position < tables => {
-                    inner.plan_fault(PlanStage::Fill)?;
-                    let table = &shadow.tables[position as usize];
-                    let (copied, last) = inner.fill(&shadow, table, &record.cursor).await?;
-                    let (position, cursor) = if copied < PLAN_ROWS {
-                        (position + 1, Vec::new())
-                    } else {
-                        (position, last)
-                    };
-                    inner
-                        .conn
-                        .execute(
-                            "UPDATE secure_projection_plan SET position=?,cursor=?",
-                            bindings(vec![SqlValue::Integer(position), SqlValue::Blob(cursor)]),
-                        )
-                        .await?;
-                    Ok(false)
-                }
-                _ => {
-                    inner.plan_fault(PlanStage::Switch)?;
-                    inner.switch(&record, &shadow).await?;
-                    Ok(true)
-                }
-            }
-        })?;
-        if switched {
-            self.workspace.shadow = None;
-            self.workspace.typed = Some(Arc::new(
-                self.authorized_projection(Typed::new(
-                    record.schema,
-                    record.domain,
-                    &record.readers,
-                )?)
-                .await?,
-            ));
-            transaction!(self, |inner| inner.install_history().await)?;
-            self.start_events();
-            // Sessions and cursors planned against the old tables end.
-            self.bump_authority();
-            self.publish_revision().await?;
-            return Ok(false);
-        }
-        if self.workspace.shadow.is_none() {
-            self.workspace.shadow = Some(shadow);
-        }
-        Ok(true)
-    }
-    /// Replaces tables whose visible rows depend on unique indexes or foreign
-    /// keys, or live in partitions: instead of filling shadows the tables are
-    /// recreated and resolved from the stored rows in one transaction, as at
-    /// installation.
-    async fn switch_constrained(
-        &mut self,
-        record: &Record,
-        installed: &LogicalSchema,
-    ) -> Result<(), Error> {
-        self.plan_fault(PlanStage::Switch)?;
         let projected = Arc::new(
             self.authorized_projection(Typed::new(
                 record.schema.clone(),
@@ -417,62 +258,35 @@ impl<A: RowApplication> Inner<A> {
                 Some(old) => inner.begin_switch_history(old, &projected).await?,
                 None => None,
             };
-            for table in installed
-                .mergeable()
-                .chain(removed_replayed(installed, &record.schema))
-            {
+            for table in removed_replayed(&installed, &record.schema) {
                 inner.touch(&table.sql_name);
-                for name in [
-                    table.sql_name.clone(),
-                    format!("secure_candidates_{}", table.sql_name),
-                ] {
-                    inner
-                        .conn
-                        .execute(format!("DROP TABLE IF EXISTS {}", quoted(&name)), ())
-                        .await?;
-                }
+                inner
+                    .conn
+                    .execute(
+                        format!("DROP TABLE IF EXISTS {}", quoted(&table.sql_name)),
+                        (),
+                    )
+                    .await?;
             }
-            inner.conn.execute("DELETE FROM secure_support", ()).await?;
             inner.record_projection_access(&projected).await?;
+            let mut replayed = Vec::new();
             for table in record.schema.tables.iter().filter(|table| {
                 table.class == TableClass::LocalOnly || projected.by_name(&table.sql_name).is_some()
             }) {
                 inner.touch(&table.sql_name);
                 match table.class {
-                    TableClass::Mergeable => {
-                        inner.conn.execute(table.create_sql.clone(), ()).await?;
-                        for index in &table.indexes {
-                            inner.conn.execute(index.create_sql.clone(), ()).await?;
-                        }
-                    }
-                    TableClass::Replayed => inner.rebuild_replayed(installed, table).await?,
-                    _ => inner.replace_indexes(installed, table).await?,
+                    TableClass::Replayed => replayed.push(table),
+                    TableClass::LocalOnly => inner.replace_indexes(&installed, table).await?,
                 }
             }
-            inner.reshape_undo(installed, &record.schema).await?;
-            for sql in projected
-                .constraints
-                .iter()
-                .flat_map(super::constraints::Constraints::statements)
-            {
-                inner.conn.execute(sql.clone(), ()).await?;
-            }
-            for table in &projected.tables {
-                if projected
-                    .constraints
-                    .as_ref()
-                    .and_then(|constraints| constraints.node(table.scope))
-                    .is_none()
-                    && !inner.replayed_scope(table.scope)
-                {
-                    typed::reproject(inner, &projected, table).await?;
-                }
-            }
-            Box::pin(inner.rebuild_constraints(None, None)).await?;
-            typed::verify_constraint_indexes(&inner.conn, &projected).await?;
+            inner
+                .rebuild_replayed(&installed, &record.schema, &replayed, path.as_ref())
+                .await?;
+            inner.install_delete_triggers(&projected).await?;
+            inner.reshape_undo(&installed, &record.schema).await?;
             inner.install_history().await?;
             inner.end_switch_history(&projected, switching).await?;
-            inner.finish_switch(record).await
+            inner.finish_switch(&record).await
         });
         if let Err(error) = switched {
             self.abandon_switch_history();
@@ -483,132 +297,6 @@ impl<A: RowApplication> Inner<A> {
         self.bump_authority();
         self.publish_revision().await?;
         Ok(())
-    }
-    /// Runs the pending plan to its switch.
-    pub(super) async fn finish_plan(&mut self) -> Result<(), Error> {
-        while self.plan_step().await? {}
-        Ok(())
-    }
-    /// Copies one batch of a scope's live rows after `cursor` into its
-    /// shadow table. Rows that change meanwhile project there themselves.
-    async fn fill(
-        &self,
-        shadow: &Typed,
-        table: &typed::Projected,
-        cursor: &[u8],
-    ) -> Result<(usize, Vec<u8>), Error> {
-        let chunk = collect_rows(
-            self.conn
-                .query(
-                    "SELECT row,fields FROM secure_row_records WHERE scope=? AND row>? ORDER BY row LIMIT ?",
-                    bindings(vec![
-                        SqlValue::Blob(encode(&table.scope)?),
-                        SqlValue::Blob(cursor.to_vec()),
-                        SqlValue::Integer(PLAN_ROWS as i64),
-                    ]),
-                )
-                .await?,
-        )
-        .await?;
-        let mut last = cursor.to_vec();
-        for record in &chunk {
-            let [SqlValue::Blob(row), SqlValue::Blob(bytes)] = record.as_slice() else {
-                return Err(Error::Corrupt("stored row".into()));
-            };
-            last = row.clone();
-            let record = self.decode_record(bytes).await?;
-            if record.deleted
-                || (record.identity.is_some()
-                    && self
-                        .winner(
-                            table.scope,
-                            record
-                                .key
-                                .ok_or_else(|| Error::Corrupt("missing incarnation key".into()))?,
-                        )
-                        .await?
-                        .is_none_or(|winner| winner.identity != record.identity))
-            {
-                continue;
-            }
-            let values = shadow
-                .rows
-                .values(&table.table, &record.fields)
-                .map_err(Error::Corrupt)?;
-            self.conn
-                .execute(table.upsert.clone(), bindings(values))
-                .await?;
-        }
-        Ok((chunk.len(), last))
-    }
-    /// Verifies every shadow table against the stored rows, then replaces
-    /// the installed tables with them, inside the caller's transaction.
-    async fn switch(&mut self, record: &Record, shadow: &Typed) -> Result<(), Error> {
-        for table in &shadow.tables {
-            self.verify_shadow(shadow, table).await?;
-        }
-        let installed = self
-            .installed_typed()
-            .await?
-            .ok_or_else(|| Error::Corrupt("a projection plan without typed tables".into()))?
-            .0;
-        let projected = self
-            .authorized_projection(Typed::new(
-                record.schema.clone(),
-                record.domain,
-                &record.readers,
-            )?)
-            .await?;
-        let switching = match self.workspace.typed.clone() {
-            Some(old) => self.begin_switch_history(&old, &projected).await?,
-            None => None,
-        };
-        for table in installed
-            .mergeable()
-            .chain(removed_replayed(&installed, &record.schema))
-        {
-            self.touch(&table.sql_name);
-            self.conn
-                .execute(
-                    format!("DROP TABLE IF EXISTS {}", quoted(&table.sql_name)),
-                    (),
-                )
-                .await?;
-        }
-        self.record_projection_access(&projected).await?;
-        for table in record.schema.tables.iter().filter(|table| {
-            table.class == TableClass::LocalOnly || projected.by_name(&table.sql_name).is_some()
-        }) {
-            self.touch(&table.sql_name);
-            match table.class {
-                TableClass::Mergeable => {
-                    self.conn
-                        .execute(
-                            format!(
-                                "ALTER TABLE {} RENAME TO {}",
-                                quoted(&physical(&table.sql_name, true)),
-                                quoted(&table.sql_name)
-                            ),
-                            (),
-                        )
-                        .await?;
-                    for index in &table.indexes {
-                        self.conn.execute(index.create_sql.clone(), ()).await?;
-                    }
-                }
-                TableClass::Replayed => self.rebuild_replayed(&installed, table).await?,
-                _ => self.replace_indexes(&installed, table).await?,
-            }
-        }
-        self.reshape_undo(&installed, &record.schema).await?;
-        if switching.is_some() {
-            self.install_history_for(&projected).await?;
-        }
-        self.end_switch_history(&projected, switching).await?;
-        // Rows rebuilt as the follow moves on project into the new tables.
-        self.workspace.shadow = None;
-        self.workspace.typed = Some(Arc::new(projected));
-        self.finish_switch(record).await
     }
     /// A local table keeps its rows; only its indexes
     /// follow the new schema.
@@ -676,99 +364,6 @@ impl<A: RowApplication> Inner<A> {
         self.finish_schema_switch().await?;
         Ok(())
     }
-    /// The shadow table holds exactly the live stored rows of its scope.
-    async fn verify_shadow(&self, shadow: &Typed, table: &typed::Projected) -> Result<(), Error> {
-        let differs = || {
-            Error::Corrupt(format!(
-                "the shadow of {} differs from its stored rows",
-                table.table.sql_name
-            ))
-        };
-        let (mut live, mut after) = (0i64, Vec::new());
-        loop {
-            let chunk = collect_rows(
-                self.conn
-                    .query(
-                        "SELECT row,fields FROM secure_row_records WHERE scope=? AND row>? ORDER BY row LIMIT ?",
-                        bindings(vec![
-                            SqlValue::Blob(encode(&table.scope)?),
-                            SqlValue::Blob(after.clone()),
-                            SqlValue::Integer(PLAN_ROWS as i64),
-                        ]),
-                    )
-                    .await?,
-            )
-            .await?;
-            for record in &chunk {
-                let [SqlValue::Blob(row), SqlValue::Blob(bytes)] = record.as_slice() else {
-                    return Err(Error::Corrupt("stored row".into()));
-                };
-                after = row.clone();
-                let record = self.decode_record(bytes).await?;
-                if record.deleted
-                    || (record.identity.is_some()
-                        && self
-                            .winner(
-                                table.scope,
-                                record.key.ok_or_else(|| {
-                                    Error::Corrupt("missing incarnation key".into())
-                                })?,
-                            )
-                            .await?
-                            .is_none_or(|winner| winner.identity != record.identity))
-                {
-                    continue;
-                }
-                live += 1;
-                let values = shadow
-                    .rows
-                    .values(&table.table, &record.fields)
-                    .map_err(Error::Corrupt)?;
-                let key: Vec<SqlValue> = table
-                    .table
-                    .key
-                    .iter()
-                    .filter_map(|index| values.get(*index).cloned())
-                    .collect();
-                let stored =
-                    collect_rows(self.conn.query(table.select.clone(), bindings(key)).await?)
-                        .await?;
-                if stored.first() != Some(&values) {
-                    return Err(differs());
-                }
-            }
-            if chunk.len() < PLAN_ROWS {
-                break;
-            }
-        }
-        let counted = rows(
-            &self.conn,
-            &format!(
-                "SELECT count(*) FROM {}",
-                quoted(&physical(&table.table.sql_name, true))
-            ),
-        )
-        .await?;
-        if counted != vec![vec![SqlValue::Integer(live)]] {
-            return Err(differs());
-        }
-        Ok(())
-    }
-    /// A test's interruption of a plan step.
-    #[cfg_attr(not(test), allow(clippy::unused_self, unused_variables))]
-    fn plan_fault(&mut self, stage: PlanStage) -> Result<(), Error> {
-        #[cfg(test)]
-        if let Some((at, remaining)) = self.plan_fault
-            && at == stage
-        {
-            if remaining == 0 {
-                self.plan_fault = None;
-                return Err(Error::InjectedFailure);
-            }
-            self.plan_fault = Some((at, remaining - 1));
-        }
-        Ok(())
-    }
 }
 
 impl<A: RowApplication> EncryptedReplica<A> {
@@ -780,27 +375,23 @@ impl<A: RowApplication> EncryptedReplica<A> {
             .plan_status()
             .await
     }
-    /// Runs a pending plan step by step; other work proceeds between steps.
     pub(crate) async fn run_plan(&self) -> Result<(), Error> {
-        loop {
-            let mut inner = self.inner.lock(crate::replica::Class::Background).await;
-            if !inner.plan_step().await? {
-                return Ok(());
-            }
-        }
-    }
-    #[cfg(test)]
-    pub(crate) async fn inject_plan_fault(&self, stage: PlanStage, after: usize) {
         self.inner
             .lock(crate::replica::Class::Background)
             .await
-            .plan_fault = Some((stage, after));
+            .finish_plan()
+            .await
+    }
+    #[cfg(test)]
+    /// Fails the next plan switch before its transaction.
+    pub(crate) async fn fail_next_plan_switch(&self) {
+        self.inner
+            .lock(crate::replica::Class::Background)
+            .await
+            .plan_fault = true;
     }
 }
 
-/// Whether either schema's tables carry unique indexes or foreign keys, or
-/// the new one partitions a table: a shadow fills from its table's scope
-/// alone, and partitioned rows are stored under each partition's.
 /// Replayed tables of `installed` that `schema` no longer declares.
 fn removed_replayed<'a>(
     installed: &'a LogicalSchema,
@@ -809,23 +400,4 @@ fn removed_replayed<'a>(
     installed.tables.iter().filter(|table| {
         table.class == TableClass::Replayed && schema.table(&table.sql_name).is_none()
     })
-}
-
-fn constrained(
-    installed: &LogicalSchema,
-    schema: &LogicalSchema,
-    domain: Scope,
-    readers: &BTreeMap<String, Commitment>,
-) -> Result<bool, Error> {
-    Ok(installed
-        .tables
-        .iter()
-        .any(|table| installed.constrained(table))
-        || schema
-            .tables
-            .iter()
-            .any(|table| !table.partition_by.is_empty())
-        || Typed::new(schema.clone(), domain, readers)?
-            .constraints
-            .is_some())
 }

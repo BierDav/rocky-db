@@ -2,57 +2,33 @@
 //! `docs/runtime/sql-driver.md#the-writer`.
 use super::*;
 use crate::network::link::Link;
-use rocky_core::{RowChange, RowIdentity, RowWrite};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-fn number(node: &PrivateKey) -> u32 {
-    crate::tests::node_number(node.public_key())
-}
-fn values(key: usize, done: i64, id: i64) -> Vec<SqlValue> {
-    vec![
-        text(&format!("k{key}")),
-        text("item"),
-        SqlValue::Integer(done),
-        SqlValue::Integer(id),
-        SqlValue::Integer(0),
-    ]
-}
-fn write(t: &Typed, app: &TypedRows, before: Option<&[SqlValue]>, after: &[SqlValue]) -> RowWrite {
-    let table = app
-        .tables()
-        .find(|table| table.sql_name == "items")
+/// Creates `rows` items, one SQL transaction each.
+async fn create(replica: &EncryptedReplica<TypedRows>, both: &[ResourceScope], rows: usize) {
+    let session = sql(replica, both).await;
+    for key in 1..=rows {
+        insert(
+            &session,
+            "INSERT INTO items VALUES(?,'item',0)",
+            vec![text(&format!("k{key}"))],
+        )
+        .await
         .unwrap();
-    RowWrite::changed(RowChange {
-        scope: t.items,
-        row: app.row_id(t.domain.domain, table, after).unwrap(),
-        before: before.map(|values| app.fields(table, values).unwrap()),
-        after: Some(app.fields(table, after).unwrap()),
-    })
+    }
 }
-/// Commits `writes` as single-row bundles, 64 at a time so they share
-/// group commits and flushes.
-async fn author_all(replica: &EncryptedReplica<TypedRows>, writes: Vec<RowWrite>, tag: &str) {
-    let mut writes = writes.into_iter().enumerate().peekable();
-    while writes.peek().is_some() {
-        let guard = replica.inner.lock(crate::replica::Class::Background).await;
-        let mut tasks = tokio::task::JoinSet::new();
-        for (index, write) in writes.by_ref().take(64) {
-            let replica = replica.clone();
-            let handle = rocky_core::commitment(tag, &index.to_be_bytes());
-            let mut request =
-                Box::pin(async move { replica.author_bundle(handle, vec![write], vec![]).await });
-            // Enqueue in birth order while the leader cannot take the lock.
-            std::future::poll_fn(|cx| {
-                assert!(request.as_mut().poll(cx).is_pending());
-                std::task::Poll::Ready(())
-            })
-            .await;
-            tasks.spawn(request);
-        }
-        drop(guard);
-        while let Some(result) = tasks.join_next().await {
-            result.unwrap().unwrap();
-        }
+/// Ticks every item, one SQL transaction each.
+async fn tick(replica: &EncryptedReplica<TypedRows>, both: &[ResourceScope], rows: usize) {
+    let session = sql(replica, both).await;
+    for key in 1..=rows {
+        let ticked = session
+            .run(
+                "UPDATE items SET done=1 WHERE key=?",
+                vec![text(&format!("k{key}"))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ticked.changes, 1);
     }
 }
 /// `source` serves one scope's catch-up to `target` over loopback TCP, on
@@ -163,8 +139,7 @@ async fn source_node_key(replica: &EncryptedReplica<TypedRows>) -> PublicKey {
 /// The reader receives every operation while a SQL writer commits one row
 /// per transaction.
 async fn catch_up_beside_a_writer(operations: usize) -> usize {
-    let t = Typed::new(UpdatePolicy::Changed);
-    let app = t.app();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let (creator, updater) = loop {
@@ -177,40 +152,12 @@ async fn catch_up_beside_a_writer(operations: usize) -> usize {
     let source = t
         .open(&dir.path().join("creator.db"), &creator, t.full(), &both)
         .await;
-    let created: Vec<_> = (1..=rows)
-        .map(|key| {
-            let id = RowIdentity::new(number(&creator), key as u32)
-                .unwrap()
-                .integer();
-            values(key, 0, id)
-        })
-        .collect();
-    author_all(
-        &source,
-        created
-            .iter()
-            .map(|after| write(&t, &app, None, after))
-            .collect(),
-        "create",
-    )
-    .await;
+    create(&source, &both, rows).await;
     let editor = t
         .open(&dir.path().join("updater.db"), &updater, t.full(), &both)
         .await;
     assert_eq!(pull(&source, &editor, t.items).await.frames, rows);
-    author_all(
-        &editor,
-        created
-            .iter()
-            .map(|before| {
-                let mut after = before.clone();
-                after[2] = SqlValue::Integer(1);
-                write(&t, &app, Some(before), &after)
-            })
-            .collect(),
-        "tick",
-    )
-    .await;
+    tick(&editor, &both, rows).await;
     let reader = t
         .open(
             &dir.path().join("reader.db"),
@@ -292,8 +239,7 @@ async fn retrying_a_receipt_resumes_an_interrupted_catch_up_without_reopening() 
 }
 
 async fn interrupted_catch_up(retry_receipt: bool) {
-    let t = Typed::new(UpdatePolicy::Changed);
-    let app = t.app();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let (creator, updater) = loop {
@@ -306,40 +252,12 @@ async fn interrupted_catch_up(retry_receipt: bool) {
     let source = t
         .open(&dir.path().join("creator.db"), &creator, t.full(), &both)
         .await;
-    let created: Vec<_> = (1..=rows)
-        .map(|key| {
-            let id = RowIdentity::new(number(&creator), key as u32)
-                .unwrap()
-                .integer();
-            values(key, 0, id)
-        })
-        .collect();
-    author_all(
-        &source,
-        created
-            .iter()
-            .map(|after| write(&t, &app, None, after))
-            .collect(),
-        "create",
-    )
-    .await;
+    create(&source, &both, rows).await;
     let editor = t
         .open(&dir.path().join("updater.db"), &updater, t.full(), &both)
         .await;
     assert_eq!(pull(&source, &editor, t.items).await.frames, rows);
-    author_all(
-        &editor,
-        created
-            .iter()
-            .map(|before| {
-                let mut after = before.clone();
-                after[2] = SqlValue::Integer(1);
-                write(&t, &app, Some(before), &after)
-            })
-            .collect(),
-        "tick",
-    )
-    .await;
+    tick(&editor, &both, rows).await;
     // Every operation in log order, the updater's ticks first.
     let mut frames = crate::tests::stored_frames(
         &editor,
@@ -438,21 +356,14 @@ async fn interrupted_catch_up(retry_receipt: bool) {
 /// pass, so a receive waiting for it never returned while writes continued.
 #[tokio::test]
 async fn sql_commits_between_pending_steps_do_not_restart_the_pass() {
-    let t = Typed::new(UpdatePolicy::Changed);
-    let app = t.app();
+    let t = Typed::new();
     let dir = TempDir::new().unwrap();
     let both = [t.items, t.salaries];
     let creator = PrivateKey::new();
     let source = t
         .open(&dir.path().join("creator.db"), &creator, t.full(), &both)
         .await;
-    let created = (1..=3)
-        .map(|key| {
-            let id = RowIdentity::new(number(&creator), key).unwrap().integer();
-            write(&t, &app, None, &values(key as usize, 0, id))
-        })
-        .collect();
-    author_all(&source, created, "create").await;
+    create(&source, &both, 3).await;
     let frames = crate::tests::stored_frames(
         &source,
         "SELECT header,body FROM secure_operations ORDER BY author,sequence",

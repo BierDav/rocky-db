@@ -11,6 +11,7 @@ import dev.zacsweers.metrox.viewmodel.ViewModelKey
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
 import org.example.examples.shopping.data.db.entity.Category
 import org.example.examples.shopping.data.db.entity.ItemCategory
 import org.example.examples.shopping.data.db.entity.ShoppingItem
@@ -57,6 +58,16 @@ class ListsViewModel(session: ShoppingSession) : NodeViewModel(session) {
             }.settledOnRocky()
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    init {
+        // A replica drops a whole transaction whose replay fails; its writes are gone, so say so.
+        viewModelScope.launch {
+            node.collectLatest { node ->
+                // Ends when the database closes.
+                node.rocky.drops().catch { }.collect { tell(dropMessage(it.outcome.reason)) }
+            }
+        }
+    }
 
     fun shareWithDevice(recipient: String) = onList { household.share(it, recipient) }
 
@@ -119,3 +130,11 @@ internal fun ListsState.observeDetails(
 ): Flow<ListsState> = combine(categories, items, links) { categories, items, links ->
     copy(categories = categories, items = items, links = links, contentLoading = false)
 }.onStart { emit(copy(contentLoading = true)) }
+
+/** The snackbar text for a dropped transaction, by its drop reason. */
+internal fun dropMessage(reason: String): String = when (reason) {
+    "constraint" -> "A change was undone: it clashed with another device's, such as a duplicate title"
+    "admission" -> "A change was undone: its device may no longer write there"
+    "schema" -> "A change was undone: a newer app version no longer accepts it"
+    else -> "A change was undone on this device ($reason)"
+}

@@ -441,67 +441,6 @@ impl<A: RowApplication> Inner<A> {
             self.authorize_peer(peer, credentials, scope)
         }
     }
-    /// As `authorize_peer` for a coordinated log's entries: a peer also
-    /// takes those of a sealed tip its followed tip descends from, the
-    /// state it starts from.
-    pub(crate) fn authorize_log_peer(
-        &self,
-        peer: PublicKey,
-        credentials: &CredentialChain,
-        scope: ResourceScope,
-        log: rocky_core::TipLog,
-    ) -> Result<(), Error> {
-        let inherited = match (self.peer_tip(peer), self.graphs.get(&log.scope)) {
-            (Some(tip), Some(graph)) => Self::descends(graph, tip, log.tip)?,
-            _ => false,
-        };
-        if !inherited {
-            return self.authorize_peer(peer, credentials, scope);
-        }
-        let grants = self.verify_chain_scopes(credentials, peer, now()?, &[scope])?;
-        if !crate::replica::roles::holds_whole(&grants, scope) {
-            return Err(denied("ciphertext custody denied"));
-        }
-        Ok(())
-    }
-    pub(crate) fn authorize_log_frame(
-        &self,
-        peer: PublicKey,
-        log: rocky_core::TipLog,
-        frame: &EncryptedFrame,
-    ) -> Result<(), Error> {
-        let Some(mut tip) = self.peer_tip(peer) else {
-            return Ok(());
-        };
-        let Some(graph) = self.graphs.get(&log.scope) else {
-            return Ok(());
-        };
-        let header = frame.operation()?.header;
-        let mut visited = BTreeSet::new();
-        while tip != log.tip && visited.insert(tip) {
-            for opening in &graph.openings {
-                if opening.tip().map_err(credential)? == tip {
-                    let seal = graph
-                        .seal_by_id(opening.statement.seal)
-                        .map_err(credential)?;
-                    let covered = seal.statement.frontier.iter().any(|mark| {
-                        Some(mark.author) == header.extensions.author
-                            && header.extensions.author_sequence <= mark.sequence
-                    });
-                    if !covered {
-                        return Err(denied(
-                            "ancestor frame exceeds the branch's inherited frontier",
-                        ));
-                    }
-                }
-            }
-            match Self::tip_parent(graph, tip)? {
-                Some((parent, _)) => tip = parent,
-                None => break,
-            }
-        }
-        Ok(())
-    }
     /// Whether `tip` continues or opens on a seal of `ancestor`, directly
     /// or through further seals.
     pub(in crate::replica) fn descends(
@@ -841,10 +780,6 @@ impl<A: RowApplication> Inner<A> {
                 applied,
             )
             .await?;
-            for (_, _, record) in &page.rows {
-                self.project(scope, None, record).await?;
-            }
-            Box::pin(self.resolve(None)).await?;
             self.cause(crate::observe::Cause::Sync);
             self.conn
                 .execute(
@@ -958,6 +893,9 @@ impl<A: RowApplication> Inner<A> {
             self.conn.execute(sql, [id]).await?;
         }
         self.store_scope_state(id, 0, 0, &Lt::new(), 0).await?;
+        if self.replayed_scope(scope) {
+            self.reset_replayed(scope).await?;
+        }
         self.reproject(scope).await?;
         self.reseed_ledger(scope, id).await?;
         self.clear_staging(id).await
@@ -1023,6 +961,7 @@ impl<A: RowApplication> Inner<A> {
             "secure_rebootstrap_rows",
             "secure_rebootstrap_stubs",
             "secure_rebootstrap_pages",
+            "secure_replayed_staged",
         ] {
             self.conn
                 .execute(format!("DELETE FROM {table} WHERE scope=?"), [id])
@@ -1343,6 +1282,12 @@ impl<A: RowApplication> EncryptedReplica<A> {
             ),
         };
         let through = stored.as_ref().and_then(|(next, _)| *next);
+        // A replayed scope's base rows are row images, not records.
+        let replayed = inner.replayed_scope(scope);
+        let rows_sql = match (replayed, &served) {
+            (true, served::Served::Base) => "SELECT row,image FROM secure_replayed_base",
+            _ => &format!("SELECT row,fields FROM {}", served.rows()),
+        };
         let mut plain = PagePlain {
             checkpoint,
             after,
@@ -1371,7 +1316,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
             inner = self.inner.lock(Class::Background).await;
             inner.check_export_source(&source)?;
             let records = collect_rows(inner.conn.query(
-                format!("SELECT row,fields FROM {} WHERE scope=? AND row>? AND (? IS NULL OR row<=?) ORDER BY row LIMIT ?", served.rows()),
+                format!("{rows_sql} WHERE scope=? AND row>? AND (? IS NULL OR row<=?) ORDER BY row LIMIT ?"),
                 bindings(vec![SqlValue::Integer(id), SqlValue::Blob(scanned.map(|row| row.to_vec()).unwrap_or_default()), through.map_or(SqlValue::Null, |row| SqlValue::Blob(row.to_vec())), through.map_or(SqlValue::Null, |row| SqlValue::Blob(row.to_vec())), SqlValue::Integer(EXPORT_ROWS.min(page_rows + 1 - plain.rows.len()) as i64)]),
             ).await?).await?;
             #[cfg(feature = "qualification")]
@@ -1384,6 +1329,30 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 let [SqlValue::Blob(row), SqlValue::Blob(fields)] = record.as_slice() else {
                     return Err(Error::Corrupt("checkpoint row".into()));
                 };
+                if replayed {
+                    let weight = ROW_OVERHEAD + fields.len();
+                    if plain.rows.len() == page_rows || used + weight > budget {
+                        if stored.is_some() {
+                            return Err(Error::Corrupt(
+                                "checkpoint page exceeds its signed cut".into(),
+                            ));
+                        }
+                        plain.next = plain
+                            .rows
+                            .last()
+                            .map(|last| row_of(&last.row))
+                            .transpose()?;
+                        break 'records;
+                    }
+                    used += weight;
+                    scanned = Some(row_of(row)?);
+                    plain.rows.push(PageRow {
+                        row: row.clone(),
+                        fields: fields.clone(),
+                        clock: 0,
+                    });
+                    continue;
+                }
                 let record = inner.decode_record(fields).await?;
                 // A row's bindings weigh on the page that first names them.
                 let set = match record.proof.as_ref().map(|proof| proof.bindings()) {
@@ -1535,7 +1504,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
             })
             .collect::<Result<_, Error>>()?;
         plain.creations = legend_creations.into_iter().collect();
-        for (index, row) in plain.rows.iter_mut().enumerate() {
+        for (index, row) in plain.rows.iter_mut().enumerate().filter(|_| !replayed) {
             if index % EXPORT_ROWS == 0 {
                 tokio::task::yield_now().await;
             }
@@ -1788,6 +1757,14 @@ impl<A: RowApplication> EncryptedReplica<A> {
         result
     }
     async fn stage_checkpoint_page_inner(&self, page: CheckpointPage) -> Result<(), Error> {
+        if self
+            .inner
+            .lock(Class::Background)
+            .await
+            .replayed_scope(page.scope)
+        {
+            return self.stage_replayed_page(page).await;
+        }
         let store = store_rows()?;
         #[cfg(feature = "qualification")]
         let metadata_step = crate::qualification_bound(
@@ -2112,7 +2089,7 @@ impl<A: RowApplication> EncryptedReplica<A> {
             };
             #[cfg(any(test, feature = "qualification"))]
             {
-                inner.row_work(store as u64, chunk.rows.len() as u64);
+                inner.row_work(store as u64);
                 inner.units("checkpoint_store_metadata", metadata.len() as u64);
                 inner.units("checkpoint_store_row", chunk.rows.len() as u64);
             }
@@ -2128,6 +2105,110 @@ impl<A: RowApplication> EncryptedReplica<A> {
                 inner.imported.send_modify(|pages| *pages += 1);
             }
         }
+        Ok(())
+    }
+    /// `stage_checkpoint_page` for a replayed scope: the page's row images
+    /// are staged for the switch, which checks them against the statement.
+    /// A direct import shows them at once: its scope holds nothing else.
+    async fn stage_replayed_page(&self, page: CheckpointPage) -> Result<(), Error> {
+        let mut inner = self.inner.lock(Class::Background).await;
+        let (key, staging) = inner.expected_page(&page).await?;
+        let plain: PagePlain = decode(&page.rows.open(&key)?)?;
+        let rows = plain
+            .rows
+            .iter()
+            .map(|row| Ok((row_of(&row.row)?, row.fields.clone())))
+            .collect::<Result<Vec<_>, Error>>()?;
+        if plain.checkpoint != page.checkpoint
+            || plain.after != page.after
+            || plain.next != page.next
+            || rows.len() > PAGE_ROWS
+            || plain.next.is_some() && plain.next != rows.last().map(|(row, _)| *row)
+            || !(plain.legend.is_empty()
+                && plain.origins.is_empty()
+                && plain.creations.is_empty()
+                && plain.authors.is_empty()
+                && plain.bindings.is_empty()
+                && plain.headers.is_empty())
+            || plain.rows.iter().any(|row| row.clock != 0)
+        {
+            return Err(denied("checkpoint page binding mismatch"));
+        }
+        if !staging
+            .signed
+            .signer()
+            .verify(&page_signing_bytes(&plain)?, &plain.signature)
+        {
+            return Err(denied("checkpoint page signature mismatch"));
+        }
+        let mut last = staging.cursor;
+        for (row, _) in &rows {
+            if last.is_some_and(|last| *row <= last) {
+                return Err(denied("checkpoint rows out of order"));
+            }
+            last = Some(*row);
+        }
+        inner.check_base_identities(
+            page.scope,
+            staging.signed.statement.tip,
+            &rows,
+            &staging.signed.statement.identities,
+        )?;
+        let id = inner
+            .find_scope_id(page.scope)
+            .await?
+            .ok_or_else(|| denied("no rebootstrap in progress"))?;
+        transaction!(inner, |inner| {
+            if staging.direct {
+                inner
+                    .restore_images(page.scope, staging.signed.statement.tip, &rows)
+                    .await?;
+            }
+            let mut sets = staging.sets.clone();
+            for (row, image) in &rows {
+                replay::add_row(&mut sets, row, image);
+                inner
+                    .conn
+                    .execute(
+                        "INSERT INTO secure_replayed_staged VALUES(?,?,?)",
+                        bindings(vec![
+                            SqlValue::Integer(id),
+                            SqlValue::Blob(row.to_vec()),
+                            SqlValue::Blob(image.clone()),
+                        ]),
+                    )
+                    .await?;
+            }
+            let row = |row: Option<Commitment>| {
+                row.map_or(SqlValue::Null, |row| SqlValue::Blob(row.to_vec()))
+            };
+            inner
+                .conn
+                .execute(
+                    "INSERT INTO secure_rebootstrap_pages VALUES(?,?,?,?)",
+                    bindings(vec![
+                        SqlValue::Integer(id),
+                        SqlValue::Blob(page.after.map(|row| row.to_vec()).unwrap_or_default()),
+                        row(plain.next),
+                        SqlValue::Blob(plain.signature.to_bytes().to_vec()),
+                    ]),
+                )
+                .await?;
+            inner
+                .conn
+                .execute(
+                    "UPDATE secure_rebootstrap SET cursor=?,complete=?,sets=? WHERE scope=?",
+                    bindings(vec![
+                        row(last),
+                        SqlValue::Integer(i64::from(plain.next.is_none())),
+                        SqlValue::Blob(sets.to_bytes()),
+                        SqlValue::Integer(id),
+                    ]),
+                )
+                .await?;
+            inner.fault(Stage::Import)
+        })?;
+        inner.imported.send_modify(|pages| *pages += 1);
         Ok(())
     }
     /// The stored rows of `checkpoint` this replica has imported: all of
@@ -2314,30 +2395,50 @@ impl<A: RowApplication> Inner<A> {
         // A direct import's rows and projection are in place, unless a
         // local write applied over them: then they are restored and
         // the write applies again.
-        let rewrite = !direct || self.applied_any(id).await?;
+        let replayed = self.replayed_scope(scope);
+        let rewrite = !replayed && (!direct || self.applied_any(id).await?);
         // Before anything changes: the statement's marks keep every author's
         // signer, and no incoming row contradicts a known original.
         self.check_statement_marks(scope, &statement.identities)
             .await?;
-        self.check_covered_identities(
-            match direct {
-                true => "secure_checkpoint_rows",
-                false => "secure_rebootstrap_rows",
-            },
-            id,
-            &statement.identities,
-        )
-        .await?;
-        self.check_row_provenance(
-            scope,
-            match direct {
-                true => "secure_checkpoint_rows",
-                false => "secure_rebootstrap_rows",
-            },
-            id,
-        )
-        .await?;
+        if !replayed {
+            self.check_covered_identities(
+                match direct {
+                    true => "secure_checkpoint_rows",
+                    false => "secure_rebootstrap_rows",
+                },
+                id,
+                &statement.identities,
+            )
+            .await?;
+            self.check_row_provenance(
+                scope,
+                match direct {
+                    true => "secure_checkpoint_rows",
+                    false => "secure_rebootstrap_rows",
+                },
+                id,
+            )
+            .await?;
+        }
+        if replayed {
+            let rows = self
+                .stored_images("secure_replayed_staged", id, None)
+                .await?;
+            self.check_base_identities(scope, statement.tip, &rows, &statement.identities)
+                .map_err(|_| Error::Corrupt("a staged row exceeds its permanent mark".into()))?;
+        }
         let reapply = self.supersede(scope, &statement, &mut report).await?;
+        if replayed {
+            // The scope starts over from the base's rows; operations it
+            // applied replay again on top.
+            let rows = self
+                .stored_images("secure_replayed_staged", id, None)
+                .await?;
+            self.reset_replayed(scope).await?;
+            self.restore_images(scope, statement.tip, &rows).await?;
+            self.store_base(id, &rows, None).await?;
+        }
         let blob = encode(&scope)?;
         if rewrite {
             self.in_rows_bulk(scope, async {
@@ -2428,14 +2529,39 @@ impl<A: RowApplication> Inner<A> {
                 )
                 .await?;
         }
-        self.store_scope_state(
-            id,
-            sets.rows,
-            sets.tombstones,
-            &sets.digest,
-            statement.operations,
-        )
-        .await?;
+        // Later intents name the frontier's frames as their base; their
+        // stubs outlive the logs' advance.
+        if replayed {
+            for log in &statement.frontier {
+                self.conn
+                    .execute(
+                        "INSERT INTO secure_stubs VALUES(?,?,?,0) ON CONFLICT(hash) DO NOTHING",
+                        bindings(vec![
+                            SqlValue::Blob(log.hash.as_bytes().to_vec()),
+                            SqlValue::Integer(id),
+                            SqlValue::Integer(log.clock as i64),
+                        ]),
+                    )
+                    .await?;
+            }
+        }
+        // A replayed scope's stored-row state stays empty: it keeps no records.
+        match replayed {
+            true => {
+                self.store_scope_state(id, 0, 0, &Lt::new(), statement.operations)
+                    .await?
+            }
+            false => {
+                self.store_scope_state(
+                    id,
+                    sets.rows,
+                    sets.tombstones,
+                    &sets.digest,
+                    statement.operations,
+                )
+                .await?
+            }
+        }
         // Operations applied from here on get later positions.
         self
             .conn
@@ -2732,31 +2858,6 @@ pub(crate) fn forge_page(
     )
     .unwrap();
 }
-/// Re-seals a page after `edit` of the author bindings beside its rows.
-#[cfg(test)]
-pub(crate) fn forge_page_bindings(
-    page: &mut CheckpointPage,
-    key: &[u8; 32],
-    edit: impl FnOnce(&mut Vec<Vec<u8>>),
-) {
-    let mut plain: PagePlain = decode(&page.rows.open(key).unwrap()).unwrap();
-    let mut sets = plain
-        .bindings
-        .into_iter()
-        .map(|set| set.into_vec())
-        .collect();
-    edit(&mut sets);
-    plain.bindings = sets.into_iter().map(serde_bytes::ByteBuf::from).collect();
-    page.rows = EncryptedPackage::seal(
-        page.rows.scope,
-        page.rows.generation,
-        PackageKind::Checkpoint,
-        key,
-        &encode(&plain).unwrap(),
-    )
-    .unwrap();
-}
-
 #[cfg(test)]
 pub(crate) fn forge_page_legend(
     page: &mut CheckpointPage,
@@ -2775,12 +2876,6 @@ pub(crate) fn forge_page_legend(
         &encode(&plain).unwrap(),
     )
     .unwrap();
-}
-
-#[cfg(test)]
-pub(crate) fn page_header_count(page: &CheckpointPage, key: &[u8; 32]) -> usize {
-    let plain: PagePlain = decode(&page.rows.open(key).unwrap()).unwrap();
-    plain.headers.len()
 }
 
 #[cfg(test)]
