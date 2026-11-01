@@ -1,20 +1,20 @@
 name: Cache SDK tooling
-description: Reuse Gradle dependencies, build cache and Kotlin/Native toolchains.
+description: Reuse build cache and toolchains for SDK-less Rust native builds.
 inputs:
   scope:
-    description: Separate iOS compiler caches from the earlier JVM-only build.
+	    description: Isolate cache by platform scope.
     default: jvm
 
 runs:
   using: composite
   steps:
-    - uses: actions/cache@v4
+	    - uses: actions/cache@v4
       with:
         path: |
           ~/.gradle/caches
           ~/.gradle/wrapper
           ~/.konan
-        key: sdk-tooling-v1-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/sdks/kotlin/**/*.gradle.kts', 'source/sdks/kotlin/**/*.properties', 'source/sdks/kotlin/gradle/libs.versions.toml') }}-${{ github.sha }}
+	        key: sdk-tooling-v1-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/Cargo.lock', 'source/rust-toolchain.toml') }}-${{ github.sha }}
         restore-keys: |
-          sdk-tooling-v1-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/sdks/kotlin/**/*.gradle.kts', 'source/sdks/kotlin/**/*.properties', 'source/sdks/kotlin/gradle/libs.versions.toml') }}-
+	          sdk-tooling-v1-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/Cargo.lock', 'source/rust-toolchain.toml') }}-
           sdk-tooling-v1-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-

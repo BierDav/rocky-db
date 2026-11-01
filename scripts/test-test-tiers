@@ -147,8 +147,8 @@ class Scope(unittest.TestCase):
 
     def test_unknown_shared_and_manifest_inputs_fall_back_to_everything(self):
         for paths in ([], ["Cargo.lock"], ["crates/core/Cargo.toml"], [".cargo/config.toml"],
-                      ["scripts/check"], ["crates/core/src/lib.rs", "vendor/lib.rs"],
-                      ["sdks/uniffi/src/lib.rs"]):
+	                      ["scripts/check"], ["crates/core/src/lib.rs", "vendor/lib.rs"],
+	                      ["sdks/legacy/src/lib.rs"]):
             with self.subTest(paths=paths):
                 self.assertIsNone(scope.changed_packages(self.packages(), paths, Path("/repo")))
 

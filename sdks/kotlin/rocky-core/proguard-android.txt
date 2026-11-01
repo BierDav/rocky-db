@@ -1,5 +1,0 @@
-# The UniFFI bindings and JNA find their classes and methods by reflection.
--keep class com.sun.jna.** { *; }
--keep class * implements com.sun.jna.** { *; }
--keep class rocky.internal.native.** { *; }
--dontwarn java.awt.**

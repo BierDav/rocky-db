@@ -1,7 +1,0 @@
-#!/bin/sh
-set -eu
-app=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-repo_root=$(CDPATH='' cd -- "$app/../.." && pwd)
-cd "$app"
-export ROCKY_DEMO_DATA="${ROCKY_DEMO_DATA:-$repo_root/local/shoppinglist-uniffi}"
-./kotlin run -m libraryDemo

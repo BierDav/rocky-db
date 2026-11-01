@@ -1,5 +1,0 @@
-[crates.rocky_uniffi.bindings.kotlin]
-package_name = "rocky.internal.native"
-cdylib_name = "rocky_uniffi"
-generate_immutable_records = true
-use_pascal_case_enum_class = true

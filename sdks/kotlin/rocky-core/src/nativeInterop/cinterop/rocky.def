@@ -1,5 +1,0 @@
-headers = rocky_uniffiFFI.h malloc/malloc.h
-headerFilter = rocky_uniffiFFI.h malloc/malloc.h
-package = rocky_uniffi.cinterop
-staticLibraries = librocky_uniffi.a
-linkerOpts = -framework CoreFoundation -framework Security -framework SystemConfiguration -framework Network -liconv

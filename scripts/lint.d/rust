@@ -2,7 +2,7 @@
 # Rust formatting. Clippy needs a build and runs in scripts/check.
 tools=
 # Every Cargo workspace outside the root one; benchmarks keep their own rules.
-manifests='sdks/uniffi/Cargo.toml sdks/uniffi/qualification/discovery/Cargo.toml'
+manifests=''
 
 check() {
     cargo fmt --all -- --check

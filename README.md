@@ -22,8 +22,11 @@ add `--unit` for just its unit tier. `./scripts/check --all` also runs e2e. Thes
 filter test execution to avoid additional dependency variants. Cranelift's
 separate build is opt-in with `ROCKY_CRANELIFT=1`.
 
-The Rust application SDK is the `rocky-sdk` crate in `crates/rocky-sdk`. Kotlin uses
-the same SDK through the binding adapter in `sdks/uniffi`. Try it with:
+The Rust application SDK is the `rocky-sdk` crate in `crates/rocky-sdk`. We only
+provide the Rust-native API; developers who want to use it from Kotlin or other
+languages need to write their own Rust wrapper/bindings.
+
+Try it with:
 
 ```sh
 cargo run -p rocky-sdk --example notes -- ./local/notes --create

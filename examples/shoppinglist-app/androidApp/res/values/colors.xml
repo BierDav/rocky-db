@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- The brand colour behind the app icon and splash; shared Compose code seeds its theme with the same BrandColor. -->
-    <color name="brand">#FF98D4E3</color>
-</resources>

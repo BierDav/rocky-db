@@ -1,8 +1,0 @@
-#!/bin/sh
-set -eu
-repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
-cd "$repo_root"
-cargo fmt --manifest-path sdks/uniffi/Cargo.toml -- --check
-cargo clippy --manifest-path sdks/uniffi/Cargo.toml --all-targets --features bindgen --locked -- -D warnings
-cargo test --manifest-path sdks/uniffi/Cargo.toml --features bindgen --locked
-cargo check --manifest-path sdks/uniffi/Cargo.toml --no-default-features --locked

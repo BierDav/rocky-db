@@ -1,8 +1,0 @@
-{# This Source Code Form is subject to the terms of the Mozilla Public
-   License, v. 2.0. If a copy of the MPL was not distributed with this
-   file, You can obtain one at https://mozilla.org/MPL/2.0/. #}
-
-{%- let namespace = ci.namespace_for_module_path(module_path)? %}
-{%- let package_name=self.external_type_package_name(module_path, namespace) %}
-{%- let fully_qualified_type_name = "{}.{}"|format(package_name, name|class_name(ci)) %}
-{{- self.add_import(fully_qualified_type_name) }}

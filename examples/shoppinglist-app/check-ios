@@ -1,9 +1,0 @@
-#!/bin/sh
-# The application's platform matrix; signing is a separate device gate.
-set -eu
-app=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-cd "$app"
-project=${ROCKY_SHOPPING_PROJECT:-$app}
-./kotlin build --project-dir "$project" -p iosArm64 -p iosSimulatorArm64 -m shared
-./kotlin test --project-dir "$project" -p iosSimulatorArm64 -m shared
-./kotlin build --project-dir "$project" -p iosSimulatorArm64 -m iosApp

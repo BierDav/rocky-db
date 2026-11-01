@@ -20,12 +20,9 @@ esac
 # The root workspace and the standalone native bindings workspace have their
 # own target directories.
 cargo clean
-[ -f sdks/uniffi/Cargo.toml ] && cargo clean --manifest-path sdks/uniffi/Cargo.toml
 
-# Gradle, Kotlin/Native and Amper output under the SDK and shopping example.
-find sdks/kotlin examples/shoppinglist-app \
-    -type d \( -name build -o -name .gradle -o -name .kotlin \) -prune \
-    -exec rm -rf {} + 2>/dev/null || true
+# Kotlin/Uniffi/shopping support is legacy; this script only cleans the Rust
+# workspace build output.
 
 if $evidence; then
     find benchmarks/runtime-scaling/evidence -type f \

@@ -1,5 +1,0 @@
-[general]
-dirs = ["src/bin/kotlin_native/templates"]
-
-[[syntax]]
-name = "kt"

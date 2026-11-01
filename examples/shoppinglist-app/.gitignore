@@ -1,9 +1,0 @@
-/build/
-/local/
-.idea/
-**/module.xcodeproj/*
-!**/module.xcodeproj/project.pbxproj
-!**/module.xcodeproj/xcshareddata/
-!**/module.xcodeproj/project.xcworkspace/
-**/xcshareddata/WorkspaceSettings.xcsettings
-xcuserdata
